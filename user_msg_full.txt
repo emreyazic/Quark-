@@ -1,0 +1,16 @@
+<USER_REQUEST>
+something went wrong I guess. Check it 
+</USER_REQUEST>
+<ADDITIONAL_METADATA>
+The current local time is: 2026-07-06T08:22:59+03:00.
+
+The user's current state is as follows:
+Active Document: c:\Users\baris\Desktop\ahmed\tests\test_base_excel_writer.py (LANGUAGE_PYTHON)
+Cursor is on line: 5
+Other open documents:
+- c:\Users\baris\Desktop\ahmed\tests\test_base_excel_writer.py (LANGUAGE_PYTHON)
+- c:\Users\baris\Desktop\ahmed\core\workspace_excel_writer.py (LANGUAGE_PYTHON)
+- c:\Users\baris\Desktop\ahmed\ui\file_manager_widget.py (LANGUAGE_PYTHON)
+- c:\Users\baris\Desktop\ahmed\ui\main_window.py (LANGUAGE_PYTHON)
+- c:\Users\baris\Desktop\ahmed\core\base_excel_writer.py (LANGUAGE_PYTHON)
+</ADDITIONAL_METADATA>

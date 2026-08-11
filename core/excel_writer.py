@@ -1,0 +1,309 @@
+import os
+from typing import List
+import openpyxl
+from openpyxl.styles import PatternFill, Font, Alignment
+from openpyxl.utils import get_column_letter
+
+from models.bom_item import BomItem
+
+
+class ExcelWriter:
+    """Writes enriched BOM data to an Excel file with strict formatting rules."""
+
+    def __init__(self, items: List[BomItem]):
+        self.items = items
+        self.wb = openpyxl.Workbook()
+        self.ws = self.wb.active
+        self.ws.title = "Enriched BOM"
+
+        # Define fills specifically for the JLCPCB Part Number column
+        self.fill_green = PatternFill(start_color="c8e6c9", end_color="c8e6c9", fill_type="solid")
+        self.fill_yellow = PatternFill(start_color="fff9c4", end_color="fff9c4", fill_type="solid")
+        self.fill_red = PatternFill(start_color="ffcdd2", end_color="ffcdd2", fill_type="solid")
+
+    def write(self, output_path: str) -> None:
+        """Write the BOM data to the given Excel file path."""
+        headers = BomItem.get_headers()
+        self.ws.append(headers)
+
+        # Style headers
+        header_font = Font(bold=True)
+        for col_idx, cell in enumerate(self.ws[1], 1):
+            cell.font = header_font
+            self.ws.column_dimensions[get_column_letter(col_idx)].width = 20
+
+        # Adjust specific column widths
+        try:
+            self.ws.column_dimensions[get_column_letter(headers.index("Description") + 1)].width = 40
+            self.ws.column_dimensions[get_column_letter(headers.index("Designator") + 1)].width = 30
+            self.ws.column_dimensions[get_column_letter(headers.index("Unit Price (JLCPCB / DigiKey)") + 1)].width = 35
+        except ValueError:
+            pass
+
+        jlcpcb_part_col_idx = headers.index("JLCPCB Part Number") + 1
+        unit_price_col_idx = headers.index("Unit Price (JLCPCB / DigiKey)") + 1
+
+        for row_idx, item in enumerate(self.items, 2):
+            row_data = item.to_row()
+
+            for col_idx, val in enumerate(row_data, 1):
+                cell = self.ws.cell(row=row_idx, column=col_idx, value=val)
+
+                # Alignment
+                if col_idx in (headers.index("Quantity") + 1, headers.index("JLCPCB Part Number") + 1, unit_price_col_idx):
+                    cell.alignment = Alignment(horizontal="center")
+
+                # Apply specific coloring ONLY to the JLCPCB Part Number cell
+                if col_idx == jlcpcb_part_col_idx:
+                    if "error" in item.status.lower() or "exception" in item.status.lower():
+                        cell.fill = self.fill_red
+                    elif item.status == "" and item.jlcpcb_part_number:
+                        cell.fill = self.fill_green
+                    else:
+                        # Any other problem (missing MPN, RES, mismatch, insufficient stock) is yellow
+                        cell.fill = self.fill_yellow
+
+        # Enable AutoFilter for the header row
+        self.ws.auto_filter.ref = self.ws.dimensions
+        # Freeze the top header row
+        self.ws.freeze_panes = "A2"
+
+        self._add_summary_sheet()
+        self._add_cost_sheets()
+        self.wb.save(output_path)
+
+    def _add_summary_sheet(self):
+        """Add a secondary sheet with high-level sourcing statistics."""
+        ws_sum = self.wb.create_sheet("Sourcing Summary")
+        
+        ws_sum.append(["Metric", "Count"])
+        ws_sum["A1"].font = Font(bold=True)
+        ws_sum["B1"].font = Font(bold=True)
+
+        total = len(self.items)
+        valid = sum(1 for i in self.items if i.status == "" and i.jlcpcb_part_number)
+        yellow = sum(1 for i in self.items if i.status != "" and "error" not in i.status.lower())
+        red = sum(1 for i in self.items if "error" in i.status.lower())
+
+        ws_sum.append(["Total Components", total])
+        ws_sum.append(["Valid (Green)", valid])
+        ws_sum.append(["Manual Review (Yellow)", yellow])
+        ws_sum.append(["API Errors (Red)", red])
+
+        ws_sum.column_dimensions["A"].width = 30
+        ws_sum.column_dimensions["B"].width = 15
+
+    def _add_cost_sheets(self):
+        import re
+        groups = {}
+        for item in self.items:
+            src = item.source_file_name if item.source_file_name else item.board_name
+            if not src:
+                src = "Unknown"
+            groups.setdefault(src, []).append(item)
+            
+        used_names = {"Enriched BOM", "Sourcing Summary"}
+        
+        for src, group_items in groups.items():
+            base_name = re.sub(r'[\\\\/?*\\[\\]:]', '', src)
+            base_name = base_name.replace(".xlsx", "").replace(".csv", "").strip()
+            base_name = f"{base_name} Cost"
+            base_name = base_name[:31]
+            
+            sheet_name = base_name
+            counter = 2
+            while sheet_name in used_names:
+                suffix = f"_{counter}"
+                sheet_name = base_name[:31 - len(suffix)] + suffix
+                counter += 1
+            
+            used_names.add(sheet_name)
+            self._write_single_cost_sheet(sheet_name, group_items)
+
+    def _write_single_cost_sheet(self, sheet_name: str, items: List[BomItem]):
+        from core.mpn_utils import select_unit_price, select_digikey_price
+        ws = self.wb.create_sheet(sheet_name)
+        
+        # --- Summary Table ---
+        sum_headers = [
+            "BOM Quantity", "JLCPCB Total", "Remaining DigiKey Total",
+            "Combined Total", "All-DigiKey Total", "Missing Price Count"
+        ]
+        ws.append(sum_headers)
+        
+        multipliers = [1, 5, 10, 50, 100]
+        summary_rows = {}
+        for m in multipliers:
+            summary_rows[m] = {
+                "jlc_total": 0.0,
+                "rem_dk_total": 0.0,
+                "all_dk_total": 0.0,
+                "missing_count": 0
+            }
+            
+        header_font = Font(bold=True)
+        for col_idx, cell in enumerate(ws[1], 1):
+            cell.font = header_font
+            
+        # Pre-calculate data for each row
+        row_data_cache = []
+        for item in items:
+            row_cache = {}
+            for m in multipliers:
+                scaled_qty = item.quantity * m
+                
+                # Fetch JLC and DK prices
+                j_price = None
+                if item.jlcpcb_part_number and not item.skip_jlcpcb and "error" not in item.status.lower() and "not found" not in item.status.lower() and "insufficient" not in item.status.lower() and "mismatch" not in item.status.lower():
+                    j_price = select_unit_price(item.jlcpcb_price_breaks_raw, scaled_qty)
+                    
+                d_price = select_digikey_price(item.digikey_price_breaks, scaled_qty)
+                
+                used_source = "Missing price"
+                line_total = None
+                
+                if j_price is not None:
+                    used_source = "JLCPCB"
+                    line_total = scaled_qty * j_price
+                    summary_rows[m]["jlc_total"] += line_total
+                elif d_price is not None:
+                    used_source = "DigiKey fallback"
+                    line_total = scaled_qty * d_price
+                    summary_rows[m]["rem_dk_total"] += line_total
+                else:
+                    summary_rows[m]["missing_count"] += 1
+                    
+                if d_price is not None:
+                    summary_rows[m]["all_dk_total"] += scaled_qty * d_price
+                    
+                row_cache[m] = {
+                    "j_price": j_price,
+                    "d_price": d_price,
+                    "used_source": used_source,
+                    "line_total": line_total
+                }
+            row_data_cache.append(row_cache)
+            
+        # Write Summary Data
+        for idx, m in enumerate(multipliers, 2):
+            jlc_t = summary_rows[m]["jlc_total"]
+            rem_dk_t = summary_rows[m]["rem_dk_total"]
+            comb_t = jlc_t + rem_dk_t
+            all_dk_t = summary_rows[m]["all_dk_total"]
+            miss_c = summary_rows[m]["missing_count"]
+            
+            row_vals = [f"{m}x", jlc_t, rem_dk_t, comb_t, all_dk_t, miss_c]
+            for c_idx, val in enumerate(row_vals, 1):
+                cell = ws.cell(row=idx, column=c_idx, value=val)
+                if c_idx in (2, 3, 4, 5):
+                    cell.number_format = "#,##0.0000"
+                    
+        # --- Detailed Table ---
+        det_start_row = len(multipliers) + 3
+        
+        det_headers = [
+            "Designator", "Quantity", "Value", "Manufacturer", "MPN",
+            "JLCPCB Part Number", "Status"
+        ]
+        for m in multipliers:
+            det_headers.extend([
+                f"{m}x JLCPCB Unit",
+                f"{m}x DigiKey Unit",
+                f"{m}x Used Source",
+                f"{m}x Line Total"
+            ])
+            
+        for c_idx, h_text in enumerate(det_headers, 1):
+            cell = ws.cell(row=det_start_row, column=c_idx, value=h_text)
+            cell.font = header_font
+            
+        for r_idx, (item, cache) in enumerate(zip(items, row_data_cache), det_start_row + 1):
+            row_vals = [
+                item.designator,
+                item.quantity,
+                item.value,
+                item.manufacturer,
+                item.mpn,
+                item.jlcpcb_part_number,
+                item.status if item.status else "Valid"
+            ]
+            
+            for m in multipliers:
+                rc = cache[m]
+                row_vals.extend([
+                    rc["j_price"] if rc["j_price"] is not None else "-",
+                    rc["d_price"] if rc["d_price"] is not None else "-",
+                    rc["used_source"],
+                    rc["line_total"] if rc["line_total"] is not None else "-"
+                ])
+                
+            for c_idx, val in enumerate(row_vals, 1):
+                cell = ws.cell(row=r_idx, column=c_idx, value=val)
+                # Apply format
+                if c_idx == 2:
+                    cell.number_format = "0"
+                elif c_idx > 7:
+                    rel_idx = (c_idx - 8) % 4
+                    if rel_idx in (0, 1, 3) and isinstance(val, (int, float)):
+                        cell.number_format = "#,##0.0000"
+                        
+        # Formatting
+        ws.column_dimensions["A"].width = 25
+        ws.column_dimensions["B"].width = 18
+        ws.column_dimensions["C"].width = 18
+        ws.column_dimensions["D"].width = 18
+        ws.column_dimensions["E"].width = 25
+        ws.column_dimensions["F"].width = 25
+        ws.column_dimensions["G"].width = 25
+        
+        ws.auto_filter.ref = f"A{det_start_row}:{get_column_letter(len(det_headers))}{det_start_row + len(items)}"
+        ws.freeze_panes = f"A{det_start_row + 1}"
+
+class UnavailableReportWriter:
+    """Writes a specific report of items that couldn't be sourced automatically."""
+
+    def __init__(self, items: List[BomItem]):
+        # Keep only items that are NOT valid
+        self.unavailable_items = [i for i in items if i.status != ""]
+
+    def write(self, output_path: str) -> None:
+        """Write the unavailable report data to the given Excel file path."""
+        if not self.unavailable_items:
+            return  # Nothing to write
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Action Required"
+
+        headers = [
+            "Board Name", "Designator", "Quantity", "Manufacturer", 
+            "MPN", "Required Stock", "JLCPCB Stock", "Status"
+        ]
+        ws.append(headers)
+
+        header_font = Font(bold=True)
+        for col_idx, cell in enumerate(ws[1], 1):
+            cell.font = header_font
+            ws.column_dimensions[get_column_letter(col_idx)].width = 20
+        ws.column_dimensions["B"].width = 30 # Designator
+        ws.column_dimensions["H"].width = 30 # Status
+
+        for r_idx, item in enumerate(self.unavailable_items, 2):
+            row = [
+                item.board_name,
+                item.designator,
+                item.quantity,
+                item.manufacturer,
+                item.mpn,
+                item.required_stock,
+                item.available_stock_qty if item.available_stock_qty is not None else "-",
+                item.status
+            ]
+            for c_idx, val in enumerate(row, 1):
+                ws.cell(row=r_idx, column=c_idx, value=val)
+
+        # Enable AutoFilter and freeze panes
+        ws.auto_filter.ref = ws.dimensions
+        ws.freeze_panes = "A2"
+
+        wb.save(output_path)

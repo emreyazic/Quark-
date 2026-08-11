@@ -1,0 +1,10 @@
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+typeCheckingMode = "off"
+reportMissingImports = false
+reportMissingTypeStubs = false
+
+[tool.pyrefly]
+typeCheckingMode = "off"
+reportMissingImports = false

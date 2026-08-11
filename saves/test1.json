@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "project_name": "test1",
+  "board_items": [
+    {
+      "file_path": "C:/Users/baris/Desktop/ahmet_back/ahmed_03_07/pcb_files/PBA_BOSS_CPU_P0_B0.xlsx",
+      "board_name": "PBA_BOSS_CPU_P0_B0",
+      "board_quantity": 1
+    },
+    {
+      "file_path": "C:/Users/baris/Desktop/ahmet_back/ahmed_03_07/pcb_files/PBA_SAR6_CB_PWR_P1_B0.xlsx",
+      "board_name": "PBA_SAR6_CB_PWR_P1_B0",
+      "board_quantity": 1
+    },
+    {
+      "file_path": "C:/Users/baris/Desktop/ahmet_back/ahmed_03_07/pcb_files/PBA_SAR6_COM_P1_B0v1.xlsx",
+      "board_name": "PBA_SAR6_COM_P1_B0v1",
+      "board_quantity": 1
+    }
+  ]
+}
