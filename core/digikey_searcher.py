@@ -268,8 +268,20 @@ class DigiKeySearcher:
             except Exception as e:
                 result.error = f"DigiKey API error: {e}"
                 return result
-                
+        
         return result
+                
+    def search_mpn(self, mpn: str) -> DigiKeySearchResult:
+        """Search DigiKey directly by MPN string."""
+        class _Item:
+            def __init__(self, mpn_val):
+                self.mpn = mpn_val
+                self.value = ""
+                self.description = ""
+                self.manufacturer = ""
+                self.footprint = ""
+
+        return self.search_item(_Item(mpn))
 
     def close(self):
         """Close the HTTP session."""

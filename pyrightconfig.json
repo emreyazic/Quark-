@@ -1,8 +1,12 @@
 {
   "venvPath": ".",
   "venv": ".venv",
-  "pythonVersion": "3.11",
   "typeCheckingMode": "off",
-  "reportMissingImports": false,
-  "reportMissingTypeStubs": false
+  "reportMissingImports": "none",
+  "reportMissingTypeStubs": "none",
+  "reportOptionalMemberAccess": "none",
+  "reportIncompatibleMethodOverride": "none",
+  "reportGeneralTypeIssues": "none",
+  "reportOptionalOperand": "none",
+  "reportAssignmentType": "none"
 }

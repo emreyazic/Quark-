@@ -268,6 +268,6 @@ class ColumnMapperDialog(QDialog):
         self.bom_file.column_mapping = mapping
         self.accept()
 
-    def get_mapping(self) -> ColumnMapping:
+    def get_mapping(self) -> Optional[ColumnMapping]:
         """Return the confirmed column mapping."""
         return self.bom_file.column_mapping

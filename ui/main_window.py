@@ -803,7 +803,7 @@ class MainWindow(QMainWindow):
         self._search_item_component_keys = []
         for comp in self._workspace_aggregation_result.components:
             search_item = copy.deepcopy(comp.representative_item)
-            search_item.quantity = comp.total_quantity
+            search_item.quantity = int(comp.total_quantity)
             self._all_items.append(search_item)
             self._search_item_component_keys.append(comp.component_key)
 
@@ -979,7 +979,7 @@ class MainWindow(QMainWindow):
         table.setSortingEnabled(True)
 
     def _status_color(self, status: str) -> Optional[QColor]:
-        status_text = str(status or "")
+        status_text = status or ""
         if status_text == "":
             return QColor("#1a4a3a")
         elif status_text == "JLCPCB not found":
