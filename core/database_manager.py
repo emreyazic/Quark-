@@ -1,14 +1,21 @@
 import sqlite3
 import os
 import threading
+import time
+from pathlib import Path
 from typing import Optional, Dict, Any
 
 class DatabaseManager:
     """Manages local SQLite database for caching and internal part mappings."""
 
-    def __init__(self, db_path: str = "saves/database.sqlite"):
+    def __init__(self, db_path: Optional[str] = None):
         """Initialize the database manager with a path to the sqlite file."""
-        self.db_path = db_path
+        # Always keep the application database beside the project source, not
+        # beside the shell's current directory. Search workers and the UI can
+        # otherwise open different ``saves/database.sqlite`` files when the app
+        # is started from a shortcut or a different terminal directory.
+        project_root = Path(__file__).resolve().parent.parent
+        self.db_path = str(project_root / "saves" / "database.sqlite") if db_path is None else db_path
         self._lock = threading.Lock()
         
         # Ensure the directory exists
@@ -34,7 +41,8 @@ class DatabaseManager:
                         comment_code TEXT PRIMARY KEY,
                         mpn TEXT NOT NULL,
                         lcsc_code TEXT NOT NULL,
-                        approved INTEGER NOT NULL DEFAULT 0
+                        approved INTEGER NOT NULL DEFAULT 0,
+                        updated_at REAL
                     )
                 ''')
                 
@@ -42,6 +50,8 @@ class DatabaseManager:
                 columns = [info[1] for info in cursor.fetchall()]
                 if 'digikey_code' not in columns:
                     cursor.execute("ALTER TABLE internal_mappings ADD COLUMN digikey_code TEXT NOT NULL DEFAULT ''")
+                if 'updated_at' not in columns:
+                    cursor.execute("ALTER TABLE internal_mappings ADD COLUMN updated_at REAL")
                 
                 # Table 2: api_cache
                 cursor.execute('''
@@ -82,7 +92,7 @@ class DatabaseManager:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    "SELECT comment_code, mpn, lcsc_code, digikey_code, approved FROM internal_mappings WHERE comment_code = ?", 
+                    "SELECT comment_code, mpn, lcsc_code, digikey_code, approved, updated_at FROM internal_mappings WHERE comment_code = ?",
                     (comment_code,)
                 )
                 row = cursor.fetchone()
@@ -96,14 +106,15 @@ class DatabaseManager:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
-                    INSERT INTO internal_mappings (comment_code, mpn, lcsc_code, digikey_code, approved)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT INTO internal_mappings (comment_code, mpn, lcsc_code, digikey_code, approved, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     ON CONFLICT(comment_code) DO UPDATE SET
                         mpn = excluded.mpn,
                         lcsc_code = excluded.lcsc_code,
                         digikey_code = excluded.digikey_code,
-                        approved = excluded.approved
-                ''', (comment_code, mpn, lcsc_code, digikey_code, 1 if approved else 0))
+                        approved = excluded.approved,
+                        updated_at = excluded.updated_at
+                ''', (comment_code, mpn, lcsc_code, digikey_code, 1 if approved else 0, time.time()))
                 conn.commit()
 
     def insert_pending_suggestion(self, comment_code: str, mpn: str = "", lcsc_code: str = "", digikey_code: str = "") -> None:
@@ -117,7 +128,7 @@ class DatabaseManager:
                 cursor = conn.cursor()
                 # Önce mevcut kaydı kontrol et
                 cursor.execute(
-                    "SELECT comment_code, mpn, lcsc_code, digikey_code, approved FROM internal_mappings WHERE comment_code = ?",
+                    "SELECT comment_code, mpn, lcsc_code, digikey_code, approved, updated_at FROM internal_mappings WHERE comment_code = ?",
                     (comment_code,)
                 )
                 existing = cursor.fetchone()
@@ -125,18 +136,19 @@ class DatabaseManager:
                 if existing is None:
                     # Yeni kayıt — direkt ekle
                     cursor.execute(
-                        "INSERT INTO internal_mappings (comment_code, mpn, lcsc_code, digikey_code, approved) VALUES (?, ?, ?, ?, 0)",
-                        (comment_code, mpn, lcsc_code, digikey_code)
+                        "INSERT INTO internal_mappings (comment_code, mpn, lcsc_code, digikey_code, approved, updated_at) VALUES (?, ?, ?, ?, 0, ?)",
+                        (comment_code, mpn, lcsc_code, digikey_code, time.time())
                     )
                 elif existing["approved"] == 0:
                     # Mevcut pending kayıt — sadece boş alanları doldur
                     new_mpn = existing["mpn"] or mpn
                     new_lcsc = existing["lcsc_code"] or lcsc_code
                     new_dk = existing["digikey_code"] or digikey_code
-                    cursor.execute(
-                        "UPDATE internal_mappings SET mpn = ?, lcsc_code = ?, digikey_code = ? WHERE comment_code = ?",
-                        (new_mpn, new_lcsc, new_dk, comment_code)
-                    )
+                    if (new_mpn, new_lcsc, new_dk) != (existing["mpn"], existing["lcsc_code"], existing["digikey_code"]):
+                        cursor.execute(
+                            "UPDATE internal_mappings SET mpn = ?, lcsc_code = ?, digikey_code = ?, updated_at = ? WHERE comment_code = ?",
+                            (new_mpn, new_lcsc, new_dk, time.time(), comment_code)
+                        )
                 # approved == 1 ise hiçbir şey yapma — onaylı kaydı koru
                 conn.commit()
 
@@ -155,13 +167,49 @@ class DatabaseManager:
                 cursor = conn.cursor()
                 cursor.execute("DELETE FROM internal_mappings")
                 conn.commit()
+
+    def refresh_mapping_codes(self, comment_code: str, lcsc_code: str = "", digikey_code: str = "") -> bool:
+        """Update only newly found, changed supplier codes and return whether a change was saved.
+
+        Empty lookup results are deliberately ignored, so an unavailable API can
+        never erase a user's approved or pending mapping.
+        """
+        with self._lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT lcsc_code, digikey_code FROM internal_mappings WHERE comment_code = ?",
+                    (comment_code,),
+                )
+                existing = cursor.fetchone()
+                if existing is None:
+                    return False
+
+                changed_lcsc = lcsc_code.strip() if lcsc_code and lcsc_code.strip() != existing["lcsc_code"] else ""
+                changed_digikey = digikey_code.strip() if digikey_code and digikey_code.strip() != existing["digikey_code"] else ""
+                if not changed_lcsc and not changed_digikey:
+                    return False
+
+                cursor.execute(
+                    """UPDATE internal_mappings
+                       SET lcsc_code = ?, digikey_code = ?, updated_at = ?
+                       WHERE comment_code = ?""",
+                    (
+                        changed_lcsc or existing["lcsc_code"],
+                        changed_digikey or existing["digikey_code"],
+                        time.time(),
+                        comment_code,
+                    ),
+                )
+                conn.commit()
+                return True
                 
     def get_all_internal_mappings(self) -> list[Dict[str, Any]]:
         """Retrieves all internal mappings."""
         with self._lock:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("SELECT comment_code, mpn, lcsc_code, digikey_code, approved FROM internal_mappings")
+                cursor.execute("SELECT comment_code, mpn, lcsc_code, digikey_code, approved, updated_at FROM internal_mappings")
                 return [dict(row) for row in cursor.fetchall()]
 
     # =========================================================

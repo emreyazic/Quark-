@@ -1,4 +1,5 @@
 import sys
+from datetime import datetime
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QTableWidget, 
@@ -58,8 +59,8 @@ class ApprovalDialog(QDialog):
         layout_pending.addWidget(info_label_pending)
 
         self.table_pending = QTableWidget()
-        self.table_pending.setColumnCount(5)
-        self.table_pending.setHorizontalHeaderLabels(["Internal Code (Comment)", "Suggested MPN", "Suggested LCSC", "Suggested DigiKey", "Action"])
+        self.table_pending.setColumnCount(6)
+        self.table_pending.setHorizontalHeaderLabels(["Internal Code (Comment)", "Suggested MPN", "Suggested LCSC", "Suggested DigiKey", "Last Updated", "Action"])
         self.table_pending.setItemDelegate(TableEditorDelegate(self.table_pending))
         self._configure_table(self.table_pending, action_width=140)
         layout_pending.addWidget(self.table_pending)
@@ -74,8 +75,8 @@ class ApprovalDialog(QDialog):
         layout_approved.addWidget(info_label_approved)
         
         self.table_approved = QTableWidget()
-        self.table_approved.setColumnCount(5)
-        self.table_approved.setHorizontalHeaderLabels(["Internal Code (Comment)", "MPN", "LCSC Code", "DigiKey Code", "Action"])
+        self.table_approved.setColumnCount(6)
+        self.table_approved.setHorizontalHeaderLabels(["Internal Code (Comment)", "MPN", "LCSC Code", "DigiKey Code", "Last Updated", "Action"])
         self.table_approved.setItemDelegate(TableEditorDelegate(self.table_approved))
         self._configure_table(self.table_approved, action_width=240)
         
@@ -102,9 +103,10 @@ class ApprovalDialog(QDialog):
         table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
-        table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
+        table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
         table.horizontalHeader().setMinimumSectionSize(action_width)
-        table.setColumnWidth(4, action_width)
+        table.setColumnWidth(5, action_width)
 
     def _load_data(self):
         mappings = self.db_manager.get_all_internal_mappings()
@@ -129,7 +131,7 @@ class ApprovalDialog(QDialog):
             h_layout = QHBoxLayout(container)
             h_layout.setContentsMargins(4, 2, 4, 2)
             h_layout.addWidget(btn_approve)
-            self.table_pending.setCellWidget(row, 4, container)
+            self.table_pending.setCellWidget(row, 5, container)
 
     def _populate_approved_table(self, approved_list):
         self.table_approved.setRowCount(len(approved_list))
@@ -153,13 +155,15 @@ class ApprovalDialog(QDialog):
             h_layout.setSpacing(4)
             h_layout.addWidget(btn_update)
             h_layout.addWidget(btn_delete)
-            self.table_approved.setCellWidget(row, 4, container)
+            self.table_approved.setCellWidget(row, 5, container)
 
     def _fill_row(self, table: QTableWidget, row: int, mapping: dict):
         comment = mapping.get("comment_code", "")
         mpn = mapping.get("mpn", "")
         lcsc = mapping.get("lcsc_code", "")
         digikey = mapping.get("digikey_code", "")
+        updated_at = mapping.get("updated_at")
+        updated_text = datetime.fromtimestamp(updated_at).strftime("%Y-%m-%d %H:%M") if updated_at else "—"
         
         item_comment = QTableWidgetItem(comment)
         item_comment.setFlags(item_comment.flags() & ~Qt.ItemFlag.ItemIsEditable)
@@ -168,6 +172,9 @@ class ApprovalDialog(QDialog):
         table.setItem(row, 1, QTableWidgetItem(mpn))
         table.setItem(row, 2, QTableWidgetItem(lcsc))
         table.setItem(row, 3, QTableWidgetItem(digikey))
+        item_updated = QTableWidgetItem(updated_text)
+        item_updated.setFlags(item_updated.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        table.setItem(row, 4, item_updated)
 
     def _on_approve_clicked(self, row: int):
         self._process_upsert(self.table_pending, row, is_approve_action=True)

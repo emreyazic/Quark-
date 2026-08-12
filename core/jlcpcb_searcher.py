@@ -15,6 +15,7 @@ import requests
 from models.bom_item import BomItem
 from core.mpn_utils import (
     clean_mpn_value,
+    is_exact_mpn_match,
     is_res_coded,
     compute_required_stock,
     select_unit_price,
@@ -25,6 +26,9 @@ from core.database_manager import DatabaseManager
 API_BASE_URL = "https://open.jlcpcb.com"
 # MPN -> LCSC eşlemesi için kullanılan hızlı arama servisi
 COMMUNITY_SEARCH_URL = "https://jlcsearch.tscircuit.com/components/list.json"
+# LCSC's own global search endpoint.  The community index above is fast but
+# incomplete for many extended-library parts, so this is an exact-match fallback.
+LCSC_GLOBAL_SEARCH_URL = "https://wmsc.lcsc.com/ftps/wm/search/v3/global"
 
 # İstek zaman aşımı (saniye)
 REQUEST_TIMEOUT = 15
@@ -107,14 +111,65 @@ class JlcpcbSearcher:
         # 2. Fallback: Orijinal jlcsearch topluluk API'si
         #    Endpoint: GET /components/list.json?search=<MPN>
         #    mfr alanı MPN'i, lcsc alanı LCSC numarasını içerir
-        community_url = "https://jlcsearch.tscircuit.com/components/list.json"
+        def get_components(response_data: Any) -> list[dict]:
+            """Accept both documented object responses and legacy list responses."""
+            if isinstance(response_data, dict):
+                components = response_data.get("components", []) or response_data.get("data", [])
+            else:
+                components = response_data
+            return components if isinstance(components, list) else []
+
+        def find_exact_lcsc(components: list[dict]) -> Optional[str]:
+            """Return an LCSC code only when the MPN match is unambiguous.
+
+            A search response can contain a similarly named part or multiple
+            LCSC entries for the same MPN.  Selecting the first entry in either
+            case can silently map a BOM to the wrong component, so those cases
+            must remain pending for user review.
+            """
+            exact_codes: set[str] = set()
+            for comp in components:
+                if not isinstance(comp, dict):
+                    continue
+                candidate_mpns = (
+                    comp.get("mfr", ""),
+                    comp.get("manufacturer_part_number", ""),
+                    comp.get("manufacturerPartNumber", ""),
+                    comp.get("manufacturerPartNum", ""),
+                    comp.get("componentModel", ""),
+                    comp.get("productModel", ""),
+                    comp.get("mpn", ""),
+                )
+                if not any(is_exact_mpn_match(mpn_clean, candidate_mpn) for candidate_mpn in candidate_mpns if candidate_mpn):
+                    continue
+                lcsc_val = (
+                    comp.get("lcsc", "")
+                    or comp.get("lcscPart", "")
+                    or comp.get("lcsc_part_number", "")
+                    or comp.get("lcscPartNumber", "")
+                    or comp.get("componentCode", "")
+                    or comp.get("productCode", "")
+                )
+                if lcsc_val:
+                    lcsc_str = str(lcsc_val).strip()
+                    lcsc_code = lcsc_str if lcsc_str.startswith("C") else f"C{lcsc_str}"
+                    exact_codes.add(lcsc_code)
+
+            if len(exact_codes) == 1:
+                lcsc_code = exact_codes.pop()
+                print(f"DEBUG: Found LCSC: {lcsc_code} for MPN: {mpn_clean}")
+                return lcsc_code
+            if len(exact_codes) > 1:
+                print(f"DEBUG: Ambiguous exact LCSC matches for MPN: {mpn_clean}: {', '.join(sorted(exact_codes))}")
+            return None
+
         max_retries = 3
         backoff = 1.0
 
         for attempt in range(max_retries):
             try:
                 resp = self.session.get(
-                    community_url,
+                    COMMUNITY_SEARCH_URL,
                     params={"search": mpn_clean},
                     timeout=8,
                     headers={
@@ -123,21 +178,12 @@ class JlcpcbSearcher:
                     },
                 )
                 if resp.status_code == 200:
-                    data = resp.json()
-                    components = data.get("components", []) if isinstance(data, dict) else []
-                    # Tam MPN eşleşmesi ara (orijinal mantık)
-                    for comp in components:
-                        candidate_mpn = comp.get("mfr", "")
-                        if is_exact_mpn_match(mpn_clean, candidate_mpn):
-                            lcsc_val = comp.get("lcsc", "")
-                            if lcsc_val:
-                                lcsc_str = str(lcsc_val).strip()
-                                lcsc_code = lcsc_str if lcsc_str.startswith("C") else f"C{lcsc_str}"
-                                print(f"DEBUG: Found LCSC: {lcsc_code} for MPN: {mpn_clean}")
-                                return lcsc_code
+                    lcsc_code = find_exact_lcsc(get_components(resp.json()))
+                    if lcsc_code:
+                        return lcsc_code
                     # Tam eşleşme yoksa manufacturer_part_number parametresiyle ikinci bir deneme
                     resp2 = self.session.get(
-                        community_url,
+                        COMMUNITY_SEARCH_URL,
                         params={"manufacturer_part_number": mpn_clean, "limit": 5},
                         timeout=8,
                         headers={
@@ -146,17 +192,35 @@ class JlcpcbSearcher:
                         },
                     )
                     if resp2.status_code == 200:
-                        data2 = resp2.json()
-                        components2 = data2.get("components", []) if isinstance(data2, dict) else []
-                        for comp in components2:
-                            candidate_mpn = comp.get("mfr", "") or comp.get("manufacturer_part_number", "")
-                            if is_exact_mpn_match(mpn_clean, candidate_mpn):
-                                lcsc_val = comp.get("lcsc", "") or comp.get("lcscPart", "") or comp.get("componentCode", "")
-                                if lcsc_val:
-                                    lcsc_str = str(lcsc_val).strip()
-                                    lcsc_code = lcsc_str if lcsc_str.startswith("C") else f"C{lcsc_str}"
-                                    print(f"DEBUG: Found LCSC: {lcsc_code} for MPN: {mpn_clean}")
-                                    return lcsc_code
+                        lcsc_code = find_exact_lcsc(get_components(resp2.json()))
+                        if lcsc_code:
+                            return lcsc_code
+
+                    # Community index is incomplete for many LCSC extended
+                    # parts. Query LCSC's own search service, then validate the
+                    # returned product model ourselves before accepting it.
+                    official_resp = self.session.post(
+                        LCSC_GLOBAL_SEARCH_URL,
+                        json={"keyword": mpn_clean},
+                        timeout=12,
+                        headers={
+                            "User-Agent": "BOM-Enrichment-Tool/2.0",
+                            "Accept": "application/json",
+                            "Origin": "https://www.lcsc.com",
+                            "Referer": "https://www.lcsc.com/",
+                        },
+                    )
+                    if official_resp.status_code == 200:
+                        official_data = official_resp.json()
+                        official_result = official_data.get("result") if isinstance(official_data, dict) else None
+                        if isinstance(official_result, dict):
+                            exact_products = official_result.get("exactMatchResult") or []
+                            search_result = official_result.get("productSearchResultVO") or {}
+                            search_products = search_result.get("productList") or [] if isinstance(search_result, dict) else []
+                            lcsc_code = find_exact_lcsc(exact_products + search_products)
+                            if lcsc_code:
+                                return lcsc_code
+
                     # Bulunamadı ama hata yok — sessizce None dön
                     return None
                 elif resp.status_code in (429, 503):

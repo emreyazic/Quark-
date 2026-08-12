@@ -229,6 +229,55 @@ class ManualSearchWorker(QThread):
         self.results_ready.emit(results)
 
 
+class MappingRefreshWorker(QThread):
+    """Checks existing mappings and persists only supplier codes that changed."""
+
+    progress = pyqtSignal(int, int, str)
+    finished = pyqtSignal(int)
+    error = pyqtSignal(str)
+
+    def __init__(self, db_manager: DatabaseManager, parent=None):
+        super().__init__(parent)
+        self.db_manager = db_manager
+
+    def run(self):
+        searcher = JlcpcbSearcher(APP_ID, ACCESS_KEY, SECRET_KEY, self.db_manager)
+        digikey_searcher = DigiKeySearcher()
+        updated_count = 0
+        try:
+            mappings = self.db_manager.get_all_internal_mappings()
+            eligible_mappings = [mapping for mapping in mappings if mapping.get("mpn", "").strip()]
+            total = len(eligible_mappings)
+
+            for index, mapping in enumerate(eligible_mappings, start=1):
+                comment_code = mapping["comment_code"]
+                mpn = mapping["mpn"].strip()
+                self.progress.emit(index, total, f"Refreshing {comment_code} ({mpn})")
+
+                # Resolve only the MPN→LCSC mapping. A lookup failure must not
+                # clear the existing code, which is enforced in the DB method.
+                try:
+                    lcsc_code = searcher._resolve_lcsc_from_mpn(mpn) or ""
+                except Exception:
+                    lcsc_code = ""
+
+                try:
+                    digikey_result = digikey_searcher.search_mpn(mpn)
+                    digikey_code = digikey_result.digikey_part_number or ""
+                except Exception:
+                    digikey_code = ""
+
+                if self.db_manager.refresh_mapping_codes(comment_code, lcsc_code, digikey_code):
+                    updated_count += 1
+
+            self.finished.emit(updated_count)
+        except Exception as exc:
+            self.error.emit(str(exc))
+        finally:
+            searcher.close()
+            digikey_searcher.close()
+
+
 # ═══════════════════════════════════════════════════════════════════
 #  Main Window
 # ═══════════════════════════════════════════════════════════════════
@@ -241,6 +290,7 @@ class MainWindow(QMainWindow):
         self._parser = BomParser()
         self._search_worker: Optional[SearchWorker] = None
         self._manual_search_worker: Optional[ManualSearchWorker] = None
+        self._mapping_refresh_worker: Optional[MappingRefreshWorker] = None
         self._all_items: list[BomItem] = []
         self._project_aggregation_result = None
         self._search_item_component_keys: list[str] = []
@@ -416,11 +466,11 @@ class MainWindow(QMainWindow):
         self._btn_sync_library.clicked.connect(self._sync_jlc_library)
         action_layout.addWidget(self._btn_sync_library)
 
-        # Reset Mappings button
-        self._btn_reset_mappings = QPushButton("⚠️ Reset Mappings")
-        self._btn_reset_mappings.setToolTip("Clear all internal code mappings and rescan from scratch")
-        self._btn_reset_mappings.clicked.connect(self._reset_mappings)
-        action_layout.addWidget(self._btn_reset_mappings)
+        # Refresh Mappings button
+        self._btn_refresh_mappings = QPushButton("🔄 Refresh Mappings")
+        self._btn_refresh_mappings.setToolTip("Update only changed LCSC and DigiKey codes; never clears existing mappings")
+        self._btn_refresh_mappings.clicked.connect(self._refresh_mappings)
+        action_layout.addWidget(self._btn_refresh_mappings)
 
         # Refresh Data button
         self._btn_refresh = QPushButton("🔄 Refresh Stock & Prices")
@@ -743,19 +793,37 @@ class MainWindow(QMainWindow):
         dlg = ApprovalDialog(self._database_manager, self)
         dlg.exec()
 
-    def _reset_mappings(self):
+    def _refresh_mappings(self):
         reply = QMessageBox.question(
-            self, "Reset Mappings",
-            "Are you sure you want to clear all approved and pending mappings?\n\nThis will force the system to rescan JLC/DigiKey for suggestions on your next BOM process.",
+            self, "Refresh Mappings",
+            "Check all mappings against JLCPCB and DigiKey?\n\n"
+            "Only newly found codes that differ from the saved LCSC or DigiKey code will be updated. "
+            "Existing values are never cleared when a lookup fails.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No
         )
         if reply == QMessageBox.StandardButton.Yes:
-            try:
-                self._database_manager.reset_all_internal_mappings()
-                QMessageBox.information(self, "Success", "All internal mappings have been successfully reset.")
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to reset mappings: {str(e)}")
+            self._btn_refresh_mappings.setEnabled(False)
+            self._btn_refresh_mappings.setText("⏳ Refreshing Mappings...")
+            self._mapping_refresh_worker = MappingRefreshWorker(self._database_manager, self)
+            self._mapping_refresh_worker.progress.connect(self._on_mapping_refresh_progress)
+            self._mapping_refresh_worker.finished.connect(self._on_mapping_refresh_finished)
+            self._mapping_refresh_worker.error.connect(self._on_mapping_refresh_error)
+            self._mapping_refresh_worker.start()
+
+    def _on_mapping_refresh_progress(self, current: int, total: int, message: str):
+        self.statusBar().showMessage(f"{message} ({current}/{total})")
+
+    def _on_mapping_refresh_finished(self, updated_count: int):
+        self._btn_refresh_mappings.setEnabled(True)
+        self._btn_refresh_mappings.setText("🔄 Refresh Mappings")
+        self.statusBar().showMessage("Mapping refresh complete.", 5000)
+        QMessageBox.information(self, "Refresh Complete", f"Updated {updated_count} mapping(s).")
+
+    def _on_mapping_refresh_error(self, message: str):
+        self._btn_refresh_mappings.setEnabled(True)
+        self._btn_refresh_mappings.setText("🔄 Refresh Mappings")
+        QMessageBox.critical(self, "Refresh Error", f"Failed to refresh mappings: {message}")
 
     def _sync_jlc_library(self):
         """Starts syncing the JLC component library to local DB in the background."""
