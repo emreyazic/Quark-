@@ -36,7 +36,7 @@ from PyQt6.QtWidgets import (
 
 from core.bom_parser import BomParser
 from core.excel_writer import ExcelWriter, UnavailableReportWriter
-from core.jlcpcb_searcher import JlcpcbSearcher, SearchWorker
+from core.jlcpcb_searcher import JlcpcbSearcher, SearchWorker, LibrarySyncWorker
 from core.digikey_searcher import DigiKeySearcher
 from core.mpn_utils import clean_mpn_value, is_exact_mpn_match, compute_required_stock
 from models.bom_item import BomFile, BomItem
@@ -410,6 +410,12 @@ class MainWindow(QMainWindow):
         self._btn_approvals.clicked.connect(self._open_approval_dialog)
         action_layout.addWidget(self._btn_approvals)
 
+        # Sync JLC Library button
+        self._btn_sync_library = QPushButton("🗄 Sync JLC Library")
+        self._btn_sync_library.setToolTip("Download JLC component library to local DB for offline MPN→LCSC lookup")
+        self._btn_sync_library.clicked.connect(self._sync_jlc_library)
+        action_layout.addWidget(self._btn_sync_library)
+
         # Reset Mappings button
         self._btn_reset_mappings = QPushButton("⚠️ Reset Mappings")
         self._btn_reset_mappings.setToolTip("Clear all internal code mappings and rescan from scratch")
@@ -750,6 +756,52 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(self, "Success", "All internal mappings have been successfully reset.")
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to reset mappings: {str(e)}")
+
+    def _sync_jlc_library(self):
+        """Starts syncing the JLC component library to local DB in the background."""
+        count = self._database_manager.get_library_count()
+        msg = f"Local library has {count:,} components."
+        if count > 0:
+            msg += "\n\nSync will add/update records from JOP API. Continue?"
+        else:
+            msg += "\n\nThis will download the full JLCPCB component list to your local database.\nThis may take a few minutes. Continue?"
+
+        reply = QMessageBox.question(
+            self, "Sync JLC Library", msg,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        self._btn_sync_library.setEnabled(False)
+        self._btn_sync_library.setText("⏳ Syncing...")
+
+        self._sync_worker = LibrarySyncWorker(
+            APP_ID, ACCESS_KEY, SECRET_KEY, self._database_manager, self
+        )
+        self._sync_worker.progress.connect(self._on_sync_progress)
+        self._sync_worker.finished.connect(self._on_sync_finished)
+        self._sync_worker.error.connect(self._on_sync_error)
+        self._sync_worker.start()
+
+    def _on_sync_progress(self, fetched: int, total: int, message: str):
+        self._btn_sync_library.setText(f"⏳ {fetched:,} synced...")
+        self.statusBar().showMessage(f"JLC Library Sync: {message}")
+
+    def _on_sync_finished(self, total: int):
+        self._btn_sync_library.setEnabled(True)
+        self._btn_sync_library.setText("🗄 Sync JLC Library")
+        self.statusBar().showMessage(f"JLC Library Sync complete: {total:,} components saved.")
+        QMessageBox.information(
+            self, "Sync Complete",
+            f"JLC Library sync finished.\n{total:,} components are now available for local MPN→LCSC lookup."
+        )
+
+    def _on_sync_error(self, message: str):
+        self._btn_sync_library.setEnabled(True)
+        self._btn_sync_library.setText("🗄 Sync JLC Library")
+        QMessageBox.critical(self, "Sync Error", f"JLC Library sync failed:\n{message}")
 
     def _clear_processed_state(self):
         """Clear state from previous processing runs."""

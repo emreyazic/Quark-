@@ -91,25 +91,89 @@ class JlcpcbSearcher:
         )
 
     def _resolve_lcsc_from_mpn(self, mpn_clean: str) -> Optional[str]:
-        """Resolves permanent MPN to LCSC part code (C...) using search mapping."""
-        try:
-            resp = self.session.get(
-                COMMUNITY_SEARCH_URL,
-                params={"manufacturer_part_number": mpn_clean, "limit": 1},
-                timeout=5
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                components = data.get("components", []) if isinstance(data, dict) else data
-                if components and len(components) > 0:
-                    comp = components[0]
-                    lcsc_val = comp.get("lcscPart", "") or comp.get("lcsc", "") or comp.get("componentCode", "")
-                    if lcsc_val:
-                        lcsc_str = str(lcsc_val).strip()
-                        return lcsc_str if lcsc_str.startswith("C") else f"C{lcsc_str}"
-        except Exception:
-            pass
+        """Resolves permanent MPN to LCSC part code (C...) using:
+        1. Local JLC library DB (fast, offline)
+        2. Original community search API with exact MPN matching (fallback)
+        Returns None silently if not found — caller handles pending flow.
+        """
+        # 1. Önce yerel kütüphane veritabanını sorgula
+        if self.db_manager:
+            lcsc = self.db_manager.lookup_lcsc_by_mpn(mpn_clean)
+            if lcsc:
+                lcsc_code = str(lcsc).strip()
+                print(f"DEBUG: Found LCSC: {lcsc_code} for MPN: {mpn_clean}")
+                return lcsc_code
+
+        # 2. Fallback: Orijinal jlcsearch topluluk API'si
+        #    Endpoint: GET /components/list.json?search=<MPN>
+        #    mfr alanı MPN'i, lcsc alanı LCSC numarasını içerir
+        community_url = "https://jlcsearch.tscircuit.com/components/list.json"
+        max_retries = 3
+        backoff = 1.0
+
+        for attempt in range(max_retries):
+            try:
+                resp = self.session.get(
+                    community_url,
+                    params={"search": mpn_clean},
+                    timeout=8,
+                    headers={
+                        "User-Agent": "BOM-Enrichment-Tool/2.0",
+                        "Accept": "application/json",
+                    },
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    components = data.get("components", []) if isinstance(data, dict) else []
+                    # Tam MPN eşleşmesi ara (orijinal mantık)
+                    for comp in components:
+                        candidate_mpn = comp.get("mfr", "")
+                        if is_exact_mpn_match(mpn_clean, candidate_mpn):
+                            lcsc_val = comp.get("lcsc", "")
+                            if lcsc_val:
+                                lcsc_str = str(lcsc_val).strip()
+                                lcsc_code = lcsc_str if lcsc_str.startswith("C") else f"C{lcsc_str}"
+                                print(f"DEBUG: Found LCSC: {lcsc_code} for MPN: {mpn_clean}")
+                                return lcsc_code
+                    # Tam eşleşme yoksa manufacturer_part_number parametresiyle ikinci bir deneme
+                    resp2 = self.session.get(
+                        community_url,
+                        params={"manufacturer_part_number": mpn_clean, "limit": 5},
+                        timeout=8,
+                        headers={
+                            "User-Agent": "BOM-Enrichment-Tool/2.0",
+                            "Accept": "application/json",
+                        },
+                    )
+                    if resp2.status_code == 200:
+                        data2 = resp2.json()
+                        components2 = data2.get("components", []) if isinstance(data2, dict) else []
+                        for comp in components2:
+                            candidate_mpn = comp.get("mfr", "") or comp.get("manufacturer_part_number", "")
+                            if is_exact_mpn_match(mpn_clean, candidate_mpn):
+                                lcsc_val = comp.get("lcsc", "") or comp.get("lcscPart", "") or comp.get("componentCode", "")
+                                if lcsc_val:
+                                    lcsc_str = str(lcsc_val).strip()
+                                    lcsc_code = lcsc_str if lcsc_str.startswith("C") else f"C{lcsc_str}"
+                                    print(f"DEBUG: Found LCSC: {lcsc_code} for MPN: {mpn_clean}")
+                                    return lcsc_code
+                    # Bulunamadı ama hata yok — sessizce None dön
+                    return None
+                elif resp.status_code in (429, 503):
+                    # Rate limit — tekrar dene
+                    if attempt < max_retries - 1:
+                        time.sleep(backoff * (2 ** attempt))
+                        continue
+                # Diğer HTTP hataları — sessizce None dön
+                return None
+            except Exception:
+                if attempt < max_retries - 1:
+                    time.sleep(backoff * (2 ** attempt))
+                    continue
+                return None
+
         return None
+
 
     def search_mpn(self, mpn: str, required_stock: int = 0, refresh: bool = False) -> JlcpcbSearchResult:
         """Search component by MPN: resolves LCSC code first, then queries official JOP OpenAPI."""
@@ -123,12 +187,23 @@ class JlcpcbSearcher:
             result.error = "Missing MPN"
             return result
 
-        # 1. Adım: MPN'i LCSC koduna çözümle
+        # 1. Adım: MPN'i LCSC koduna çözümle (topluluk arama servisi üzerinden)
         lcsc_code = self._resolve_lcsc_from_mpn(mpn_clean)
         if not lcsc_code:
+            # Harici servis yanıt vermedi / parçayı bulamadı.
+            # Hata verip durmak yerine boş LCSC ile dön;
+            # çağıran kod bunu "pending" olarak veritabanına kaydedecek
+            # ve kullanıcı ApprovalDialog üzerinden manuel girebilecek.
             result.found = False
-            result.error = "JLCPCB not found"
+            result.lcsc_code = ""
+            result.matched_mpn = mpn_clean
+            # error değil, sessizce dön — is_unapproved akışına bırak
             return result
+
+        # LCSC eşlemesi JOP ayrıntı isteğinden bağımsız olarak korunur. Böylece
+        # JOP yanıtı başarısız olsa bile pending approval kaydı öneriyi gösterir.
+        result.lcsc_code = lcsc_code
+        result.matched_mpn = mpn_clean
 
         # 2. Adım: Resmi SDK path'i ile resmi JOP API'sinden canlı veri çek
         path = "/overseas/openapi/component/getComponentDetailByCode"
@@ -424,26 +499,42 @@ class SearchWorker(QThread):
                     if result:
                         suggested_mpn = result.matched_mpn or item.mpn
                         suggested_lcsc = result.lcsc_code or ""
-                    enrich_bom_item(item, result)
+                    # is_unapproved ise sadece öneri topluyoruz, item durumunu bozmuyoruz
+                    if not is_unapproved:
+                        enrich_bom_item(item, result)
 
-                if dk_searcher.is_configured:
+                if dk_searcher.is_configured and not is_unapproved:
+                    # Pending parçalar için DigiKey araması yapmıyoruz — çok yavaş olur
+                    # DigiKey önerisi ancak mevcut DB'de boşsa aranır
                     self.progress.emit(idx + 1, total, mpn_display, "Searching DigiKey for pricing...")
                     dk_result = dk_searcher.search_item(item)
                     if dk_result:
                         suggested_digikey = dk_result.digikey_part_number or ""
                     enrich_bom_item_digikey(item, dk_result)
+                elif dk_searcher.is_configured and is_unapproved:
+                    # Pending için DigiKey önerisini sadece DB'de hiç kayıt yokken topla
+                    existing = self.db_manager.get_internal_mapping(internal_code)
+                    if existing is None or not existing.get("digikey_code"):
+                        self.progress.emit(idx + 1, total, mpn_display, "Searching DigiKey suggestion...")
+                        try:
+                            dk_result = dk_searcher.search_item(item)
+                            if dk_result:
+                                suggested_digikey = dk_result.digikey_part_number or ""
+                        except Exception:
+                            pass
 
                 if is_unapproved:
-                    self.db_manager.upsert_internal_mapping(
+                    # Kullanıcının ApprovalDialog'da manuel girdiği verileri koruyarak
+                    # sadece boş alanları doldur
+                    self.db_manager.insert_pending_suggestion(
                         comment_code=internal_code,
                         mpn=suggested_mpn,
                         lcsc_code=suggested_lcsc,
-                        approved=False,
-                        digikey_code=suggested_digikey
+                        digikey_code=suggested_digikey,
                     )
                     item.status = "Pending Approval"
                     item.jlcpcb_part_number = ""
-                    
+
                 self.item_result.emit(idx, item)
                 self.progress.emit(idx + 1, total, mpn_display, item.status)
 
@@ -452,6 +543,176 @@ class SearchWorker(QThread):
         except Exception as e:
             self.error.emit(str(e))
 
+
+# ═══════════════════════════════════════════════════════════════════
+#  Library Sync Worker
+# ═══════════════════════════════════════════════════════════════════
+
+class LibrarySyncWorker(QThread):
+    """Background worker that syncs the JOP component library to the local SQLite DB."""
+
+    progress = pyqtSignal(int, int, str)   # fetched, total, message
+    finished = pyqtSignal(int)             # total records written
+    error = pyqtSignal(str)
+
+    # JOP API kütüphane listesi endpoint'i
+    LIBRARY_PATH = "/overseas/openapi/component/getComponentLibraryList"
+    PAGE_SIZE = 100
+    MAX_PAGES = 2000  # güvenlik sınırı (~200k parça)
+
+    def __init__(self, app_id: str, access_key: str, secret_key: str, db_manager: DatabaseManager, parent=None):
+        super().__init__(parent)
+        self.app_id = app_id
+        self.access_key = access_key
+        self.secret_key = secret_key
+        self.db_manager = db_manager
+        self._cancelled = False
+        self._mutex = QMutex()
+        self._searcher = JlcpcbSearcher(app_id, access_key, secret_key, db_manager)
+
+    def cancel(self):
+        self._mutex.lock()
+        try:
+            self._cancelled = True
         finally:
-            searcher.close()
-            dk_searcher.close()
+            self._mutex.unlock()
+
+    def _is_cancelled(self) -> bool:
+        self._mutex.lock()
+        try:
+            return self._cancelled
+        finally:
+            self._mutex.unlock()
+
+    def run(self):
+        total_written = 0
+        page = 1
+        url = f"{API_BASE_URL}{self.LIBRARY_PATH}"
+
+        try:
+            while page <= self.MAX_PAGES:
+                if self._is_cancelled():
+                    break
+
+                payload = {"pageIndex": page, "pageSize": self.PAGE_SIZE}
+                body_str = json.dumps(payload, separators=(',', ':'), ensure_ascii=False)
+
+                try:
+                    auth_header = self._searcher._get_auth_header("POST", self.LIBRARY_PATH, body_str)
+                    headers = {
+                        "Content-Type": "application/json",
+                        "Authorization": auth_header,
+                        # Gerçekçi tarayıcı başlıkları — WAF / Cloudflare engelini aşmak için
+                        "User-Agent": (
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/124.0.0.0 Safari/537.36"
+                        ),
+                        "Accept": "application/json, text/plain, */*",
+                        "Accept-Language": "en-US,en;q=0.9",
+                        "Referer": "https://jlcpcb.com/",
+                        "Origin": "https://jlcpcb.com",
+                    }
+                    resp = self._searcher.session.post(url, data=body_str, headers=headers, timeout=30)
+
+                    # 403 / WAF engeli — çökme yerine kullanıcıya bilgi ver ve dur
+                    if resp.status_code == 403:
+                        self.error.emit(
+                            "403 Forbidden: JLCPCB API access denied (WAF/Cloudflare block).\n\n"
+                            "The bulk library download is not available via the API at this time.\n"
+                            "You can still manually enter LCSC codes in the Approval Dialog."
+                        )
+                        return
+
+                    resp.raise_for_status()
+                    data = resp.json()
+
+                except Exception as e:
+                    err_str = str(e)
+                    # HTTP 403 requests exception olarak da gelebilir
+                    if "403" in err_str:
+                        self.error.emit(
+                            "403 Forbidden: JLCPCB API access denied (WAF/Cloudflare block).\n\n"
+                            "The bulk library download is not available via the API at this time.\n"
+                            "You can still manually enter LCSC codes in the Approval Dialog."
+                        )
+                    else:
+                        self.error.emit(f"API request failed on page {page}: {err_str}")
+                    return
+
+                code = data.get("code", 200)
+                if code not in (200, 0):
+                    self.error.emit(f"API Error [{code}]: {data.get('message', 'Unknown error')}")
+                    return
+
+                response_data = data.get("data", {})
+                if isinstance(response_data, dict):
+                    components = (
+                        response_data.get("componentList", [])
+                        or response_data.get("components", [])
+                        or response_data.get("data", [])
+                    )
+                    total = response_data.get("totalCount", 0) or response_data.get("total", 0)
+                elif isinstance(response_data, list):
+                    components = response_data
+                    total = 0
+                else:
+                    components = []
+                    total = 0
+
+                if not components:
+                    # Son sayfa — daha fazla veri yok
+                    break
+
+                records = []
+                for comp in components:
+                    # JOP API alan isimleri farklı versiyonlarda değişiyor, hepsini dene
+                    lcsc_raw = (
+                        comp.get("componentCode", "")
+                        or comp.get("lcscCode", "")
+                        or comp.get("lcsc", "")
+                    )
+                    if not lcsc_raw:
+                        continue
+                    lcsc_str = str(lcsc_raw).strip()
+                    if not lcsc_str.startswith("C"):
+                        lcsc_str = f"C{lcsc_str}"
+
+                    mpn = (
+                        comp.get("componentModel", "")
+                        or comp.get("mfr", "")
+                        or comp.get("manufacturerPartNumber", "")
+                        or comp.get("mpn", "")
+                    ).strip()
+                    if not mpn:
+                        continue
+
+                    records.append({
+                        "lcsc_code": lcsc_str,
+                        "mpn": mpn,
+                        "manufacturer": comp.get("brandName", "") or comp.get("manufacturer", ""),
+                        "description": comp.get("describe", "") or comp.get("description", ""),
+                        "package": comp.get("componentSpecification", "") or comp.get("package", ""),
+                        "category": comp.get("firstTypeName", "") or comp.get("category", ""),
+                        "subcategory": comp.get("secondTypeName", "") or comp.get("subcategory", ""),
+                    })
+
+                written = self.db_manager.bulk_upsert_library(records)
+                total_written += written
+
+                self.progress.emit(
+                    total_written,
+                    total if total > 0 else total_written + self.PAGE_SIZE,
+                    f"Page {page}: +{written} records ({total_written} total)"
+                )
+
+                if len(components) < self.PAGE_SIZE:
+                    # Son sayfa
+                    break
+
+                page += 1
+
+            self.finished.emit(total_written)
+
+        except Exception as e:
+            self.error.emit(str(e))

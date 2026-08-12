@@ -203,19 +203,29 @@ class DigiKeySearcher:
                         result.manufacturer = mfr_obj.get("Name", "") if isinstance(mfr_obj, dict) else str(mfr_obj)
                         
                         variations = prod.get("ProductVariations", [])
-                        result.digikey_part_number = variations[0].get("DigiKeyProductNumber", "") if variations else ""
+                        best_var = None
+                        if variations:
+                            for var in variations:
+                                package = var.get("PackageType", {})
+                                package_name = package.get("Name", "") if isinstance(package, dict) else str(package)
+                                try:
+                                    moq = int(var.get("MinimumOrderQuantity", 0))
+                                except:
+                                    moq = 0
+                                if "Cut Tape" in package_name or "CT" in package_name or moq == 1:
+                                    best_var = var
+                                    break
+                            if not best_var:
+                                best_var = variations[0]
+                                
+                        result.digikey_part_number = best_var.get("DigiKeyProductNumber", "") if best_var else ""
                         
                         result.stock = int(prod.get("QuantityAvailable", 0))
                         
                         desc_obj = prod.get("Description", {})
                         result.description = desc_obj.get("ProductDescription", "")
                         
-                        std_pricing = []
-                        if variations:
-                            for var in variations:
-                                if var.get("StandardPricing"):
-                                    std_pricing = var.get("StandardPricing")
-                                    break
+                        std_pricing = best_var.get("StandardPricing", []) if best_var else []
                         
                         pbs = []
                         for pb in std_pricing:
@@ -237,10 +247,25 @@ class DigiKeySearcher:
                     mfr_obj = prod.get("Manufacturer", {})
                     variations = prod.get("ProductVariations", [])
                     
+                    best_cand_var = None
+                    if variations:
+                        for var in variations:
+                            package = var.get("PackageType", {})
+                            package_name = package.get("Name", "") if isinstance(package, dict) else str(package)
+                            try:
+                                moq = int(var.get("MinimumOrderQuantity", 0))
+                            except:
+                                moq = 0
+                            if "Cut Tape" in package_name or "CT" in package_name or moq == 1:
+                                best_cand_var = var
+                                break
+                        if not best_cand_var:
+                            best_cand_var = variations[0]
+                    
                     result.candidates.append({
                         "mpn": prod.get("ManufacturerProductNumber", ""),
                         "manufacturer": mfr_obj.get("Name", "") if isinstance(mfr_obj, dict) else str(mfr_obj),
-                        "digikey_pn": variations[0].get("DigiKeyProductNumber", "") if variations else "",
+                        "digikey_pn": best_cand_var.get("DigiKeyProductNumber", "") if best_cand_var else "",
                         "stock": int(prod.get("QuantityAvailable", 0)),
                     })
 

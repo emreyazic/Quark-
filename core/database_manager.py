@@ -55,6 +55,21 @@ class DatabaseManager:
                     )
                 ''')
                 
+                # Table 3: local_jlc_library  (MPN -> LCSC kalıcı eşleme, JOP API'den senkronize)
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS local_jlc_library (
+                        lcsc_code TEXT PRIMARY KEY,
+                        mpn TEXT NOT NULL,
+                        manufacturer TEXT,
+                        description TEXT,
+                        package TEXT,
+                        category TEXT,
+                        subcategory TEXT,
+                        synced_at REAL NOT NULL DEFAULT 0
+                    )
+                ''')
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_lib_mpn ON local_jlc_library (mpn COLLATE NOCASE)')
+                
                 conn.commit()
 
     # =========================================================
@@ -76,7 +91,7 @@ class DatabaseManager:
                 return None
 
     def upsert_internal_mapping(self, comment_code: str, mpn: str, lcsc_code: str, approved: bool, digikey_code: str = "") -> None:
-        """Inserts or updates an internal mapping."""
+        """Inserts or updates an internal mapping (full overwrite — use for approvals)."""
         with self._lock:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
@@ -89,6 +104,40 @@ class DatabaseManager:
                         digikey_code = excluded.digikey_code,
                         approved = excluded.approved
                 ''', (comment_code, mpn, lcsc_code, digikey_code, 1 if approved else 0))
+                conn.commit()
+
+    def insert_pending_suggestion(self, comment_code: str, mpn: str = "", lcsc_code: str = "", digikey_code: str = "") -> None:
+        """Creates a new pending record OR fills in ONLY empty suggestion fields on an existing pending record.
+        
+        This preserves any manual edits the user has made in ApprovalDialog.
+        Never overwrites an approved record.
+        """
+        with self._lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                # Önce mevcut kaydı kontrol et
+                cursor.execute(
+                    "SELECT comment_code, mpn, lcsc_code, digikey_code, approved FROM internal_mappings WHERE comment_code = ?",
+                    (comment_code,)
+                )
+                existing = cursor.fetchone()
+
+                if existing is None:
+                    # Yeni kayıt — direkt ekle
+                    cursor.execute(
+                        "INSERT INTO internal_mappings (comment_code, mpn, lcsc_code, digikey_code, approved) VALUES (?, ?, ?, ?, 0)",
+                        (comment_code, mpn, lcsc_code, digikey_code)
+                    )
+                elif existing["approved"] == 0:
+                    # Mevcut pending kayıt — sadece boş alanları doldur
+                    new_mpn = existing["mpn"] or mpn
+                    new_lcsc = existing["lcsc_code"] or lcsc_code
+                    new_dk = existing["digikey_code"] or digikey_code
+                    cursor.execute(
+                        "UPDATE internal_mappings SET mpn = ?, lcsc_code = ?, digikey_code = ? WHERE comment_code = ?",
+                        (new_mpn, new_lcsc, new_dk, comment_code)
+                    )
+                # approved == 1 ise hiçbir şey yapma — onaylı kaydı koru
                 conn.commit()
 
     def delete_internal_mapping(self, comment_code: str) -> None:
@@ -159,3 +208,70 @@ class DatabaseManager:
                 cursor = conn.cursor()
                 cursor.execute("DELETE FROM api_cache WHERE timestamp < ?", (cutoff_timestamp,))
                 conn.commit()
+
+    # =========================================================
+    # LOCAL JLC LIBRARY METHODS
+    # =========================================================
+
+    def lookup_lcsc_by_mpn(self, mpn: str) -> Optional[str]:
+        """Returns the LCSC code for the given MPN from the local library (case-insensitive)."""
+        with self._lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT lcsc_code FROM local_jlc_library WHERE mpn = ? COLLATE NOCASE LIMIT 1",
+                    (mpn.strip(),)
+                )
+                row = cursor.fetchone()
+                return row["lcsc_code"] if row else None
+
+    def get_library_count(self) -> int:
+        """Returns the number of components in the local library."""
+        with self._lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT COUNT(*) FROM local_jlc_library")
+                return cursor.fetchone()[0]
+
+    def bulk_upsert_library(self, records: list) -> int:
+        """Bulk inserts or replaces library records. Returns the number of records written.
+        
+        Each record must be a dict with keys:
+            lcsc_code, mpn, manufacturer, description, package, category, subcategory, synced_at
+        """
+        if not records:
+            return 0
+        import time
+        now = time.time()
+        with self._lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                data = [
+                    (
+                        r.get("lcsc_code", ""),
+                        r.get("mpn", ""),
+                        r.get("manufacturer", ""),
+                        r.get("description", ""),
+                        r.get("package", ""),
+                        r.get("category", ""),
+                        r.get("subcategory", ""),
+                        now,
+                    )
+                    for r in records
+                    if r.get("lcsc_code") and r.get("mpn")
+                ]
+                cursor.executemany('''
+                    INSERT INTO local_jlc_library
+                        (lcsc_code, mpn, manufacturer, description, package, category, subcategory, synced_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(lcsc_code) DO UPDATE SET
+                        mpn        = excluded.mpn,
+                        manufacturer = excluded.manufacturer,
+                        description  = excluded.description,
+                        package      = excluded.package,
+                        category     = excluded.category,
+                        subcategory  = excluded.subcategory,
+                        synced_at    = excluded.synced_at
+                ''', data)
+                conn.commit()
+                return len(data)
