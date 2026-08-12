@@ -57,6 +57,8 @@ class BomItem:
 
     # Enrichment result fields
     jlcpcb_part_number: str = ""  # e.g. "C77058" — blank unless exact match + sufficient stock
+    jlcpcb_category: Optional[str] = ""
+    jlcpcb_package: Optional[str] = ""
     matched_mpn: str = ""  # The MPN exactly matched by JLCPCB
     exact_match: bool = False  # True only if requested MPN exactly matches source MPN
     available_stock_qty: Optional[int] = None

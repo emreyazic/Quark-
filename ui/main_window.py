@@ -44,6 +44,9 @@ from ui.column_mapper_widget import ColumnMapperDialog
 from ui.file_manager_widget import FileManagerWidget
 from ui.progress_widget import ProgressWidget
 
+APP_ID = "610325957269491714"
+ACCESS_KEY = "8a568b68cf754f46ac0c279920f8e9cb"
+SECRET_KEY = "mbEtcCNB28Nf5N1GgnbmPmpNVOKjBbjI"
 
 # ═══════════════════════════════════════════════════════════════════
 #  Manual Search Worker
@@ -69,7 +72,7 @@ class ManualSearchWorker(QThread):
 
         # ── JLCPCB Search ────────────────────────────────────────
         try:
-            jlc = JlcpcbSearcher()
+            jlc = JlcpcbSearcher(APP_ID, ACCESS_KEY, SECRET_KEY)
             jlc_result = jlc.search_mpn(mpn_clean, required_stock=0)
 
             if jlc_result.error:
@@ -818,7 +821,7 @@ class MainWindow(QMainWindow):
         self._progress_widget.reset(len(self._all_items))
 
         # Start search worker
-        self._search_worker = SearchWorker(self._all_items)
+        self._search_worker = SearchWorker(self._all_items, APP_ID, ACCESS_KEY, SECRET_KEY)
         self._search_worker.progress.connect(self._on_search_progress)
         self._search_worker.finished_all.connect(self._on_search_finished)
         self._search_worker.error.connect(self._on_search_error)

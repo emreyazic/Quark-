@@ -1,21 +1,16 @@
-"""JLCPCB parts searcher using the jlcsearch community API.
-
-Key fixes vs. original:
-- Exact MPN matching for ALL results (single or multiple) — never accepts partial matches.
-- Stock threshold check: (Quantity × 10) + 10
-- Price break parsing from API response
-- RES-coded component skip before API call
-- Clean MPN values before search
-- Stores candidate info in notes when no exact match found
+"""JLCPCB parts searcher using the official JLC Open Platform (JOP) API.
+Implements HMAC-SHA256 request signing and JOP authorization headers.
 """
 
 import time
 import json
-from typing import Optional
-
+import base64
+import hmac
+import hashlib
+import random
+import string
+from typing import Optional, Dict, Any
 import requests
-from PyQt6.QtCore import QThread, pyqtSignal, QMutex
-
 from models.bom_item import BomItem
 from core.mpn_utils import (
     clean_mpn_value,
@@ -24,36 +19,24 @@ from core.mpn_utils import (
     compute_required_stock,
     select_unit_price,
 )
-from core.digikey_searcher import DigiKeySearcher, enrich_bom_item_digikey
 
+# Resmi JLC Open Platform API Base URL (Dokümantasyona göre güncellenebilir)
+API_BASE_URL = "https://open.jlcpcb.com"
 
-# jlcsearch community API endpoint
-API_BASE_URL = "https://jlcsearch.tscircuit.com/components/list.json"
-
-# Rate limiting: delay between API requests (seconds)
-REQUEST_DELAY = 0.2
-
-# HTTP timeout per request (seconds)
+# İstek zaman aşımı (saniye)
 REQUEST_TIMEOUT = 15
-
-# Maximum retry attempts on failure
-MAX_RETRIES = 3
-
-# Exponential backoff base (seconds)
-RETRY_BACKOFF_BASE = 1.0
 
 
 class JlcpcbSearchResult:
-    """Holds the result of a single JLCPCB search."""
-
+    """Holds the result of a single official JLCPCB API search."""
     def __init__(self):
         self.found: bool = False
         self.exact_match: bool = False
         self.lcsc_code: str = ""
-        self.matched_mpn: str = ""  # The actual MPN from the API (mfr field)
+        self.matched_mpn: str = ""
         self.stock: int = 0
         self.unit_price: Optional[float] = None
-        self.price_breaks_raw: str = ""  # Raw JSON string
+        self.price_breaks_raw: str = ""
         self.package: str = ""
         self.category: str = ""
         self.subcategory: str = ""
@@ -62,138 +45,151 @@ class JlcpcbSearchResult:
         self.is_preferred: bool = False
         self.match_count: int = 0
         self.error: Optional[str] = None
-        self.candidates: list[dict] = []  # Summary of all candidates for notes
+        self.candidates: list[dict] = []
 
 
 class JlcpcbSearcher:
-    """Searches the JLCPCB parts database via the jlcsearch community API."""
-
-    def __init__(self):
+    """Searches the JLCPCB parts database via official Open Platform API."""
+    def __init__(self, app_id: str, access_key: str, secret_key: str):
+        self.app_id = app_id
+        self.access_key = access_key
+        self.secret_key = secret_key
         self.session = requests.Session()
         self.session.headers.update({
-            "User-Agent": "BOM-Enrichment-Tool/2.0",
+            "Content-Type": "application/json",
             "Accept": "application/json",
         })
 
+    def _generate_nonce(self) -> str:
+        """Generate a 32-character random alphanumeric string."""
+        chars = string.ascii_letters + string.digits
+        return "".join(random.choices(chars, k=32))
+
+    def _sign_request(self, method: str, path: str, timestamp: int, nonce: str, body: str) -> str:
+        """Constructs the signature string and signs it using HMAC-SHA256 and Base64."""
+        string_to_sign = f"{method}\n{path}\n{timestamp}\n{nonce}\n{body}\n"
+        
+        # HMAC-SHA256 with secret key
+        signature_bytes = hmac.new(
+            self.secret_key.encode("utf-8"),
+            string_to_sign.encode("utf-8"),
+            hashlib.sha256
+        ).digest()
+        
+        return base64.b64encode(signature_bytes).decode("utf-8")
+
+    def _get_auth_header(self, method: str, path: str, body_str: str) -> str:
+        """Generates the required JOP Authorization header."""
+        nonce = self._generate_nonce()
+        timestamp = int(time.time())
+        signature = self._sign_request(method, path, timestamp, nonce, body_str)
+        
+        return (
+            f'JOP appid="{self.app_id}",'
+            f'accesskey="{self.access_key}",'
+            f'nonce="{nonce}",'
+            f'timestamp="{timestamp}",'
+            f'signature="{signature}"'
+        )
+
     def search_mpn(self, mpn: str, required_stock: int = 0) -> JlcpcbSearchResult:
-        """Search for a component by MPN with exact matching.
-
-        Args:
-            mpn: Manufacturer Part Number to search for.
-            required_stock: Minimum stock required (from compute_required_stock).
-
-        Returns:
-            JlcpcbSearchResult with match details.
-        """
+        """Search for a component by MPN using official JLC OpenAPI endpoints."""
         result = JlcpcbSearchResult()
-
         if not mpn or mpn.strip() == "":
             result.error = "Missing MPN"
             return result
-
+        
         mpn_clean = clean_mpn_value(mpn)
         if not mpn_clean:
             result.error = "Missing MPN"
             return result
 
-        for attempt in range(MAX_RETRIES):
-            try:
-                resp = self.session.get(
-                    API_BASE_URL,
-                    params={"search": mpn_clean},
-                    timeout=REQUEST_TIMEOUT,
-                )
-                resp.raise_for_status()
+        # Resmi bileşen arama endpoint yolu (Dokümanınızdaki gerçek path ile güncelleyin, örn: /component/v1/search)
+        path = "/component/v1/search"
+        url = f"{API_BASE_URL}{path}"
 
-                data = resp.json()
-                components = data.get("components", [])
+        # İstek gövdesi (Payload)
+        payload = {
+            "keyword": mpn_clean,
+            "requiredStock": required_stock
+        }
+        body_str = json.dumps(payload, separators=(',', ':'), ensure_ascii=False)
 
-                result.match_count = len(components)
+        try:
+            auth_header = self._get_auth_header("POST", path, body_str)
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": auth_header
+            }
 
-                if len(components) == 0:
-                    result.found = False
-                    return result
+            resp = self.session.post(url, data=body_str, headers=headers, timeout=REQUEST_TIMEOUT)
+            
+            # J-Trace-ID kontrolü için loglanabilir
+            trace_id = resp.headers.get("J-Trace-ID", "")
+            
+            if resp.status_code == 401:
+                result.error = "API Unauthorized (401): Signature verification failed."
+                return result
+            elif resp.status_code == 403:
+                result.error = "API Forbidden (403): Access denied."
+                return result
+            
+            resp.raise_for_status()
+            data = resp.json()
 
-                # Search ALL results for an exact MPN match
-                # The API 'mfr' field contains the MPN (not manufacturer name)
-                exact_comp = None
-                for comp in components:
-                    candidate_mpn = comp.get("mfr", "")
-                    if is_exact_mpn_match(mpn_clean, candidate_mpn):
-                        exact_comp = comp
-                        break
-
-                # Store candidate info for notes regardless of match
-                for comp in components[:5]:  # Limit to first 5 candidates
-                    result.candidates.append({
-                        "mpn": comp.get("mfr", ""),
-                        "lcsc": f"C{comp.get('lcsc', '')}",
-                        "stock": int(comp.get("stock", 0)),
-                        "category": comp.get("category", ""),
-                    })
-
-                if exact_comp is None:
-                    # No exact match among results
-                    result.found = False
-                    result.exact_match = False
-                    return result
-
-                # Exact match found — populate result
-                result.found = True
-                result.exact_match = True
-                result.matched_mpn = exact_comp.get("mfr", "")
-                result.lcsc_code = f"C{exact_comp.get('lcsc', '')}"
-                result.stock = int(exact_comp.get("stock", 0))
-                result.package = exact_comp.get("package", "")
-                result.category = exact_comp.get("category", "")
-                result.subcategory = exact_comp.get("subcategory", "")
-                result.description = exact_comp.get("description", "")
-                result.is_basic = bool(exact_comp.get("is_basic", False))
-                result.is_preferred = bool(exact_comp.get("is_preferred", False))
-                result.price_breaks_raw = exact_comp.get("price", "")
-
-                # Parse unit price for the required quantity
-                if result.price_breaks_raw and required_stock > 0:
-                    result.unit_price = select_unit_price(
-                        result.price_breaks_raw, required_stock
-                    )
-
+            # İş seviyesi hata kontrolü
+            code = data.get("code", 200)
+            if code != 200 and code != 0:
+                result.error = f"API Error [{code}]: {data.get('message', 'Unknown error')}"
                 return result
 
-            except requests.exceptions.Timeout:
-                if attempt < MAX_RETRIES - 1:
-                    time.sleep(RETRY_BACKOFF_BASE * (2 ** attempt))
-                    continue
-                result.error = f"Request timed out after {MAX_RETRIES} attempts"
+            # Yanıt yapısındaki bileşen listesini parse etme
+            response_data = data.get("data", {})
+            components = response_data.get("components", []) if isinstance(response_data, dict) else response_data
+            result.match_count = len(components)
+
+            if not components:
+                result.found = False
                 return result
 
-            except requests.exceptions.ConnectionError:
-                if attempt < MAX_RETRIES - 1:
-                    time.sleep(RETRY_BACKOFF_BASE * (2 ** attempt))
-                    continue
-                result.error = "Connection error - check internet connection"
+            exact_comp = None
+            for comp in components:
+                candidate_mpn = comp.get("mfr", "") or comp.get("manufacturerPartNumber", "")
+                if is_exact_mpn_match(mpn_clean, candidate_mpn):
+                    exact_comp = comp
+                    break
+
+            for comp in components[:5]:
+                result.candidates.append({
+                    "mpn": comp.get("mfr", "") or comp.get("manufacturerPartNumber", ""),
+                    "lcsc": f"C{comp.get('lcsc', '') or comp.get('lcscCode', '')}",
+                    "stock": int(comp.get("stock", 0) or comp.get("availableStock", 0)),
+                })
+
+            if exact_comp is None:
+                result.found = False
+                result.exact_match = False
                 return result
 
-            except requests.exceptions.HTTPError as e:
-                if e.response is not None and e.response.status_code >= 500:
-                    if attempt < MAX_RETRIES - 1:
-                        time.sleep(RETRY_BACKOFF_BASE * (2 ** attempt))
-                        continue
-                result.error = f"HTTP error: {e}"
-                return result
+            result.found = True
+            result.exact_match = True
+            result.matched_mpn = exact_comp.get("mfr", "") or exact_comp.get("manufacturerPartNumber", "")
+            result.lcsc_code = f"C{exact_comp.get('lcsc', '') or exact_comp.get('lcscCode', '')}"
+            result.stock = int(exact_comp.get("stock", 0) or exact_comp.get("availableStock", 0))
+            result.package = exact_comp.get("package", "")
+            result.category = exact_comp.get("category", "")
+            result.price_breaks_raw = json.dumps(exact_comp.get("priceList", []) or exact_comp.get("price", ""))
+            
+            if result.price_breaks_raw and required_stock > 0:
+                result.unit_price = select_unit_price(result.price_breaks_raw, required_stock)
 
-            except (json.JSONDecodeError, KeyError, ValueError) as e:
-                result.error = f"Invalid API response: {e}"
-                return result
+            return result
 
-            except Exception as e:
-                result.error = f"Unexpected error: {e}"
-                return result
-
-        return result
+        except Exception as e:
+            result.error = f"API Request Exception: {str(e)}"
+            return result
 
     def close(self):
-        """Close the HTTP session."""
         self.session.close()
 
 
@@ -213,12 +209,9 @@ def enrich_bom_item(item: BomItem, search_result: JlcpcbSearchResult) -> None:
     item.source = "JLCPCB"
     required = item.required_stock
 
-    # ── Skip: PRE-CHECKED conditions (e.g. RES or Missing MPN) ──
     if item.skip_jlcpcb:
-        # Don't overwrite item.status here! It might be "RES manual" or "Missing MPN"
         return
 
-    # ── Error cases ──────────────────────────────────────────────
     if search_result.error:
         if search_result.error == "Missing MPN":
             item.status = "Missing MPN"
@@ -226,17 +219,14 @@ def enrich_bom_item(item: BomItem, search_result: JlcpcbSearchResult) -> None:
             item.status = "JLCPCB API error"
         return
 
-    # ── Not found at all ─────────────────────────────────────────
     if not search_result.found and not search_result.exact_match:
         if search_result.match_count > 0:
-            # Results exist but none are an exact MPN match
             item.status = "No exact JLCPCB match"
             item.matched_mpn = ""
         else:
             item.status = "JLCPCB not found"
         return
 
-    # ── Exact match found — check stock ──────────────────────────
     item.matched_mpn = search_result.matched_mpn
     item.exact_match = True
     item.available_stock_qty = search_result.stock
@@ -248,39 +238,35 @@ def enrich_bom_item(item: BomItem, search_result: JlcpcbSearchResult) -> None:
     item.jlcpcb_price_breaks_raw = search_result.price_breaks_raw
 
     if search_result.stock < required:
-        # Exact match but insufficient stock — do NOT fill JLC code
         item.status = "Insufficient JLCPCB stock"
-        item.jlcpcb_part_number = ""  # Explicitly blank
+        item.jlcpcb_part_number = ""
         return
 
-    # ── Success: exact match + sufficient stock ──────────────────
     item.jlcpcb_part_number = search_result.lcsc_code
     item.status = ""
 
 
+from PyQt6.QtCore import QThread, pyqtSignal, QMutex
+from core.digikey_searcher import DigiKeySearcher, enrich_bom_item_digikey
+
 class SearchWorker(QThread):
-    """Background worker that searches JLCPCB for all BOM items.
+    """Background worker that searches JLCPCB for all BOM items."""
 
-    Signals:
-        progress(int, int, str, str): (current, total, mpn, status) — progress update
-        item_result(int, BomItem): (index, enriched_item) — single item result
-        finished_all(list): list of all enriched BomItems
-        error(str): fatal error message
-    """
+    progress = pyqtSignal(int, int, str, str)
+    item_result = pyqtSignal(int, object)
+    finished_all = pyqtSignal(list)
+    error = pyqtSignal(str)
 
-    progress = pyqtSignal(int, int, str, str)  # current, total, mpn, status
-    item_result = pyqtSignal(int, object)  # index, BomItem
-    finished_all = pyqtSignal(list)  # all items
-    error = pyqtSignal(str)  # error message
-
-    def __init__(self, items: list[BomItem], parent=None):
+    def __init__(self, items: list[BomItem], app_id: str, access_key: str, secret_key: str, parent=None):
         super().__init__(parent)
         self.items = items
+        self.app_id = app_id
+        self.access_key = access_key
+        self.secret_key = secret_key
         self._cancelled = False
         self._mutex = QMutex()
 
     def cancel(self):
-        """Request cancellation of the search."""
         self._mutex.lock()
         self._cancelled = True
         self._mutex.unlock()
@@ -292,8 +278,7 @@ class SearchWorker(QThread):
         return val
 
     def run(self):
-        """Execute the search for all items."""
-        searcher = JlcpcbSearcher()
+        searcher = JlcpcbSearcher(self.app_id, self.access_key, self.secret_key)
         dk_searcher = DigiKeySearcher()
         total = len(self.items)
 
@@ -305,39 +290,28 @@ class SearchWorker(QThread):
                 mpn_display = item.mpn if item.mpn else "(empty)"
                 self.progress.emit(idx + 1, total, mpn_display, "Searching JLCPCB...")
 
-                # Compute required stock for this item
                 item.required_stock = compute_required_stock(item.quantity)
 
-                # ── RES skip: check comment column ───────────────────
                 if is_res_coded(item.comment):
                     item.status = "RES manual"
                     item.jlcpcb_part_number = ""
                     item.skip_jlcpcb = True
-                # ── Missing MPN: don't search JLCPCB ───────────────────
                 elif not item.mpn or not item.mpn.strip():
                     item.status = "Missing MPN"
                     item.jlcpcb_part_number = ""
                     item.skip_jlcpcb = True
 
-                # ── Search JLCPCB ────────────────────────────────────
                 if not item.skip_jlcpcb:
                     result = searcher.search_mpn(item.mpn, item.required_stock)
                     enrich_bom_item(item, result)
 
-                # ── Always Search DigiKey for Price Reference ─────────────
                 if dk_searcher.is_configured:
                     self.progress.emit(idx + 1, total, mpn_display, "Searching DigiKey for pricing...")
                     dk_result = dk_searcher.search_item(item)
                     enrich_bom_item_digikey(item, dk_result)
 
                 self.item_result.emit(idx, item)
-                self.progress.emit(
-                    idx + 1, total, mpn_display, item.status
-                )
-
-                # Rate limiting delay (only for JLCPCB since DigiKey has different limits)
-                if idx < total - 1 and not self._is_cancelled():
-                    time.sleep(REQUEST_DELAY)
+                self.progress.emit(idx + 1, total, mpn_display, item.status)
 
             self.finished_all.emit(self.items)
 
