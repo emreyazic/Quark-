@@ -1,0 +1,9 @@
+Metadata-Version: 2.4
+Name: jlcpcb_bom_tool
+Version: 1.0.0
+Summary: JLCPCB BOM Enrichment Tool
+Requires-Python: >=3.8
+Requires-Dist: requests
+Requires-Dist: PyQt6
+Requires-Dist: pandas
+Requires-Dist: openpyxl

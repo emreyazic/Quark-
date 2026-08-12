@@ -308,8 +308,9 @@ class FileManagerWidget(QWidget):
             proj_item.setFont(0, font)
             
             # Set folder icon if available in OS theme, otherwise just bold is fine
-            if QIcon.hasThemeIcon("folder"):
-                proj_item.setIcon(0, QIcon.fromTheme("folder"))
+            # BUG FIX: QIcon.hasThemeIcon("folder") causes ~18 minute freeze on some Windows systems
+            # if QIcon.hasThemeIcon("folder"):
+            #     proj_item.setIcon(0, QIcon.fromTheme("folder"))
             
             # Status column for Project
             num_boards = len(project.board_items)

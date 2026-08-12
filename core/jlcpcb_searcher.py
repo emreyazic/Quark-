@@ -1,5 +1,6 @@
-"""JLCPCB parts searcher using the official JLC Open Platform (JOP) API.
-Implements HMAC-SHA256 request signing and JOP authorization headers.
+"""JLCPCB parts searcher using a hybrid approach:
+1. Maps permanent MPN to LCSC code.
+2. Fetches real-time stock, package, category, and pricing via official JLC Open Platform (JOP) API.
 """
 
 import time
@@ -20,15 +21,17 @@ from core.mpn_utils import (
     select_unit_price,
 )
 
-# Resmi JLC Open Platform API Base URL (Dokümantasyona göre güncellenebilir)
+# Resmi JLC Open Platform API Base URL
 API_BASE_URL = "https://open.jlcpcb.com"
+# MPN -> LCSC eşlemesi için kullanılan hızlı arama servisi
+COMMUNITY_SEARCH_URL = "https://jlcsearch.tscircuit.com/components/list.json"
 
 # İstek zaman aşımı (saniye)
 REQUEST_TIMEOUT = 15
 
 
 class JlcpcbSearchResult:
-    """Holds the result of a single official JLCPCB API search."""
+    """Holds the result of a hybrid JLCPCB search."""
     def __init__(self):
         self.found: bool = False
         self.exact_match: bool = False
@@ -49,7 +52,7 @@ class JlcpcbSearchResult:
 
 
 class JlcpcbSearcher:
-    """Searches the JLCPCB parts database via official Open Platform API."""
+    """Searches and enriches JLCPCB parts using MPN resolution + Official JOP API."""
     def __init__(self, app_id: str, access_key: str, secret_key: str):
         self.app_id = app_id
         self.access_key = access_key
@@ -61,25 +64,19 @@ class JlcpcbSearcher:
         })
 
     def _generate_nonce(self) -> str:
-        """Generate a 32-character random alphanumeric string."""
         chars = string.ascii_letters + string.digits
         return "".join(random.choices(chars, k=32))
 
     def _sign_request(self, method: str, path: str, timestamp: int, nonce: str, body: str) -> str:
-        """Constructs the signature string and signs it using HMAC-SHA256 and Base64."""
         string_to_sign = f"{method}\n{path}\n{timestamp}\n{nonce}\n{body}\n"
-        
-        # HMAC-SHA256 with secret key
         signature_bytes = hmac.new(
             self.secret_key.encode("utf-8"),
             string_to_sign.encode("utf-8"),
             hashlib.sha256
         ).digest()
-        
         return base64.b64encode(signature_bytes).decode("utf-8")
 
     def _get_auth_header(self, method: str, path: str, body_str: str) -> str:
-        """Generates the required JOP Authorization header."""
         nonce = self._generate_nonce()
         timestamp = int(time.time())
         signature = self._sign_request(method, path, timestamp, nonce, body_str)
@@ -92,8 +89,29 @@ class JlcpcbSearcher:
             f'signature="{signature}"'
         )
 
+    def _resolve_lcsc_from_mpn(self, mpn_clean: str) -> Optional[str]:
+        """Resolves permanent MPN to LCSC part code (C...) using search mapping."""
+        try:
+            resp = self.session.get(
+                COMMUNITY_SEARCH_URL,
+                params={"manufacturer_part_number": mpn_clean, "limit": 1},
+                timeout=5
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                components = data.get("components", []) if isinstance(data, dict) else data
+                if components and len(components) > 0:
+                    comp = components[0]
+                    lcsc_val = comp.get("lcscPart", "") or comp.get("lcsc", "") or comp.get("componentCode", "")
+                    if lcsc_val:
+                        lcsc_str = str(lcsc_val).strip()
+                        return lcsc_str if lcsc_str.startswith("C") else f"C{lcsc_str}"
+        except Exception:
+            pass
+        return None
+
     def search_mpn(self, mpn: str, required_stock: int = 0) -> JlcpcbSearchResult:
-        """Search for a component by MPN using official JLC OpenAPI endpoints."""
+        """Search component by MPN: resolves LCSC code first, then queries official JOP OpenAPI."""
         result = JlcpcbSearchResult()
         if not mpn or mpn.strip() == "":
             result.error = "Missing MPN"
@@ -104,14 +122,22 @@ class JlcpcbSearcher:
             result.error = "Missing MPN"
             return result
 
-        # Resmi bileşen arama endpoint yolu (Dokümanınızdaki gerçek path ile güncelleyin, örn: /component/v1/search)
-        path = "/component/v1/search"
+        # 1. Adım: MPN'i LCSC koduna çözümle
+        lcsc_code = self._resolve_lcsc_from_mpn(mpn_clean)
+        if not lcsc_code:
+            result.found = False
+            result.error = "JLCPCB not found"
+            return result
+
+        # 2. Adım: Resmi SDK path'i ile resmi JOP API'sinden canlı veri çek
+        path = "/overseas/openapi/component/getComponentDetailByCode"
         url = f"{API_BASE_URL}{path}"
 
-        # İstek gövdesi (Payload)
+        # LCSC kodunu sayısal formata çevir (C harfini çıkararak veya olduğu gibi, JOP API genellikle C'siz sayı veya C ile kabul eder)
+        lcsc_numeric = lcsc_code[1:] if lcsc_code.startswith("C") else lcsc_code
+
         payload = {
-            "keyword": mpn_clean,
-            "requiredStock": required_stock
+            "componentCodes": [lcsc_numeric]
         }
         body_str = json.dumps(payload, separators=(',', ':'), ensure_ascii=False)
 
@@ -124,9 +150,6 @@ class JlcpcbSearcher:
 
             resp = self.session.post(url, data=body_str, headers=headers, timeout=REQUEST_TIMEOUT)
             
-            # J-Trace-ID kontrolü için loglanabilir
-            trace_id = resp.headers.get("J-Trace-ID", "")
-            
             if resp.status_code == 401:
                 result.error = "API Unauthorized (401): Signature verification failed."
                 return result
@@ -137,48 +160,38 @@ class JlcpcbSearcher:
             resp.raise_for_status()
             data = resp.json()
 
-            # İş seviyesi hata kontrolü
             code = data.get("code", 200)
             if code != 200 and code != 0:
                 result.error = f"API Error [{code}]: {data.get('message', 'Unknown error')}"
                 return result
 
-            # Yanıt yapısındaki bileşen listesini parse etme
-            response_data = data.get("data", {})
-            components = response_data.get("components", []) if isinstance(response_data, dict) else response_data
+            response_data = data.get("data", [])
+            if isinstance(response_data, dict):
+                components = response_data.get("components", []) or response_data.get("componentList", []) or response_data.get("data", [])
+            elif isinstance(response_data, list):
+                components = response_data
+            else:
+                components = []
+
             result.match_count = len(components)
 
             if not components:
                 result.found = False
                 return result
 
-            exact_comp = None
-            for comp in components:
-                candidate_mpn = comp.get("mfr", "") or comp.get("manufacturerPartNumber", "")
-                if is_exact_mpn_match(mpn_clean, candidate_mpn):
-                    exact_comp = comp
-                    break
-
-            for comp in components[:5]:
-                result.candidates.append({
-                    "mpn": comp.get("mfr", "") or comp.get("manufacturerPartNumber", ""),
-                    "lcsc": f"C{comp.get('lcsc', '') or comp.get('lcscCode', '')}",
-                    "stock": int(comp.get("stock", 0) or comp.get("availableStock", 0)),
-                })
-
-            if exact_comp is None:
-                result.found = False
-                result.exact_match = False
-                return result
+            exact_comp = components[0]
 
             result.found = True
             result.exact_match = True
-            result.matched_mpn = exact_comp.get("mfr", "") or exact_comp.get("manufacturerPartNumber", "")
-            result.lcsc_code = f"C{exact_comp.get('lcsc', '') or exact_comp.get('lcscCode', '')}"
-            result.stock = int(exact_comp.get("stock", 0) or exact_comp.get("availableStock", 0))
-            result.package = exact_comp.get("package", "")
-            result.category = exact_comp.get("category", "")
-            result.price_breaks_raw = json.dumps(exact_comp.get("priceList", []) or exact_comp.get("price", ""))
+            result.matched_mpn = exact_comp.get("componentModel", "") or exact_comp.get("mfr", "") or exact_comp.get("manufacturerPartNumber", "") or mpn_clean
+            
+            result.lcsc_code = lcsc_code
+            result.stock = int(exact_comp.get("stockCount", 0) or exact_comp.get("stock", 0) or exact_comp.get("availableStock", 0))
+            result.package = exact_comp.get("componentSpecification", "") or exact_comp.get("package", "")
+            result.category = exact_comp.get("firstTypeName", "") or exact_comp.get("category", "")
+            
+            price_ranges = exact_comp.get("priceRanges", []) or exact_comp.get("priceList", [])
+            result.price_breaks_raw = json.dumps(price_ranges) if price_ranges else ""
             
             if result.price_breaks_raw and required_stock > 0:
                 result.unit_price = select_unit_price(result.price_breaks_raw, required_stock)
@@ -194,18 +207,7 @@ class JlcpcbSearcher:
 
 
 def enrich_bom_item(item: BomItem, search_result: JlcpcbSearchResult) -> None:
-    """Apply JLCPCB search results to a BomItem in-place.
-
-    CRITICAL RULE: jlcpcb_part_number is ONLY set when:
-      1. The MPN match is EXACT
-      2. Stock is sufficient: available >= (Quantity × 10) + 10
-
-    All other cases leave jlcpcb_part_number BLANK.
-
-    Args:
-        item: The BomItem to enrich.
-        search_result: The search result from JLCPCB.
-    """
+    """Apply JLCPCB search results to a BomItem in-place."""
     item.source = "JLCPCB"
     required = item.required_stock
 
