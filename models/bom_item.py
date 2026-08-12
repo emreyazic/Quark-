@@ -65,6 +65,7 @@ class BomItem:
     required_stock: int = 0  # Computed as (quantity * 10) + 10
     unit_price: Optional[float] = None
     digikey_unit_price: Optional[float] = None
+    digikey_part_number: str = ""
     
     jlcpcb_price_breaks_raw: str = ""
     digikey_price_breaks: list[tuple[int, float]] = field(default_factory=list)

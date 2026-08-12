@@ -15,11 +15,11 @@ import requests
 from models.bom_item import BomItem
 from core.mpn_utils import (
     clean_mpn_value,
-    is_exact_mpn_match,
     is_res_coded,
     compute_required_stock,
     select_unit_price,
 )
+from core.database_manager import DatabaseManager
 
 # Resmi JLC Open Platform API Base URL
 API_BASE_URL = "https://open.jlcpcb.com"
@@ -53,10 +53,11 @@ class JlcpcbSearchResult:
 
 class JlcpcbSearcher:
     """Searches and enriches JLCPCB parts using MPN resolution + Official JOP API."""
-    def __init__(self, app_id: str, access_key: str, secret_key: str):
+    def __init__(self, app_id: str, access_key: str, secret_key: str, db_manager: Optional[DatabaseManager] = None):
         self.app_id = app_id
         self.access_key = access_key
         self.secret_key = secret_key
+        self.db_manager = db_manager
         self.session = requests.Session()
         self.session.headers.update({
             "Content-Type": "application/json",
@@ -110,7 +111,7 @@ class JlcpcbSearcher:
             pass
         return None
 
-    def search_mpn(self, mpn: str, required_stock: int = 0) -> JlcpcbSearchResult:
+    def search_mpn(self, mpn: str, required_stock: int = 0, refresh: bool = False) -> JlcpcbSearchResult:
         """Search component by MPN: resolves LCSC code first, then queries official JOP OpenAPI."""
         result = JlcpcbSearchResult()
         if not mpn or mpn.strip() == "":
@@ -196,6 +197,102 @@ class JlcpcbSearcher:
             if result.price_breaks_raw and required_stock > 0:
                 result.unit_price = select_unit_price(result.price_breaks_raw, required_stock)
 
+            if self.db_manager and result.lcsc_code:
+                self.db_manager.upsert_api_cache(
+                    lcsc_code=result.lcsc_code,
+                    stock=result.stock,
+                    price_breaks_raw=result.price_breaks_raw,
+                    package=result.package,
+                    category=result.category,
+                    timestamp=time.time()
+                )
+
+            return result
+
+        except Exception as e:
+            result.error = f"API Request Exception: {str(e)}"
+            return result
+
+    def search_lcsc(self, lcsc_code: str, mpn: str, required_stock: int = 0, refresh: bool = False) -> JlcpcbSearchResult:
+        """Search component directly by LCSC code using API cache or JOP OpenAPI."""
+        result = JlcpcbSearchResult()
+        
+        if self.db_manager and not refresh:
+            cached = self.db_manager.get_api_cache(lcsc_code)
+            if cached and time.time() - cached["timestamp"] < 86400:
+                result.found = True
+                result.exact_match = True
+                result.matched_mpn = mpn
+                result.lcsc_code = lcsc_code
+                result.stock = cached["stock"]
+                result.package = cached["package"]
+                result.category = cached["category"]
+                result.price_breaks_raw = cached["price_breaks_raw"]
+                if result.price_breaks_raw and required_stock > 0:
+                    result.unit_price = select_unit_price(result.price_breaks_raw, required_stock)
+                return result
+        
+        path = "/overseas/openapi/component/getComponentDetailByCode"
+        url = f"{API_BASE_URL}{path}"
+        lcsc_numeric = lcsc_code[1:] if lcsc_code.startswith("C") else lcsc_code
+        payload = {"componentCodes": [lcsc_numeric]}
+        body_str = json.dumps(payload, separators=(',', ':'), ensure_ascii=False)
+
+        try:
+            auth_header = self._get_auth_header("POST", path, body_str)
+            headers = {"Content-Type": "application/json", "Authorization": auth_header}
+            resp = self.session.post(url, data=body_str, headers=headers, timeout=REQUEST_TIMEOUT)
+            
+            if resp.status_code in [401, 403]:
+                result.error = f"API Auth Error ({resp.status_code})"
+                return result
+                
+            resp.raise_for_status()
+            data = resp.json()
+
+            code = data.get("code", 200)
+            if code != 200 and code != 0:
+                result.error = f"API Error [{code}]: {data.get('message', 'Unknown error')}"
+                return result
+
+            response_data = data.get("data", [])
+            if isinstance(response_data, dict):
+                components = response_data.get("components", []) or response_data.get("componentList", []) or response_data.get("data", [])
+            elif isinstance(response_data, list):
+                components = response_data
+            else:
+                components = []
+
+            result.match_count = len(components)
+            if not components:
+                result.found = False
+                return result
+
+            exact_comp = components[0]
+            result.found = True
+            result.exact_match = True
+            result.matched_mpn = mpn
+            result.lcsc_code = lcsc_code
+            result.stock = int(exact_comp.get("stockCount", 0) or exact_comp.get("stock", 0) or exact_comp.get("availableStock", 0))
+            result.package = exact_comp.get("componentSpecification", "") or exact_comp.get("package", "")
+            result.category = exact_comp.get("firstTypeName", "") or exact_comp.get("category", "")
+            
+            price_ranges = exact_comp.get("priceRanges", []) or exact_comp.get("priceList", [])
+            result.price_breaks_raw = json.dumps(price_ranges) if price_ranges else ""
+            
+            if result.price_breaks_raw and required_stock > 0:
+                result.unit_price = select_unit_price(result.price_breaks_raw, required_stock)
+
+            if self.db_manager:
+                self.db_manager.upsert_api_cache(
+                    lcsc_code=lcsc_code,
+                    stock=result.stock,
+                    price_breaks_raw=result.price_breaks_raw,
+                    package=result.package,
+                    category=result.category,
+                    timestamp=time.time()
+                )
+
             return result
 
         except Exception as e:
@@ -259,14 +356,16 @@ class SearchWorker(QThread):
     finished_all = pyqtSignal(list)
     error = pyqtSignal(str)
 
-    def __init__(self, items: list[BomItem], app_id: str, access_key: str, secret_key: str, parent=None):
+    def __init__(self, items: list[BomItem], app_id: str, access_key: str, secret_key: str, parent=None, force_refresh: bool = False):
         super().__init__(parent)
         self.items = items
         self.app_id = app_id
         self.access_key = access_key
         self.secret_key = secret_key
+        self.force_refresh = force_refresh
         self._cancelled = False
         self._mutex = QMutex()
+        self.db_manager = DatabaseManager()
 
     def cancel(self):
         self._mutex.lock()
@@ -280,7 +379,7 @@ class SearchWorker(QThread):
         return val
 
     def run(self):
-        searcher = JlcpcbSearcher(self.app_id, self.access_key, self.secret_key)
+        searcher = JlcpcbSearcher(self.app_id, self.access_key, self.secret_key, self.db_manager)
         dk_searcher = DigiKeySearcher()
         total = len(self.items)
 
@@ -294,24 +393,57 @@ class SearchWorker(QThread):
 
                 item.required_stock = compute_required_stock(item.quantity)
 
+                is_unapproved = False
+                internal_code = item.comment.strip() if item.comment else ""
+                
+                # Default suggestion values
+                suggested_mpn = item.mpn or ""
+                suggested_lcsc = ""
+                suggested_digikey = ""
+                
                 if is_res_coded(item.comment):
                     item.status = "RES manual"
                     item.jlcpcb_part_number = ""
                     item.skip_jlcpcb = True
-                elif not item.mpn or not item.mpn.strip():
-                    item.status = "Missing MPN"
-                    item.jlcpcb_part_number = ""
-                    item.skip_jlcpcb = True
+                elif internal_code:
+                    mapping = self.db_manager.get_internal_mapping(internal_code)
+                    if mapping and mapping.get("approved") == 1:
+                        item.mpn = mapping.get("mpn", "")
+                        lcsc_code = mapping.get("lcsc_code", "")
+                        item.digikey_part_number = mapping.get("digikey_code", "")
+                        result = searcher.search_lcsc(lcsc_code, item.mpn, item.required_stock, refresh=self.force_refresh)
+                        enrich_bom_item(item, result)
+                        item.skip_jlcpcb = True
+                    else:
+                        is_unapproved = True
+                
+                # NOTE: If there is no internal_code, we just proceed normally and do NOT skip JLCPCB.
 
                 if not item.skip_jlcpcb:
-                    result = searcher.search_mpn(item.mpn, item.required_stock)
+                    result = searcher.search_mpn(item.mpn, item.required_stock, refresh=self.force_refresh)
+                    if result:
+                        suggested_mpn = result.matched_mpn or item.mpn
+                        suggested_lcsc = result.lcsc_code or ""
                     enrich_bom_item(item, result)
 
                 if dk_searcher.is_configured:
                     self.progress.emit(idx + 1, total, mpn_display, "Searching DigiKey for pricing...")
                     dk_result = dk_searcher.search_item(item)
+                    if dk_result:
+                        suggested_digikey = dk_result.digikey_part_number or ""
                     enrich_bom_item_digikey(item, dk_result)
 
+                if is_unapproved:
+                    self.db_manager.upsert_internal_mapping(
+                        comment_code=internal_code,
+                        mpn=suggested_mpn,
+                        lcsc_code=suggested_lcsc,
+                        approved=False,
+                        digikey_code=suggested_digikey
+                    )
+                    item.status = "Pending Approval"
+                    item.jlcpcb_part_number = ""
+                    
                 self.item_result.emit(idx, item)
                 self.progress.emit(idx + 1, total, mpn_display, item.status)
 

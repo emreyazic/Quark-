@@ -132,7 +132,10 @@ class DigiKeySearcher:
         # Build query
         query = ""
         mpn_clean = ""
-        if item.mpn and item.mpn.strip() and not item.mpn.upper().startswith("RES"):
+        if hasattr(item, 'digikey_part_number') and item.digikey_part_number and item.digikey_part_number.strip():
+            mpn_clean = clean_mpn_value(item.digikey_part_number)
+            query = mpn_clean
+        elif item.mpn and item.mpn.strip() and not item.mpn.upper().startswith("RES"):
             mpn_clean = clean_mpn_value(item.mpn)
             query = mpn_clean
         else:
@@ -308,4 +311,6 @@ def enrich_bom_item_digikey(item, search_result: DigiKeySearchResult) -> None:
     if search_result.found or search_result.exact_match:
         item.digikey_unit_price = search_result.unit_price
         item.digikey_price_breaks = search_result.price_breaks
+        if hasattr(item, 'digikey_part_number') and search_result.digikey_part_number:
+            item.digikey_part_number = search_result.digikey_part_number
 

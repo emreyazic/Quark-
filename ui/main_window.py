@@ -43,6 +43,8 @@ from models.bom_item import BomFile, BomItem
 from ui.column_mapper_widget import ColumnMapperDialog
 from ui.file_manager_widget import FileManagerWidget
 from ui.progress_widget import ProgressWidget
+from ui.approval_dialog import ApprovalDialog
+from core.database_manager import DatabaseManager
 
 APP_ID = "610325957269491714"
 ACCESS_KEY = "8a568b68cf754f46ac0c279920f8e9cb"
@@ -250,6 +252,8 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1200, 800)
         self.resize(1400, 900)
 
+        self._database_manager = DatabaseManager()
+
         self._setup_ui()
 
     def _setup_ui(self):
@@ -400,10 +404,29 @@ class MainWindow(QMainWindow):
         self._btn_map_columns.setEnabled(False)
         action_layout.addWidget(self._btn_map_columns)
 
+        # Pending Approvals button
+        self._btn_approvals = QPushButton("📋 Pending Approvals")
+        self._btn_approvals.setToolTip("Manage pending internal code mappings")
+        self._btn_approvals.clicked.connect(self._open_approval_dialog)
+        action_layout.addWidget(self._btn_approvals)
+
+        # Reset Mappings button
+        self._btn_reset_mappings = QPushButton("⚠️ Reset Mappings")
+        self._btn_reset_mappings.setToolTip("Clear all internal code mappings and rescan from scratch")
+        self._btn_reset_mappings.clicked.connect(self._reset_mappings)
+        action_layout.addWidget(self._btn_reset_mappings)
+
+        # Refresh Data button
+        self._btn_refresh = QPushButton("🔄 Refresh Stock & Prices")
+        self._btn_refresh.setToolTip("Ignore API cache and fetch latest data from JLCPCB API")
+        self._btn_refresh.clicked.connect(lambda: self._start_processing(force_refresh=True))
+        self._btn_refresh.setEnabled(False)
+        action_layout.addWidget(self._btn_refresh)
+
         # Process button
         self._btn_process = QPushButton("🚀  Process BOM")
         self._btn_process.setObjectName("btnProcess")
-        self._btn_process.clicked.connect(self._start_processing)
+        self._btn_process.clicked.connect(lambda: self._start_processing(force_refresh=False))
         self._btn_process.setEnabled(False)
         action_layout.addWidget(self._btn_process)
 
@@ -620,8 +643,8 @@ class MainWindow(QMainWindow):
         """Called when files are added or removed."""
         has_files = self._file_manager.has_files()
         self._btn_map_columns.setEnabled(has_files)
-
-        # Update preview
+        self._btn_process.setEnabled(has_files)
+        self._btn_refresh.setEnabled(has_files)
         bom_files = self._file_manager.get_bom_files()
         if bom_files:
             self._show_preview(bom_files[0])
@@ -690,6 +713,7 @@ class MainWindow(QMainWindow):
             and bool(self._output_path.text())
         )
         self._btn_process.setEnabled(ready)
+        self._btn_refresh.setEnabled(ready)
 
     def _open_column_mapper(self):
         """Open column mapping dialogs for all loaded files."""
@@ -709,6 +733,24 @@ class MainWindow(QMainWindow):
             f"Column mappings confirmed for {len(bom_files)} file(s)."
         )
 
+    def _open_approval_dialog(self):
+        dlg = ApprovalDialog(self._database_manager, self)
+        dlg.exec()
+
+    def _reset_mappings(self):
+        reply = QMessageBox.question(
+            self, "Reset Mappings",
+            "Are you sure you want to clear all approved and pending mappings?\n\nThis will force the system to rescan JLC/DigiKey for suggestions on your next BOM process.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            try:
+                self._database_manager.reset_all_internal_mappings()
+                QMessageBox.information(self, "Success", "All internal mappings have been successfully reset.")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to reset mappings: {str(e)}")
+
     def _clear_processed_state(self):
         """Clear state from previous processing runs."""
         self._processed_workspace = None
@@ -717,7 +759,7 @@ class MainWindow(QMainWindow):
         self._project_aggregation_result = None
         self._search_item_component_keys = []
 
-    def _start_processing(self):
+    def _start_processing(self, force_refresh: bool = False):
         """Parse all BOM files, then start JLCPCB search."""
         self._clear_processed_state()
         bom_files = self._file_manager.get_all_bom_files()
@@ -821,7 +863,7 @@ class MainWindow(QMainWindow):
         self._progress_widget.reset(len(self._all_items))
 
         # Start search worker
-        self._search_worker = SearchWorker(self._all_items, APP_ID, ACCESS_KEY, SECRET_KEY)
+        self._search_worker = SearchWorker(self._all_items, APP_ID, ACCESS_KEY, SECRET_KEY, force_refresh=force_refresh)
         self._search_worker.progress.connect(self._on_search_progress)
         self._search_worker.finished_all.connect(self._on_search_finished)
         self._search_worker.error.connect(self._on_search_error)
