@@ -205,6 +205,7 @@ class FileManagerWidget(QWidget):
     """Widget for managing BOM file uploads and workspace projects."""
 
     files_changed = pyqtSignal()  # Emitted when files are added/removed/quantities changed
+    component_library_import_requested = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -271,6 +272,12 @@ class FileManagerWidget(QWidget):
         self._btn_browse = QPushButton("Browse Files...")
         self._btn_browse.clicked.connect(self._browse_files)
         btn_row.addWidget(self._btn_browse)
+        self._btn_import_library = QPushButton("Import Component Library...")
+        self._btn_import_library.setToolTip(
+            "Search LCSC and DigiKey codes from an Altium component-library Excel file and add results to Pending Approvals"
+        )
+        self._btn_import_library.clicked.connect(self._browse_component_library)
+        btn_row.addWidget(self._btn_import_library)
         btn_row.addStretch()
         layout.addLayout(btn_row)
 
@@ -292,6 +299,19 @@ class FileManagerWidget(QWidget):
         layout.addWidget(self._tree)
         
         self._refresh_tree()
+
+    def _browse_component_library(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import Altium Component Library",
+            "",
+            "Excel Files (*.xlsx)",
+        )
+        if path:
+            self.component_library_import_requested.emit(path)
+
+    def set_component_library_import_enabled(self, enabled: bool):
+        self._btn_import_library.setEnabled(enabled)
 
     def _refresh_tree(self):
         """Refresh the workspace tree display."""

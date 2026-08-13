@@ -1,4 +1,5 @@
 from core.database_manager import DatabaseManager
+import sqlite3
 
 
 def test_manual_override_is_not_reopened_when_auto_result_is_unchanged(tmp_path):
@@ -65,5 +66,45 @@ def test_failed_lookup_does_not_change_history(tmp_path):
     assert db.refresh_mapping_codes("R1", None, None) is False
     mapping = db.get_internal_mapping("R1")
     assert mapping["approved"] == 1
+    assert mapping["last_found_lcsc"] == "C1"
+    assert mapping["last_found_digikey"] == "DK1"
+
+
+def test_pending_suggestions_never_populate_approved_columns(tmp_path):
+    db = DatabaseManager(str(tmp_path / "mappings.sqlite"))
+    db.insert_pending_suggestion("R1", "MPN1", "C1", "DK1")
+    db.insert_pending_suggestion("R1", "MPN1", "C2", "DK2")
+
+    mapping = db.get_internal_mapping("R1")
+    assert mapping["approved"] == 0
+    assert mapping["lcsc_code"] == ""
+    assert mapping["digikey_code"] == ""
+    assert mapping["previous_found_lcsc"] == "C1"
+    assert mapping["last_found_lcsc"] == "C2"
+    assert mapping["previous_found_digikey"] == "DK1"
+    assert mapping["last_found_digikey"] == "DK2"
+
+
+def test_legacy_pending_codes_are_migrated_to_auto_history(tmp_path):
+    path = tmp_path / "legacy.sqlite"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """CREATE TABLE internal_mappings (
+                   comment_code TEXT PRIMARY KEY,
+                   mpn TEXT NOT NULL,
+                   lcsc_code TEXT NOT NULL,
+                   approved INTEGER NOT NULL DEFAULT 0,
+                   updated_at REAL,
+                   digikey_code TEXT NOT NULL DEFAULT ''
+               )"""
+        )
+        connection.execute(
+            "INSERT INTO internal_mappings VALUES ('R1', 'MPN1', 'C1', 0, 0, 'DK1')"
+        )
+
+    db = DatabaseManager(str(path))
+    mapping = db.get_internal_mapping("R1")
+    assert mapping["lcsc_code"] == ""
+    assert mapping["digikey_code"] == ""
     assert mapping["last_found_lcsc"] == "C1"
     assert mapping["last_found_digikey"] == "DK1"

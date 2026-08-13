@@ -10,6 +10,7 @@ Key additions vs. original:
 import os
 from datetime import datetime
 from typing import Optional
+from openpyxl import load_workbook
 
 from PyQt6.QtCore import Qt, QSize, QThread, pyqtSignal, QMutex
 from PyQt6.QtGui import QColor, QFont, QIcon, QPixmap
@@ -278,6 +279,111 @@ class MappingRefreshWorker(QThread):
             digikey_searcher.close()
 
 
+class ComponentLibraryImportWorker(QThread):
+    """Imports Altium library rows and searches supplier codes without processing a BOM."""
+
+    progress = pyqtSignal(int, int, str)
+    finished = pyqtSignal(int, int, int)  # searched, pending/changed, skipped
+    error = pyqtSignal(str)
+
+    INVALID_MPN_VALUES = {"", "*", "-", "N/A", "NA", "NONE"}
+
+    def __init__(self, file_path: str, db_manager: DatabaseManager, parent=None):
+        super().__init__(parent)
+        self.file_path = file_path
+        self.db_manager = db_manager
+
+    @staticmethod
+    def _normalize_header(value) -> str:
+        return " ".join(str(value or "").strip().upper().split())
+
+    def _read_components(self) -> tuple[list[tuple[str, str]], int]:
+        workbook = load_workbook(self.file_path, read_only=True, data_only=True)
+        try:
+            sheet = workbook["Components"] if "Components" in workbook.sheetnames else workbook.active
+            rows = sheet.iter_rows(values_only=True)
+            headers = next(rows, None)
+            if not headers:
+                raise ValueError("The selected file is empty.")
+            header_map = {self._normalize_header(value): index for index, value in enumerate(headers)}
+            internal_index = header_map.get("LIBRARYREFERENCE", header_map.get("COMMENT"))
+            mpn_index = header_map.get("MANUFACTURER PART NUMBER")
+            if internal_index is None or mpn_index is None:
+                raise ValueError(
+                    "Required columns were not found. Expected LIBRARYREFERENCE (or COMMENT) and MANUFACTURER PART NUMBER."
+                )
+
+            components = []
+            skipped = 0
+            seen = set()
+            for row in rows:
+                internal_code = str(row[internal_index] or "").strip()
+                mpn = clean_mpn_value(row[mpn_index])
+                if not internal_code or mpn.upper() in self.INVALID_MPN_VALUES:
+                    skipped += 1
+                    continue
+                key = (internal_code, mpn.upper())
+                if key in seen:
+                    skipped += 1
+                    continue
+                seen.add(key)
+                components.append((internal_code, mpn))
+            return components, skipped
+        finally:
+            workbook.close()
+
+    def run(self):
+        jlc_searcher = None
+        digikey_searcher = None
+        try:
+            components, skipped = self._read_components()
+            if not components:
+                raise ValueError("No valid component rows with an internal code and MPN were found.")
+
+            jlc_searcher = JlcpcbSearcher(APP_ID, ACCESS_KEY, SECRET_KEY, self.db_manager)
+            digikey_searcher = DigiKeySearcher()
+            pending_count = 0
+            total = len(components)
+
+            for index, (internal_code, mpn) in enumerate(components, start=1):
+                self.progress.emit(index, total, f"Searching {internal_code} ({mpn})")
+                try:
+                    lcsc_code = jlc_searcher._resolve_lcsc_from_mpn(mpn) or ""
+                except Exception:
+                    lcsc_code = None
+
+                try:
+                    dk_result = digikey_searcher.search_mpn(mpn)
+                    digikey_code = (
+                        (dk_result.digikey_part_number or "")
+                        if dk_result.configured and not dk_result.error
+                        else None
+                    )
+                except Exception:
+                    digikey_code = None
+
+                existing = self.db_manager.get_internal_mapping(internal_code)
+                if existing is None:
+                    self.db_manager.insert_pending_suggestion(
+                        internal_code,
+                        mpn,
+                        lcsc_code or "",
+                        digikey_code or "",
+                    )
+                    pending_count += 1
+                elif self.db_manager.refresh_mapping_codes(internal_code, lcsc_code, digikey_code):
+                    pending_count += 1
+
+            self.finished.emit(total, pending_count, skipped)
+        except Exception as exc:
+            self.error.emit(str(exc))
+        finally:
+            if jlc_searcher is not None:
+                jlc_searcher.close()
+            if digikey_searcher is not None:
+                digikey_searcher.close()
+
+
 # ═══════════════════════════════════════════════════════════════════
 #  Main Window
 # ═══════════════════════════════════════════════════════════════════
@@ -291,6 +397,7 @@ class MainWindow(QMainWindow):
         self._search_worker: Optional[SearchWorker] = None
         self._manual_search_worker: Optional[ManualSearchWorker] = None
         self._mapping_refresh_worker: Optional[MappingRefreshWorker] = None
+        self._component_library_import_worker: Optional[ComponentLibraryImportWorker] = None
         self._approval_dialog: Optional[ApprovalDialog] = None
         self._all_items: list[BomItem] = []
         self._project_aggregation_result = None
@@ -397,6 +504,7 @@ class MainWindow(QMainWindow):
 
         self._file_manager = FileManagerWidget()
         self._file_manager.files_changed.connect(self._on_files_changed)
+        self._file_manager.component_library_import_requested.connect(self._import_component_library)
         left_layout.addWidget(self._file_manager)
 
         splitter.addWidget(left_panel)
@@ -809,6 +917,42 @@ class MainWindow(QMainWindow):
 
     def _on_approval_dialog_closed(self):
         self._approval_dialog = None
+
+    def _import_component_library(self, file_path: str):
+        if self._component_library_import_worker is not None:
+            return
+        self._file_manager.set_component_library_import_enabled(False)
+        self.statusBar().showMessage(f"Reading component library: {os.path.basename(file_path)}")
+        worker = ComponentLibraryImportWorker(file_path, self._database_manager, self)
+        self._component_library_import_worker = worker
+        worker.progress.connect(self._on_component_library_import_progress)
+        worker.finished.connect(self._on_component_library_import_finished)
+        worker.error.connect(self._on_component_library_import_error)
+        worker.start()
+
+    def _on_component_library_import_progress(self, current: int, total: int, message: str):
+        self.statusBar().showMessage(f"{message} ({current}/{total})")
+
+    def _finish_component_library_import(self):
+        self._file_manager.set_component_library_import_enabled(True)
+        self._component_library_import_worker = None
+
+    def _on_component_library_import_finished(self, searched: int, pending: int, skipped: int):
+        self._finish_component_library_import()
+        self.statusBar().showMessage("Component library import complete.", 5000)
+        if self._approval_dialog is not None:
+            self._approval_dialog._load_data()
+        QMessageBox.information(
+            self,
+            "Component Library Import Complete",
+            f"Searched {searched} component(s).\n"
+            f"Added or returned {pending} mapping(s) to Pending Approvals.\n"
+            f"Skipped {skipped} empty, invalid, or duplicate row(s).",
+        )
+
+    def _on_component_library_import_error(self, message: str):
+        self._finish_component_library_import()
+        QMessageBox.critical(self, "Component Library Import Error", message)
 
     def _refresh_mappings(self):
         reply = QMessageBox.question(

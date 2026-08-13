@@ -78,6 +78,39 @@ class DatabaseManager:
                            WHERE last_found_lcsc = '' AND last_found_digikey = ''
                              AND (lcsc_code != '' OR digikey_code != '')"""
                     )
+
+                # Versioned data migration: older pending rows stored automatic
+                # suggestions in the approved-value columns. Move those values
+                # to lookup history once, then keep approved values empty until
+                # the user explicitly approves them.
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS app_metadata (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL
+                    )
+                ''')
+                cursor.execute("SELECT value FROM app_metadata WHERE key = 'mapping_data_version'")
+                version_row = cursor.fetchone()
+                mapping_data_version = int(version_row["value"]) if version_row else 0
+                if mapping_data_version < 2:
+                    cursor.execute(
+                        """UPDATE internal_mappings
+                           SET last_found_lcsc = CASE
+                                   WHEN last_found_lcsc = '' THEN lcsc_code ELSE last_found_lcsc END,
+                               last_found_digikey = CASE
+                                   WHEN last_found_digikey = '' THEN digikey_code ELSE last_found_digikey END,
+                               lcsc_code = '',
+                               digikey_code = '',
+                               lcsc_source = 'AUTO',
+                               digikey_source = 'AUTO',
+                               lcsc_status = 'PENDING_REVIEW',
+                               digikey_status = 'PENDING_REVIEW'
+                           WHERE approved = 0"""
+                    )
+                    cursor.execute(
+                        """INSERT INTO app_metadata (key, value) VALUES ('mapping_data_version', '2')
+                           ON CONFLICT(key) DO UPDATE SET value = excluded.value"""
+                    )
                 
                 # Table 2: api_cache
                 cursor.execute('''
@@ -169,10 +202,7 @@ class DatabaseManager:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 # Önce mevcut kaydı kontrol et
-                cursor.execute(
-                    "SELECT comment_code, mpn, lcsc_code, digikey_code, approved, updated_at FROM internal_mappings WHERE comment_code = ?",
-                    (comment_code,)
-                )
+                cursor.execute("SELECT * FROM internal_mappings WHERE comment_code = ?", (comment_code,))
                 existing = cursor.fetchone()
 
                 if existing is None:
@@ -185,14 +215,27 @@ class DatabaseManager:
                         (comment_code, mpn, "", "", time.time(), lcsc_code, digikey_code)
                     )
                 elif existing["approved"] == 0:
-                    # Mevcut pending kayıt — sadece boş alanları doldur
+                    # Pending suggestions update automatic history only. The
+                    # approved columns remain untouched until Approve is clicked.
                     new_mpn = existing["mpn"] or mpn
-                    new_lcsc = existing["lcsc_code"] or lcsc_code
-                    new_dk = existing["digikey_code"] or digikey_code
-                    if (new_mpn, new_lcsc, new_dk) != (existing["mpn"], existing["lcsc_code"], existing["digikey_code"]):
+                    new_lcsc = (lcsc_code or "").strip()
+                    new_dk = (digikey_code or "").strip()
+                    changed_lcsc = new_lcsc != existing["last_found_lcsc"]
+                    changed_dk = new_dk != existing["last_found_digikey"]
+                    if new_mpn != existing["mpn"] or changed_lcsc or changed_dk:
                         cursor.execute(
-                            "UPDATE internal_mappings SET mpn = ?, lcsc_code = ?, digikey_code = ?, updated_at = ? WHERE comment_code = ?",
-                            (new_mpn, new_lcsc, new_dk, time.time(), comment_code)
+                            """UPDATE internal_mappings
+                               SET mpn = ?,
+                                   previous_found_lcsc = CASE WHEN ? THEN last_found_lcsc ELSE previous_found_lcsc END,
+                                   previous_found_digikey = CASE WHEN ? THEN last_found_digikey ELSE previous_found_digikey END,
+                                   last_found_lcsc = ?,
+                                   last_found_digikey = ?,
+                                   lcsc_status = CASE WHEN ? THEN 'PENDING_REVIEW' ELSE lcsc_status END,
+                                   digikey_status = CASE WHEN ? THEN 'PENDING_REVIEW' ELSE digikey_status END,
+                                   updated_at = ?
+                               WHERE comment_code = ?""",
+                            (new_mpn, changed_lcsc, changed_dk, new_lcsc, new_dk,
+                             changed_lcsc, changed_dk, time.time(), comment_code)
                         )
                 # approved == 1 ise hiçbir şey yapma — onaylı kaydı koru
                 conn.commit()
