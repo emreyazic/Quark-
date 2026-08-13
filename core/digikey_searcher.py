@@ -14,10 +14,11 @@ import os
 import time
 import json
 from typing import Optional
+from urllib.parse import quote
 
 import requests
 
-from core.mpn_utils import clean_mpn_value, is_exact_mpn_match, select_unit_price
+from core.mpn_utils import clean_mpn_value, is_exact_mpn_match, select_digikey_price
 
 
 class DigiKeySearchResult:
@@ -46,7 +47,7 @@ class DigiKeySearcher:
     If credentials are not available, all searches return a 'not configured' result.
     """
 
-    def __init__(self):
+    def __init__(self, credential_start_index: int = 0):
         # You can add as many DigiKey API credentials as you want to this dictionary.
         # Format: {"CLIENT_ID": "CLIENT_SECRET"}
         api_keys = {
@@ -68,6 +69,9 @@ class DigiKeySearcher:
                 api_keys[cid] = csec
         
         self._credentials = list(api_keys.items())
+        if self._credentials:
+            offset = credential_start_index % len(self._credentials)
+            self._credentials = self._credentials[offset:] + self._credentials[:offset]
         self._active_cred_index = 0
         
         self._configured = len(self._credentials) > 0
@@ -117,7 +121,49 @@ class DigiKeySearcher:
             self._access_token = None
             return None
 
-    def search_item(self, item) -> DigiKeySearchResult:
+    @staticmethod
+    def _select_variation(variations: list[dict]) -> Optional[dict]:
+        """Prefer a purchasable cut-tape/MOQ-1 variation."""
+        for variation in variations:
+            package = variation.get("PackageType", {})
+            package_name = package.get("Name", "") if isinstance(package, dict) else str(package)
+            try:
+                moq = int(variation.get("MinimumOrderQuantity", 0) or 0)
+            except (TypeError, ValueError):
+                moq = 0
+            if "cut tape" in package_name.lower() or moq == 1:
+                return variation
+        return variations[0] if variations else None
+
+    def _load_live_product(self, product_number: str, client_id: str, token: str) -> Optional[dict]:
+        """Load real-time availability/pricing for the selected DigiKey code."""
+        if not product_number:
+            return None
+        try:
+            response = self.session.get(
+                f"https://api.digikey.com/products/v4/search/{quote(product_number, safe='')}/productdetails",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "X-DIGIKEY-Client-Id": client_id,
+                    "X-DIGIKEY-Locale-Site": "US",
+                    "X-DIGIKEY-Locale-Language": "en",
+                    "X-DIGIKEY-Locale-Currency": "USD",
+                },
+                timeout=15,
+            )
+            response.raise_for_status()
+            data = response.json()
+            products = data.get("Products", []) if isinstance(data, dict) else []
+            if not products and isinstance(data, dict):
+                product = data.get("Product")
+                products = [product] if isinstance(product, dict) else []
+            return products[0] if products else None
+        except Exception:
+            # Keyword data is still a usable fallback if the live endpoint is
+            # temporarily unavailable or rate limited.
+            return None
+
+    def search_item(self, item, include_live_data: bool = True) -> DigiKeySearchResult:
         """Search for a component using item fields.
 
         Args:
@@ -147,6 +193,8 @@ class DigiKeySearcher:
             result.error = "Missing search criteria"
             return result
 
+        target_quantity = max(int(getattr(item, "required_stock", 1) or 1), 1)
+
         if not self._configured:
             result.error = (
                 "DigiKey API not configured. Set DIGIKEY_CLIENT_ID and "
@@ -172,6 +220,9 @@ class DigiKeySearcher:
                     headers={
                         "Authorization": f"Bearer {token}",
                         "X-DIGIKEY-Client-Id": client_id,
+                        "X-DIGIKEY-Locale-Site": "US",
+                        "X-DIGIKEY-Locale-Language": "en",
+                        "X-DIGIKEY-Locale-Currency": "USD",
                         "Content-Type": "application/json",
                     },
                     json={
@@ -203,24 +254,33 @@ class DigiKeySearcher:
                         result.manufacturer = mfr_obj.get("Name", "") if isinstance(mfr_obj, dict) else str(mfr_obj)
                         
                         variations = prod.get("ProductVariations", [])
-                        best_var = None
-                        if variations:
-                            for var in variations:
-                                package = var.get("PackageType", {})
-                                package_name = package.get("Name", "") if isinstance(package, dict) else str(package)
-                                try:
-                                    moq = int(var.get("MinimumOrderQuantity", 0))
-                                except:
-                                    moq = 0
-                                if "Cut Tape" in package_name or "CT" in package_name or moq == 1:
-                                    best_var = var
-                                    break
-                            if not best_var:
-                                best_var = variations[0]
-                                
+                        best_var = self._select_variation(variations)
                         result.digikey_part_number = best_var.get("DigiKeyProductNumber", "") if best_var else ""
-                        
-                        result.stock = int(prod.get("QuantityAvailable", 0))
+
+                        if include_live_data and result.digikey_part_number:
+                            live_product = self._load_live_product(result.digikey_part_number, client_id, token)
+                            if live_product:
+                                prod = live_product
+                                variations = prod.get("ProductVariations", [])
+                                matching_variation = next(
+                                    (
+                                        variation for variation in variations
+                                        if variation.get("DigiKeyProductNumber", "") == result.digikey_part_number
+                                    ),
+                                    None,
+                                )
+                                best_var = matching_variation or self._select_variation(variations)
+                                if best_var:
+                                    result.digikey_part_number = best_var.get("DigiKeyProductNumber", "") or result.digikey_part_number
+
+                        variation_stock = best_var.get("QuantityAvailableforPackageType") if best_var else None
+                        if variation_stock is None and best_var:
+                            variation_stock = best_var.get("QuantityAvailable")
+                        result.stock = int(
+                            variation_stock
+                            if variation_stock is not None
+                            else prod.get("QuantityAvailable", 0) or 0
+                        )
                         
                         desc_obj = prod.get("Description", {})
                         result.description = desc_obj.get("ProductDescription", "")
@@ -237,9 +297,7 @@ class DigiKeySearcher:
                                 pass
                         result.price_breaks = sorted(pbs, key=lambda x: x[0])
 
-                        # Get unit price from first price break
-                        if result.price_breaks:
-                            result.unit_price = result.price_breaks[0][1]
+                        result.unit_price = select_digikey_price(result.price_breaks, target_quantity)
                         break
 
                 # Store candidates
@@ -247,20 +305,7 @@ class DigiKeySearcher:
                     mfr_obj = prod.get("Manufacturer", {})
                     variations = prod.get("ProductVariations", [])
                     
-                    best_cand_var = None
-                    if variations:
-                        for var in variations:
-                            package = var.get("PackageType", {})
-                            package_name = package.get("Name", "") if isinstance(package, dict) else str(package)
-                            try:
-                                moq = int(var.get("MinimumOrderQuantity", 0))
-                            except:
-                                moq = 0
-                            if "Cut Tape" in package_name or "CT" in package_name or moq == 1:
-                                best_cand_var = var
-                                break
-                        if not best_cand_var:
-                            best_cand_var = variations[0]
+                    best_cand_var = self._select_variation(variations)
                     
                     result.candidates.append({
                         "mpn": prod.get("ManufacturerProductNumber", ""),
@@ -299,17 +344,18 @@ class DigiKeySearcher:
         
         return result
                 
-    def search_mpn(self, mpn: str) -> DigiKeySearchResult:
+    def search_mpn(self, mpn: str, required_stock: int = 1, include_live_data: bool = True) -> DigiKeySearchResult:
         """Search DigiKey directly by MPN string."""
         class _Item:
-            def __init__(self, mpn_val):
+            def __init__(self, mpn_val, required_stock_val):
                 self.mpn = mpn_val
+                self.required_stock = required_stock_val
                 self.value = ""
                 self.description = ""
                 self.manufacturer = ""
                 self.footprint = ""
 
-        return self.search_item(_Item(mpn))
+        return self.search_item(_Item(mpn, required_stock), include_live_data=include_live_data)
 
     def close(self):
         """Close the HTTP session."""

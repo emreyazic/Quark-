@@ -32,15 +32,39 @@ class ApprovalDialog(QDialog):
                 padding: 2px;
                 margin: 0px;
             }
-            #actionApproveBtn {
-                background-color: #00b894; color: white; font-weight: bold; padding: 6px; text-align: center; border-radius: 4px;
+            QPushButton#actionApproveBtn {
+                background: #008f73;
+                color: #ffffff;
+                border: 1px solid #39e6bd;
+                border-radius: 6px;
+                padding: 4px 10px;
+                font-size: 13px;
+                font-weight: 700;
             }
-            #actionUpdateBtn {
-                background-color: #0984e3; color: white; font-weight: bold; padding: 6px; text-align: center; border-radius: 4px;
+            QPushButton#actionApproveBtn:hover { background: #00b894; }
+            QPushButton#actionApproveBtn:pressed { background: #00745e; }
+            QPushButton#actionUpdateBtn {
+                background: #096fb8;
+                color: #ffffff;
+                border: 1px solid #58b8ff;
+                border-radius: 6px;
+                padding: 4px 10px;
+                font-size: 13px;
+                font-weight: 700;
             }
-            #actionDeleteBtn {
-                background-color: #d63031; color: white; font-weight: bold; padding: 6px; text-align: center; border-radius: 4px;
+            QPushButton#actionUpdateBtn:hover { background: #0984e3; }
+            QPushButton#actionUpdateBtn:pressed { background: #07578f; }
+            QPushButton#actionDeleteBtn {
+                background: #b82425;
+                color: #ffffff;
+                border: 1px solid #ff7675;
+                border-radius: 6px;
+                padding: 4px 10px;
+                font-size: 13px;
+                font-weight: 700;
             }
+            QPushButton#actionDeleteBtn:hover { background: #d63031; }
+            QPushButton#actionDeleteBtn:pressed { background: #941d1e; }
         """)
         self._setup_ui()
         self._load_data()
@@ -66,6 +90,8 @@ class ApprovalDialog(QDialog):
             "New Auto DigiKey", "Last Updated", "Action"
         ])
         self.table_pending.setItemDelegate(TableEditorDelegate(self.table_pending))
+        self.table_pending.verticalHeader().setMinimumSectionSize(44)
+        self.table_pending.verticalHeader().setDefaultSectionSize(44)
         self._configure_pending_table()
         layout_pending.addWidget(self.table_pending)
         
@@ -82,6 +108,8 @@ class ApprovalDialog(QDialog):
         self.table_approved.setColumnCount(6)
         self.table_approved.setHorizontalHeaderLabels(["Internal Code (Comment)", "MPN", "LCSC Code", "DigiKey Code", "Last Updated", "Action"])
         self.table_approved.setItemDelegate(TableEditorDelegate(self.table_approved))
+        self.table_approved.verticalHeader().setMinimumSectionSize(44)
+        self.table_approved.verticalHeader().setDefaultSectionSize(44)
         self._configure_table(self.table_approved, action_width=240)
         
         # Force redraw on edit
@@ -136,9 +164,10 @@ class ApprovalDialog(QDialog):
         for row, mapping in enumerate(pending_list):
             self._fill_pending_row(row, mapping)
             
-            btn_approve = QPushButton("✅ Approve")
+            btn_approve = QPushButton("Approve")
             btn_approve.setObjectName("actionApproveBtn")
-            btn_approve.setMinimumSize(100, 32)
+            btn_approve.setMinimumWidth(104)
+            btn_approve.setFixedHeight(34)
             btn_approve.clicked.connect(lambda checked, r=row: self._on_approve_clicked(r))
             
             container = QWidget()
@@ -153,14 +182,16 @@ class ApprovalDialog(QDialog):
             self._fill_row(self.table_approved, row, mapping)
             
             # Action Buttons: Update & Delete
-            btn_update = QPushButton("💾 Update")
+            btn_update = QPushButton("Update")
             btn_update.setObjectName("actionUpdateBtn")
-            btn_update.setMinimumSize(90, 32)
+            btn_update.setMinimumWidth(90)
+            btn_update.setFixedHeight(34)
             btn_update.clicked.connect(lambda checked, r=row: self._on_update_clicked(r))
             
-            btn_delete = QPushButton("🗑️ Delete")
+            btn_delete = QPushButton("Delete")
             btn_delete.setObjectName("actionDeleteBtn")
-            btn_delete.setMinimumSize(90, 32)
+            btn_delete.setMinimumWidth(90)
+            btn_delete.setFixedHeight(34)
             btn_delete.clicked.connect(lambda checked, r=row: self._on_delete_clicked(r))
             
             container = QWidget()

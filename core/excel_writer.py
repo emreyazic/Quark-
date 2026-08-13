@@ -38,6 +38,7 @@ class ExcelWriter:
             self.ws.column_dimensions[get_column_letter(headers.index("Designator") + 1)].width = 30
             self.ws.column_dimensions[get_column_letter(headers.index("JLCPCB Stock") + 1)].width = 16
             self.ws.column_dimensions[get_column_letter(headers.index("DigiKey Stock") + 1)].width = 16
+            self.ws.column_dimensions[get_column_letter(headers.index("DigiKey Part Number") + 1)].width = 24
             self.ws.column_dimensions[get_column_letter(headers.index("JLCPCB Unit Price") + 1)].width = 20
             self.ws.column_dimensions[get_column_letter(headers.index("DigiKey Unit Price") + 1)].width = 20
         except ValueError:
@@ -108,7 +109,36 @@ class ExcelWriter:
 
         self._add_summary_sheet()
         self._add_cost_sheets()
+        self._add_supplier_stock_sheet()
         self.wb.save(output_path)
+
+    def _add_supplier_stock_sheet(self):
+        ws = self.wb.create_sheet("Supplier Stock")
+        headers = [
+            "MPN", "Design Item ID", "Supplier", "Supplier Part Number",
+            "Stock", "Unit Price", "Required Stock", "Status",
+        ]
+        ws.append(headers)
+        for cell in ws[1]:
+            cell.font = Font(bold=True)
+        for item in self.items:
+            rows = [
+                ("JLCPCB", item.jlcpcb_part_number, item.available_stock_qty, item.unit_price, item.status),
+                ("DigiKey", item.digikey_part_number, item.digikey_stock_qty, item.digikey_unit_price,
+                 "Found" if item.digikey_part_number else "Not Found"),
+            ]
+            for supplier, part_number, stock, unit_price, status in rows:
+                ws.append([
+                    item.mpn, item.comment, supplier, part_number or "-",
+                    stock if stock is not None else "-", unit_price,
+                    item.required_stock, status or "",
+                ])
+                if isinstance(unit_price, (int, float)):
+                    ws.cell(row=ws.max_row, column=6).number_format = '"$"#,##0.0000'
+        ws.auto_filter.ref = ws.dimensions
+        ws.freeze_panes = "A2"
+        for column, width in {"A": 24, "B": 20, "C": 12, "D": 26, "E": 14, "F": 16, "G": 16, "H": 28}.items():
+            ws.column_dimensions[column].width = width
 
     def _add_summary_sheet(self):
         """Add a secondary sheet with high-level sourcing statistics."""

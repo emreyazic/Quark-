@@ -138,6 +138,19 @@ class DatabaseManager:
                     )
                 ''')
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_lib_mpn ON local_jlc_library (mpn COLLATE NOCASE)')
+
+                # Reusable MPN lookup cache for bulk component-library imports.
+                # Empty codes are valid cached "not found" results; NULL
+                # timestamps mean that supplier has not been checked yet.
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS mpn_lookup_cache (
+                        mpn TEXT PRIMARY KEY COLLATE NOCASE,
+                        lcsc_code TEXT NOT NULL DEFAULT '',
+                        digikey_code TEXT NOT NULL DEFAULT '',
+                        lcsc_checked_at REAL,
+                        digikey_checked_at REAL
+                    )
+                ''')
                 
                 conn.commit()
 
@@ -346,6 +359,56 @@ class DatabaseManager:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("DELETE FROM api_cache WHERE timestamp < ?", (cutoff_timestamp,))
+                conn.commit()
+
+    def get_mpn_lookup_cache(self, mpn: str, max_age_seconds: float) -> Optional[Dict[str, Any]]:
+        """Return supplier results with independent freshness flags for an MPN."""
+        with self._lock:
+            with self._get_connection() as conn:
+                row = conn.execute(
+                    "SELECT * FROM mpn_lookup_cache WHERE mpn = ? COLLATE NOCASE",
+                    (mpn.strip(),),
+                ).fetchone()
+                if row is None:
+                    return None
+                result = dict(row)
+                now = time.time()
+                result["lcsc_fresh"] = bool(
+                    result["lcsc_checked_at"] is not None
+                    and now - result["lcsc_checked_at"] <= max_age_seconds
+                )
+                result["digikey_fresh"] = bool(
+                    result["digikey_checked_at"] is not None
+                    and now - result["digikey_checked_at"] <= max_age_seconds
+                )
+                return result
+
+    def upsert_mpn_lookup_cache(
+        self,
+        mpn: str,
+        lcsc_code: Optional[str] = None,
+        digikey_code: Optional[str] = None,
+    ) -> None:
+        """Cache completed supplier lookups; ``None`` leaves that source unchanged."""
+        if lcsc_code is None and digikey_code is None:
+            return
+        now = time.time()
+        with self._lock:
+            with self._get_connection() as conn:
+                conn.execute(
+                    "INSERT OR IGNORE INTO mpn_lookup_cache (mpn) VALUES (?)",
+                    (mpn.strip(),),
+                )
+                if lcsc_code is not None:
+                    conn.execute(
+                        "UPDATE mpn_lookup_cache SET lcsc_code = ?, lcsc_checked_at = ? WHERE mpn = ? COLLATE NOCASE",
+                        (lcsc_code.strip(), now, mpn.strip()),
+                    )
+                if digikey_code is not None:
+                    conn.execute(
+                        "UPDATE mpn_lookup_cache SET digikey_code = ?, digikey_checked_at = ? WHERE mpn = ? COLLATE NOCASE",
+                        (digikey_code.strip(), now, mpn.strip()),
+                    )
                 conn.commit()
 
     # =========================================================

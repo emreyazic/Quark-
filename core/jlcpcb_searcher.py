@@ -35,8 +35,8 @@ REQUEST_TIMEOUT = 15
 
 
 def select_result_unit_price(price_breaks_raw: str, required_stock: int) -> Optional[float]:
-    """Return the displayed single-unit (1+) price, independent of BOM quantity."""
-    return select_unit_price(price_breaks_raw, 1)
+    """Return the unit price for the quantity the BOM actually requires."""
+    return select_unit_price(price_breaks_raw, max(required_stock, 1))
 
 
 class JlcpcbSearchResult:
@@ -102,7 +102,8 @@ class JlcpcbSearcher:
     def _resolve_lcsc_from_mpn(self, mpn_clean: str) -> Optional[str]:
         """Resolves permanent MPN to LCSC part code (C...) using:
         1. Local JLC library DB (fast, offline)
-        2. Original community search API with exact MPN matching (fallback)
+        2. LCSC global search with exact MPN matching
+        3. Community search API (fallback)
         Returns None silently if not found — caller handles pending flow.
         """
         # 1. Önce yerel kütüphane veritabanını sorgula
@@ -113,7 +114,7 @@ class JlcpcbSearcher:
                 print(f"DEBUG: Found LCSC: {lcsc_code} for MPN: {mpn_clean}")
                 return lcsc_code
 
-        # 2. Fallback: Orijinal jlcsearch topluluk API'si
+        # Community fallback helpers
         #    Endpoint: GET /components/list.json?search=<MPN>
         #    mfr alanı MPN'i, lcsc alanı LCSC numarasını içerir
         def get_components(response_data: Any) -> list[dict]:
@@ -168,8 +169,36 @@ class JlcpcbSearcher:
                 print(f"DEBUG: Ambiguous exact LCSC matches for MPN: {mpn_clean}: {', '.join(sorted(exact_codes))}")
             return None
 
-        max_retries = 3
-        backoff = 1.0
+        # LCSC's own endpoint is normally faster and more complete than the
+        # community index. Query it first, then retain the community service as
+        # a fallback. Exact/ambiguous-match safeguards remain identical.
+        try:
+            official_resp = self.session.post(
+                LCSC_GLOBAL_SEARCH_URL,
+                json={"keyword": mpn_clean},
+                timeout=8,
+                headers={
+                    "User-Agent": "BOM-Enrichment-Tool/2.0",
+                    "Accept": "application/json",
+                    "Origin": "https://www.lcsc.com",
+                    "Referer": "https://www.lcsc.com/",
+                },
+            )
+            if official_resp.status_code == 200:
+                official_data = official_resp.json()
+                official_result = official_data.get("result") if isinstance(official_data, dict) else None
+                if isinstance(official_result, dict):
+                    exact_products = official_result.get("exactMatchResult") or []
+                    search_result = official_result.get("productSearchResultVO") or {}
+                    search_products = search_result.get("productList") or [] if isinstance(search_result, dict) else []
+                    lcsc_code = find_exact_lcsc(exact_products + search_products)
+                    if lcsc_code:
+                        return lcsc_code
+        except Exception:
+            pass
+
+        max_retries = 2
+        backoff = 0.5
 
         for attempt in range(max_retries):
             try:
@@ -200,31 +229,6 @@ class JlcpcbSearcher:
                         lcsc_code = find_exact_lcsc(get_components(resp2.json()))
                         if lcsc_code:
                             return lcsc_code
-
-                    # Community index is incomplete for many LCSC extended
-                    # parts. Query LCSC's own search service, then validate the
-                    # returned product model ourselves before accepting it.
-                    official_resp = self.session.post(
-                        LCSC_GLOBAL_SEARCH_URL,
-                        json={"keyword": mpn_clean},
-                        timeout=12,
-                        headers={
-                            "User-Agent": "BOM-Enrichment-Tool/2.0",
-                            "Accept": "application/json",
-                            "Origin": "https://www.lcsc.com",
-                            "Referer": "https://www.lcsc.com/",
-                        },
-                    )
-                    if official_resp.status_code == 200:
-                        official_data = official_resp.json()
-                        official_result = official_data.get("result") if isinstance(official_data, dict) else None
-                        if isinstance(official_result, dict):
-                            exact_products = official_result.get("exactMatchResult") or []
-                            search_result = official_result.get("productSearchResultVO") or {}
-                            search_products = search_result.get("productList") or [] if isinstance(search_result, dict) else []
-                            lcsc_code = find_exact_lcsc(exact_products + search_products)
-                            if lcsc_code:
-                                return lcsc_code
 
                     # Bulunamadı ama hata yok — sessizce None dön
                     return None
@@ -269,93 +273,15 @@ class JlcpcbSearcher:
             # error değil, sessizce dön — is_unapproved akışına bırak
             return result
 
-        # LCSC eşlemesi JOP ayrıntı isteğinden bağımsız olarak korunur. Böylece
-        # JOP yanıtı başarısız olsa bile pending approval kaydı öneriyi gösterir.
-        result.lcsc_code = lcsc_code
-        result.matched_mpn = mpn_clean
-
-        # 2. Adım: Resmi SDK path'i ile resmi JOP API'sinden canlı veri çek
-        path = "/overseas/openapi/component/getComponentDetailByCode"
-        url = f"{API_BASE_URL}{path}"
-
-        # LCSC kodunu sayısal formata çevir (C harfini çıkararak veya olduğu gibi, JOP API genellikle C'siz sayı veya C ile kabul eder)
-        lcsc_numeric = lcsc_code[1:] if lcsc_code.startswith("C") else lcsc_code
-
-        payload = {
-            "componentCodes": [lcsc_numeric]
-        }
-        body_str = json.dumps(payload, separators=(',', ':'), ensure_ascii=False)
-
-        try:
-            auth_header = self._get_auth_header("POST", path, body_str)
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": auth_header
-            }
-
-            resp = self.session.post(url, data=body_str, headers=headers, timeout=REQUEST_TIMEOUT)
-            
-            if resp.status_code == 401:
-                result.error = "API Unauthorized (401): Signature verification failed."
-                return result
-            elif resp.status_code == 403:
-                result.error = "API Forbidden (403): Access denied."
-                return result
-            
-            resp.raise_for_status()
-            data = resp.json()
-
-            code = data.get("code", 200)
-            if code != 200 and code != 0:
-                result.error = f"API Error [{code}]: {data.get('message', 'Unknown error')}"
-                return result
-
-            response_data = data.get("data", [])
-            if isinstance(response_data, dict):
-                components = response_data.get("components", []) or response_data.get("componentList", []) or response_data.get("data", [])
-            elif isinstance(response_data, list):
-                components = response_data
-            else:
-                components = []
-
-            result.match_count = len(components)
-
-            if not components:
-                result.found = False
-                return result
-
-            exact_comp = components[0]
-
-            result.found = True
-            result.exact_match = True
-            result.matched_mpn = exact_comp.get("componentModel", "") or exact_comp.get("mfr", "") or exact_comp.get("manufacturerPartNumber", "") or mpn_clean
-            
-            result.lcsc_code = lcsc_code
-            result.stock = int(exact_comp.get("stockCount", 0) or exact_comp.get("stock", 0) or exact_comp.get("availableStock", 0))
-            result.package = exact_comp.get("componentSpecification", "") or exact_comp.get("package", "")
-            result.category = exact_comp.get("firstTypeName", "") or exact_comp.get("category", "")
-            
-            price_ranges = exact_comp.get("priceRanges", []) or exact_comp.get("priceList", [])
-            result.price_breaks_raw = json.dumps(price_ranges) if price_ranges else ""
-            
-            if result.price_breaks_raw:
-                result.unit_price = select_result_unit_price(result.price_breaks_raw, required_stock)
-
-            if self.db_manager and result.lcsc_code:
-                self.db_manager.upsert_api_cache(
-                    lcsc_code=result.lcsc_code,
-                    stock=result.stock,
-                    price_breaks_raw=result.price_breaks_raw,
-                    package=result.package,
-                    category=result.category,
-                    timestamp=time.time()
-                )
-
-            return result
-
-        except Exception as e:
-            result.error = f"API Request Exception: {str(e)}"
-            return result
+        # Use the same direct-code path for MPN and approved-code searches.
+        # It includes the LCSC global-search fallback, which provides live
+        # stock/pricing when JOP returns no component detail.
+        return self.search_lcsc(
+            lcsc_code,
+            mpn_clean,
+            required_stock=required_stock,
+            refresh=refresh,
+        )
 
     def search_lcsc(self, lcsc_code: str, mpn: str, required_stock: int = 0, refresh: bool = False) -> JlcpcbSearchResult:
         """Search component directly by LCSC code using API cache or JOP OpenAPI."""
@@ -426,7 +352,14 @@ class JlcpcbSearcher:
         
         if self.db_manager and not refresh:
             cached = self.db_manager.get_api_cache(lcsc_code)
-            if cached and time.time() - cached["timestamp"] < 86400:
+            cache_has_supplier_data = bool(
+                cached
+                and (
+                    int(cached.get("stock", 0) or 0) > 0
+                    or bool(cached.get("price_breaks_raw", ""))
+                )
+            )
+            if cached and cache_has_supplier_data and time.time() - cached["timestamp"] < 86400:
                 result.found = True
                 result.exact_match = True
                 result.matched_mpn = mpn
@@ -661,7 +594,11 @@ class SearchWorker(QThread):
                     # catalogue number. ``search_item`` treats that number as
                     # an MPN and rejects the returned manufacturer's MPN as a
                     # non-exact match. Search by the real MPN for pricing.
-                    dk_result = dk_searcher.search_mpn(item.mpn) if item.digikey_part_number else dk_searcher.search_item(item)
+                    dk_result = (
+                        dk_searcher.search_mpn(item.mpn, item.required_stock)
+                        if item.digikey_part_number
+                        else dk_searcher.search_item(item)
+                    )
                     if dk_result:
                         suggested_digikey = dk_result.digikey_part_number or ""
                     enrich_bom_item_digikey(item, dk_result)

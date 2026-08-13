@@ -8,6 +8,8 @@ Key additions vs. original:
 """
 
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Optional
 from openpyxl import load_workbook
@@ -263,7 +265,7 @@ class MappingRefreshWorker(QThread):
                     lcsc_code = None
 
                 try:
-                    digikey_result = digikey_searcher.search_mpn(mpn)
+                    digikey_result = digikey_searcher.search_mpn(mpn, include_live_data=False)
                     digikey_code = digikey_result.digikey_part_number or ""
                 except Exception:
                     digikey_code = None
@@ -287,6 +289,9 @@ class ComponentLibraryImportWorker(QThread):
     error = pyqtSignal(str)
 
     INVALID_MPN_VALUES = {"", "*", "-", "N/A", "NA", "NONE"}
+    LOOKUP_CACHE_MAX_AGE = 24 * 60 * 60
+    LCSC_MAX_WORKERS = 8
+    DIGIKEY_MAX_WORKERS = 4
 
     def __init__(self, file_path: str, db_manager: DatabaseManager, parent=None):
         super().__init__(parent)
@@ -333,34 +338,107 @@ class ComponentLibraryImportWorker(QThread):
             workbook.close()
 
     def run(self):
-        jlc_searcher = None
-        digikey_searcher = None
+        jlc_searchers = []
+        digikey_searchers = []
         try:
             components, skipped = self._read_components()
             if not components:
                 raise ValueError("No valid component rows with an internal code and MPN were found.")
 
-            jlc_searcher = JlcpcbSearcher(APP_ID, ACCESS_KEY, SECRET_KEY, self.db_manager)
-            digikey_searcher = DigiKeySearcher()
+            # Search each MPN only once even when multiple internal codes use it.
+            unique_mpns = {}
+            for _, mpn in components:
+                unique_mpns.setdefault(mpn.upper(), mpn)
+
+            results = {}
+            network_jobs = []
+            cached_supplier_results = 0
+            for key, mpn in unique_mpns.items():
+                cached = self.db_manager.get_mpn_lookup_cache(mpn, self.LOOKUP_CACHE_MAX_AGE)
+                result = {"mpn": mpn, "lcsc": None, "digikey": None}
+                if cached and cached["lcsc_fresh"]:
+                    result["lcsc"] = cached["lcsc_code"]
+                    cached_supplier_results += 1
+                else:
+                    network_jobs.append(("lcsc", key, mpn))
+                if cached and cached["digikey_fresh"]:
+                    result["digikey"] = cached["digikey_code"]
+                    cached_supplier_results += 1
+                else:
+                    network_jobs.append(("digikey", key, mpn))
+                results[key] = result
+
+            local_state = threading.local()
+            searcher_lock = threading.Lock()
+            digikey_worker_counter = 0
+
+            def search_lcsc(mpn: str) -> str:
+                if not hasattr(local_state, "jlc_searcher"):
+                    local_state.jlc_searcher = JlcpcbSearcher(
+                        APP_ID, ACCESS_KEY, SECRET_KEY, self.db_manager
+                    )
+                    with searcher_lock:
+                        jlc_searchers.append(local_state.jlc_searcher)
+                return local_state.jlc_searcher._resolve_lcsc_from_mpn(mpn) or ""
+
+            def search_digikey(mpn: str) -> Optional[str]:
+                nonlocal digikey_worker_counter
+                if not hasattr(local_state, "digikey_searcher"):
+                    with searcher_lock:
+                        credential_index = digikey_worker_counter
+                        digikey_worker_counter += 1
+                    local_state.digikey_searcher = DigiKeySearcher(
+                        credential_start_index=credential_index
+                    )
+                    with searcher_lock:
+                        digikey_searchers.append(local_state.digikey_searcher)
+                result = local_state.digikey_searcher.search_mpn(mpn, include_live_data=False)
+                if not result.configured or result.error:
+                    return None
+                return result.digikey_part_number or ""
+
+            lcsc_executor = ThreadPoolExecutor(
+                max_workers=self.LCSC_MAX_WORKERS, thread_name_prefix="lcsc-import"
+            )
+            digikey_executor = ThreadPoolExecutor(
+                max_workers=self.DIGIKEY_MAX_WORKERS, thread_name_prefix="digikey-import"
+            )
+            try:
+                future_jobs = {}
+                for source, key, mpn in network_jobs:
+                    executor = lcsc_executor if source == "lcsc" else digikey_executor
+                    function = search_lcsc if source == "lcsc" else search_digikey
+                    future_jobs[executor.submit(function, mpn)] = (source, key, mpn)
+
+                total_jobs = len(future_jobs)
+                for completed, future in enumerate(as_completed(future_jobs), start=1):
+                    source, key, mpn = future_jobs[future]
+                    try:
+                        value = future.result()
+                    except Exception:
+                        value = None
+                    results[key][source] = value
+                    if value is not None:
+                        if source == "lcsc":
+                            self.db_manager.upsert_mpn_lookup_cache(mpn, lcsc_code=value)
+                        else:
+                            self.db_manager.upsert_mpn_lookup_cache(mpn, digikey_code=value)
+                    self.progress.emit(
+                        completed,
+                        total_jobs,
+                        f"Searching suppliers for {mpn} ({cached_supplier_results} cached results)",
+                    )
+            finally:
+                lcsc_executor.shutdown(wait=True)
+                digikey_executor.shutdown(wait=True)
+
             pending_count = 0
             total = len(components)
 
             for index, (internal_code, mpn) in enumerate(components, start=1):
-                self.progress.emit(index, total, f"Searching {internal_code} ({mpn})")
-                try:
-                    lcsc_code = jlc_searcher._resolve_lcsc_from_mpn(mpn) or ""
-                except Exception:
-                    lcsc_code = None
-
-                try:
-                    dk_result = digikey_searcher.search_mpn(mpn)
-                    digikey_code = (
-                        (dk_result.digikey_part_number or "")
-                        if dk_result.configured and not dk_result.error
-                        else None
-                    )
-                except Exception:
-                    digikey_code = None
+                lookup = results[mpn.upper()]
+                lcsc_code = lookup["lcsc"]
+                digikey_code = lookup["digikey"]
 
                 existing = self.db_manager.get_internal_mapping(internal_code)
                 if existing is None:
@@ -373,15 +451,17 @@ class ComponentLibraryImportWorker(QThread):
                     pending_count += 1
                 elif self.db_manager.refresh_mapping_codes(internal_code, lcsc_code, digikey_code):
                     pending_count += 1
+                if index % 25 == 0 or index == total:
+                    self.progress.emit(index, total, f"Saving pending mappings ({index}/{total})")
 
             self.finished.emit(total, pending_count, skipped)
         except Exception as exc:
             self.error.emit(str(exc))
         finally:
-            if jlc_searcher is not None:
-                jlc_searcher.close()
-            if digikey_searcher is not None:
-                digikey_searcher.close()
+            for searcher in jlc_searchers:
+                searcher.close()
+            for searcher in digikey_searchers:
+                searcher.close()
 
 
 # ═══════════════════════════════════════════════════════════════════

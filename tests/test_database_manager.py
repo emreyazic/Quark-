@@ -108,3 +108,21 @@ def test_legacy_pending_codes_are_migrated_to_auto_history(tmp_path):
     assert mapping["digikey_code"] == ""
     assert mapping["last_found_lcsc"] == "C1"
     assert mapping["last_found_digikey"] == "DK1"
+
+
+def test_mpn_lookup_cache_tracks_supplier_freshness_independently(tmp_path):
+    db = DatabaseManager(str(tmp_path / "mappings.sqlite"))
+    assert db.get_mpn_lookup_cache("MPN1", 60) is None
+
+    db.upsert_mpn_lookup_cache("MPN1", lcsc_code="C1")
+    cached = db.get_mpn_lookup_cache("mpn1", 60)
+    assert cached["lcsc_code"] == "C1"
+    assert cached["lcsc_fresh"] is True
+    assert cached["digikey_fresh"] is False
+
+    db.upsert_mpn_lookup_cache("MPN1", digikey_code="DK1")
+    cached = db.get_mpn_lookup_cache("MPN1", 60)
+    assert cached["lcsc_code"] == "C1"
+    assert cached["digikey_code"] == "DK1"
+    assert cached["lcsc_fresh"] is True
+    assert cached["digikey_fresh"] is True

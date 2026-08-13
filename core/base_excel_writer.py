@@ -106,6 +106,58 @@ class BaseExcelWriter:
         elif item.digikey_unit_price is not None:
             digikey_cell.fill = self.fill_green
 
+    def _add_supplier_stock_sheet(self, items: list[BomItem]) -> None:
+        """Write one JLCPCB row and one DigiKey row per component."""
+        sheet_name = "Supplier Stock"
+        if sheet_name in self.wb.sheetnames:
+            del self.wb[sheet_name]
+        ws = self.wb.create_sheet(sheet_name)
+        headers = [
+            "MPN", "Design Item ID", "Supplier", "Supplier Part Number",
+            "Stock", "Unit Price", "Required Stock", "Status",
+        ]
+        ws.append(headers)
+        for cell in ws[1]:
+            cell.font = self.header_font
+            cell.alignment = self.header_alignment
+
+        for item in items:
+            supplier_rows = [
+                (
+                    "JLCPCB",
+                    item.jlcpcb_part_number,
+                    item.available_stock_qty,
+                    item.unit_price,
+                    item.status,
+                ),
+                (
+                    "DigiKey",
+                    item.digikey_part_number,
+                    item.digikey_stock_qty,
+                    item.digikey_unit_price,
+                    "Found" if item.digikey_part_number else "Not Found",
+                ),
+            ]
+            for supplier, part_number, stock, unit_price, status in supplier_rows:
+                ws.append([
+                    item.mpn,
+                    item.comment,
+                    supplier,
+                    part_number or "-",
+                    stock if stock is not None else "-",
+                    unit_price,
+                    item.required_stock,
+                    status or "",
+                ])
+                if isinstance(unit_price, (int, float)):
+                    self._format_currency(ws.cell(row=ws.max_row, column=6))
+
+        ws.auto_filter.ref = ws.dimensions
+        ws.freeze_panes = "A2"
+        self._auto_fit_columns(ws, max_width=40)
+        ws.column_dimensions["A"].width = max(ws.column_dimensions["A"].width or 0, 22)
+        ws.column_dimensions["D"].width = max(ws.column_dimensions["D"].width or 0, 24)
+
     def _get_status_fill(self, status_text: str, has_jlcpcb_part: bool = False):
         """Returns the appropriate PatternFill based on status text and JLCPCB part presence."""
         val = str(status_text or "")

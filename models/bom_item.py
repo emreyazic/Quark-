@@ -91,6 +91,7 @@ class BomItem:
         ("MPN", "mpn"),
         ("Design Item ID", "comment"),
         ("JLCPCB Part Number", "jlcpcb_part_number"),
+        ("DigiKey Part Number", "digikey_part_number"),
         ("JLCPCB Stock", "available_stock_qty"),
         ("DigiKey Stock", "digikey_stock_qty"),
         ("JLCPCB Unit Price", "unit_price"),
