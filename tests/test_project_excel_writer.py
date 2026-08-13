@@ -119,13 +119,15 @@ def test_unpriced_in_aggregated_components_sheet(tmp_path):
     assert "JLCPCB Extended Cost @ 5x" not in headers
     
     mpn_col_idx = headers.index("MPN")
-    unit_price_col_idx = headers.index("Unit Price (JLCPCB / DigiKey)")
+    jlcpcb_price_col_idx = headers.index("JLCPCB Unit Price")
+    digikey_price_col_idx = headers.index("DigiKey Unit Price")
     status_col_idx = headers.index("Status")
     
     found_unpriced = False
     for row in ws.iter_rows(min_row=2, values_only=True):
         if row[mpn_col_idx] == "R3":
-            assert row[unit_price_col_idx] == "JLCPCB: - / DigiKey: -"
+            assert row[jlcpcb_price_col_idx] is None
+            assert row[digikey_price_col_idx] is None
             assert row[status_col_idx] == "Not found"
             found_unpriced = True
             

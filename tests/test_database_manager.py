@@ -126,3 +126,17 @@ def test_mpn_lookup_cache_tracks_supplier_freshness_independently(tmp_path):
     assert cached["digikey_code"] == "DK1"
     assert cached["lcsc_fresh"] is True
     assert cached["digikey_fresh"] is True
+
+
+def test_first_manual_approval_does_not_seed_automatic_history(tmp_path):
+    db = DatabaseManager(str(tmp_path / "mappings.sqlite"))
+
+    db.upsert_internal_mapping("R1", "MPN1", "MANUAL-LCSC", True, "MANUAL-DK")
+
+    mapping = db.get_internal_mapping("R1")
+    assert mapping["lcsc_code"] == "MANUAL-LCSC"
+    assert mapping["digikey_code"] == "MANUAL-DK"
+    assert mapping["last_found_lcsc"] == ""
+    assert mapping["last_found_digikey"] == ""
+    assert mapping["lcsc_status"] == "MANUAL_OVERRIDE"
+    assert mapping["digikey_status"] == "MANUAL_OVERRIDE"

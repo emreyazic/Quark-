@@ -1,6 +1,6 @@
 import json
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Union
 
 from models.project import Project, ProjectItem
 from models.workspace import Workspace
@@ -171,7 +171,7 @@ def workspace_from_dict(data: Dict[str, Any]) -> Workspace:
         
     return workspace
 
-def save_workspace(workspace: Workspace, output_path: str | Path) -> None:
+def save_workspace(workspace: Workspace, output_path: Union[str, Path]) -> None:
     """
     Saves a Workspace object to a JSON file.
     Creates parent directories if they do not exist.
@@ -184,7 +184,7 @@ def save_workspace(workspace: Workspace, output_path: str | Path) -> None:
     with path.open("w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
-def load_workspace(input_path: str | Path) -> Workspace:
+def load_workspace(input_path: Union[str, Path]) -> Workspace:
     """
     Loads a workspace JSON file (version 1 or 2) and returns a Workspace object.
     Loads project layouts only, does not parse BOM files.

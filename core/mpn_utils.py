@@ -182,15 +182,15 @@ def is_manufacturer_like(value: str) -> bool:
 
 
 def select_unit_price(price_json_str: str, quantity: int) -> Optional[float]:
-    """Select the appropriate unit price from JLCPCB price break JSON.
+    """Return the first/base JLCPCB unit price, independent of quantity.
 
     Args:
         price_json_str: JSON string of price breaks from JLCPCB API,
             e.g. '[{"qFrom": 20, "qTo": 180, "price": 0.022}, ...]'
-        quantity: The quantity to find a price for (typically required_stock).
+        quantity: Retained for API compatibility; it does not change the price.
 
     Returns:
-        The unit price for the matching quantity break, or None if unavailable.
+        The first advertised unit price, or None if unavailable.
     """
     if not price_json_str:
         return None
@@ -201,30 +201,10 @@ def select_unit_price(price_json_str: str, quantity: int) -> Optional[float]:
         if not isinstance(breaks, list) or not breaks:
             return None
 
-        # Find the price break that covers the requested quantity
-        best_price = None
         for pb in breaks:
-            q_from = pb.get("qFrom", 0) or 0
-            q_to = pb.get("qTo")  # Can be None for "and above"
             price = pb.get("price")
-
-            if price is None:
-                continue
-
-            if quantity >= q_from:
-                if q_to is None or quantity <= q_to:
-                    return round(float(price), 6)
-                # Track the last valid break in case quantity exceeds all ranges
-                best_price = round(float(price), 6)
-
-        # If quantity exceeds all defined ranges, use the last (highest qty) price
-        if best_price is not None:
-            return best_price
-
-        # Fallback: return the first price break
-        first_price = breaks[0].get("price")
-        if first_price is not None:
-            return round(float(first_price), 6)
+            if price is not None:
+                return round(float(price), 6)
 
     except (json.JSONDecodeError, TypeError, KeyError, ValueError):
         pass
@@ -232,11 +212,11 @@ def select_unit_price(price_json_str: str, quantity: int) -> Optional[float]:
     return None
 
 def select_digikey_price(price_breaks: list[tuple[int, float]], quantity: int) -> Optional[float]:
-    """Select the appropriate unit price from DigiKey price breaks.
+    """Return the first/base DigiKey unit price, independent of quantity.
 
     Args:
         price_breaks: List of (BreakQuantity, UnitPrice) tuples, sorted by BreakQuantity ascending.
-        quantity: The target quantity.
+        quantity: Retained for API compatibility; it does not change the price.
 
     Returns:
         The unit price, or None if unavailable.
@@ -244,15 +224,4 @@ def select_digikey_price(price_breaks: list[tuple[int, float]], quantity: int) -
     if not price_breaks:
         return None
 
-    best_price = None
-    for pb_qty, pb_price in price_breaks:
-        if quantity >= pb_qty:
-            best_price = pb_price
-        else:
-            break
-
-    # If quantity is lower than the lowest break, just use the first break
-    if best_price is None and price_breaks:
-        best_price = price_breaks[0][1]
-
-    return best_price
+    return price_breaks[0][1]

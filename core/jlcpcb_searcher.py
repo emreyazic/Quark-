@@ -9,8 +9,10 @@ import base64
 import hmac
 import hashlib
 import random
+import re
 import string
 from typing import Optional, Dict, Any
+from urllib.parse import quote
 import requests
 from models.bom_item import BomItem
 from core.mpn_utils import (
@@ -29,6 +31,7 @@ COMMUNITY_SEARCH_URL = "https://jlcsearch.tscircuit.com/components/list.json"
 # LCSC's own global search endpoint.  The community index above is fast but
 # incomplete for many extended-library parts, so this is an exact-match fallback.
 LCSC_GLOBAL_SEARCH_URL = "https://wmsc.lcsc.com/ftps/wm/search/v3/global"
+JLCPCB_PART_DETAIL_URL = "https://jlcpcb.com/partdetail/{lcsc_code}"
 
 # İstek zaman aşımı (saniye)
 REQUEST_TIMEOUT = 15
@@ -58,6 +61,7 @@ class JlcpcbSearchResult:
         self.match_count: int = 0
         self.error: Optional[str] = None
         self.candidates: list[dict] = []
+        self.data_source: str = ""
 
 
 class JlcpcbSearcher:
@@ -72,6 +76,94 @@ class JlcpcbSearcher:
             "Content-Type": "application/json",
             "Accept": "application/json",
         })
+        self.last_resolution_failed = False
+        self._part_page_cache: Dict[str, tuple[Optional[int], str]] = {}
+
+    @staticmethod
+    def _normalize_jop_price_ranges(price_ranges: list[dict]) -> str:
+        """Convert JOP's price fields to the common qFrom/qTo/price shape."""
+        normalized = []
+        for tier in price_ranges or []:
+            if not isinstance(tier, dict):
+                continue
+            quantity_from = tier.get("qFrom")
+            if quantity_from is None:
+                quantity_from = tier.get("startQuantity")
+            quantity_to = tier.get("qTo")
+            if quantity_to is None:
+                quantity_to = tier.get("endQuantity")
+            price = tier.get("price")
+            if price is None:
+                price = tier.get("unitPrice")
+            if price is None:
+                price = tier.get("productPrice")
+            if quantity_from is None or price is None:
+                continue
+            quantity_to_value = int(quantity_to) if quantity_to is not None else None
+            normalized.append({
+                "qFrom": int(quantity_from),
+                "qTo": None if quantity_to_value == -1 else quantity_to_value,
+                "price": float(price),
+            })
+        return json.dumps(normalized) if normalized else ""
+
+    def _fetch_jlcpcb_part_page_data(self, lcsc_code: str) -> tuple[Optional[int], str]:
+        """Read JLCPCB's own displayed overseas stock and price tiers.
+
+        The Open Platform stock is authoritative, but its price feed can differ
+        slightly from the public JLCPCB Parts page. The page embeds the exact
+        prices shown to the user in its server-rendered data, so prefer those
+        values when they are available.
+        """
+        cache_key = lcsc_code.upper()
+        if cache_key in self._part_page_cache:
+            return self._part_page_cache[cache_key]
+        try:
+            response = self.session.get(
+                JLCPCB_PART_DETAIL_URL.format(lcsc_code=quote(lcsc_code)),
+                timeout=REQUEST_TIMEOUT,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) BOM-Enrichment-Tool/2.0",
+                    "Accept": "text/html,application/xhtml+xml",
+                },
+            )
+            response.raise_for_status()
+            html = response.text
+            escaped_code = re.escape(lcsc_code.upper())
+
+            stock_pattern = re.compile(
+                rf'\\?"componentCode\\?":\\?"{escaped_code}\\?"'
+                rf'.{{0,1200}}?\\?"overseasStockCount\\?":(\d+)',
+                re.DOTALL,
+            )
+            stock_matches = stock_pattern.findall(html)
+            stock = int(stock_matches[0]) if stock_matches else None
+
+            tier_pattern = re.compile(
+                rf'\\?"componentCode\\?":\\?"{escaped_code}\\?"'
+                rf'.{{0,600}}?\\?"startNumber\\?":(\d+),'
+                rf'\\?"endNumber\\?":(-?\d+),'
+                rf'\\?"productPrice\\?":([0-9.eE+-]+)',
+                re.DOTALL,
+            )
+            price_breaks = []
+            seen_tiers = set()
+            for quantity_from, quantity_to, price in tier_pattern.findall(html):
+                tier_key = (int(quantity_from), int(quantity_to), float(price))
+                if tier_key in seen_tiers:
+                    continue
+                seen_tiers.add(tier_key)
+                price_breaks.append({
+                    "qFrom": tier_key[0],
+                    "qTo": None if tier_key[1] == -1 else tier_key[1],
+                    "price": tier_key[2],
+                })
+            price_breaks.sort(key=lambda tier: tier["qFrom"])
+            result = (stock, json.dumps(price_breaks) if price_breaks else "")
+            self._part_page_cache[cache_key] = result
+            return result
+        except Exception:
+            return None, ""
 
     def _generate_nonce(self) -> str:
         chars = string.ascii_letters + string.digits
@@ -106,6 +198,9 @@ class JlcpcbSearcher:
         3. Community search API (fallback)
         Returns None silently if not found — caller handles pending flow.
         """
+        self.last_resolution_failed = False
+        completed_remote_lookup = False
+
         # 1. Önce yerel kütüphane veritabanını sorgula
         if self.db_manager:
             lcsc = self.db_manager.lookup_lcsc_by_mpn(mpn_clean)
@@ -185,6 +280,7 @@ class JlcpcbSearcher:
                 },
             )
             if official_resp.status_code == 200:
+                completed_remote_lookup = True
                 official_data = official_resp.json()
                 official_result = official_data.get("result") if isinstance(official_data, dict) else None
                 if isinstance(official_result, dict):
@@ -212,6 +308,7 @@ class JlcpcbSearcher:
                     },
                 )
                 if resp.status_code == 200:
+                    completed_remote_lookup = True
                     lcsc_code = find_exact_lcsc(get_components(resp.json()))
                     if lcsc_code:
                         return lcsc_code
@@ -231,6 +328,7 @@ class JlcpcbSearcher:
                             return lcsc_code
 
                     # Bulunamadı ama hata yok — sessizce None dön
+                    self.last_resolution_failed = False
                     return None
                 elif resp.status_code in (429, 503):
                     # Rate limit — tekrar dene
@@ -238,13 +336,16 @@ class JlcpcbSearcher:
                         time.sleep(backoff * (2 ** attempt))
                         continue
                 # Diğer HTTP hataları — sessizce None dön
+                self.last_resolution_failed = not completed_remote_lookup
                 return None
             except Exception:
                 if attempt < max_retries - 1:
                     time.sleep(backoff * (2 ** attempt))
                     continue
+                self.last_resolution_failed = not completed_remote_lookup
                 return None
 
+        self.last_resolution_failed = not completed_remote_lookup
         return None
 
 
@@ -340,6 +441,7 @@ class JlcpcbSearcher:
                 fallback.matched_mpn = mpn
                 fallback.lcsc_code = lcsc_code
                 fallback.stock = int(product.get("stockNumber", 0) or 0)
+                fallback.data_source = "LCSC_GLOBAL"
                 fallback.package = product.get("encapStandard", "") or ""
                 fallback.category = product.get("catalogName", "") or ""
                 fallback.price_breaks_raw = json.dumps(price_breaks) if price_breaks else ""
@@ -352,6 +454,10 @@ class JlcpcbSearcher:
         
         if self.db_manager and not refresh:
             cached = self.db_manager.get_api_cache(lcsc_code)
+            cache_source_is_current = bool(
+                cached
+                and cached.get("source") in {"JLCPCB_PAGE_V1", "JLCPCB_OPENAPI_V2"}
+            )
             cache_has_supplier_data = bool(
                 cached
                 and (
@@ -359,7 +465,7 @@ class JlcpcbSearcher:
                     or bool(cached.get("price_breaks_raw", ""))
                 )
             )
-            if cached and cache_has_supplier_data and time.time() - cached["timestamp"] < 86400:
+            if cached and cache_source_is_current and cache_has_supplier_data and time.time() - cached["timestamp"] < 86400:
                 result.found = True
                 result.exact_match = True
                 result.matched_mpn = mpn
@@ -368,14 +474,17 @@ class JlcpcbSearcher:
                 result.package = cached["package"]
                 result.category = cached["category"]
                 result.price_breaks_raw = cached["price_breaks_raw"]
+                result.data_source = cached["source"]
                 if result.price_breaks_raw:
                     result.unit_price = select_result_unit_price(result.price_breaks_raw, required_stock)
                 return result
         
         path = "/overseas/openapi/component/getComponentDetailByCode"
         url = f"{API_BASE_URL}{path}"
-        lcsc_numeric = lcsc_code[1:] if lcsc_code.startswith("C") else lcsc_code
-        payload = {"componentCodes": [lcsc_numeric]}
+        # JOP requires the complete catalogue number (for example C127833).
+        # Removing the C prefix returns HTTP 200 with an empty data array.
+        normalized_lcsc_code = lcsc_code if lcsc_code.upper().startswith("C") else f"C{lcsc_code}"
+        payload = {"componentCodes": [normalized_lcsc_code.upper()]}
         body_str = json.dumps(payload, separators=(',', ':'), ensure_ascii=False)
 
         try:
@@ -415,6 +524,7 @@ class JlcpcbSearcher:
                             package=fallback_result.package,
                             category=fallback_result.category,
                             timestamp=time.time(),
+                            source=fallback_result.data_source,
                         )
                     return fallback_result
                 result.found = False
@@ -426,11 +536,20 @@ class JlcpcbSearcher:
             result.matched_mpn = mpn
             result.lcsc_code = lcsc_code
             result.stock = int(exact_comp.get("stockCount", 0) or exact_comp.get("stock", 0) or exact_comp.get("availableStock", 0))
+            result.data_source = "JLCPCB_OPENAPI_V2"
             result.package = exact_comp.get("componentSpecification", "") or exact_comp.get("package", "")
             result.category = exact_comp.get("firstTypeName", "") or exact_comp.get("category", "")
             
             price_ranges = exact_comp.get("priceRanges", []) or exact_comp.get("priceList", [])
-            result.price_breaks_raw = json.dumps(price_ranges) if price_ranges else ""
+            result.price_breaks_raw = self._normalize_jop_price_ranges(price_ranges)
+
+            page_stock, page_price_breaks = self._fetch_jlcpcb_part_page_data(lcsc_code)
+            if page_stock is not None:
+                result.stock = page_stock
+            if page_price_breaks:
+                result.price_breaks_raw = page_price_breaks
+            if page_stock is not None or page_price_breaks:
+                result.data_source = "JLCPCB_PAGE_V1"
             
             if result.price_breaks_raw:
                 result.unit_price = select_result_unit_price(result.price_breaks_raw, required_stock)
@@ -442,7 +561,8 @@ class JlcpcbSearcher:
                     price_breaks_raw=result.price_breaks_raw,
                     package=result.package,
                     category=result.category,
-                    timestamp=time.time()
+                    timestamp=time.time(),
+                    source=result.data_source,
                 )
 
             return result
@@ -552,6 +672,7 @@ class SearchWorker(QThread):
                 suggested_mpn = item.mpn or ""
                 suggested_lcsc = ""
                 suggested_digikey = ""
+                approved_digikey_code = ""
                 
                 if is_res_coded(item.comment):
                     item.status = "RES manual"
@@ -563,6 +684,7 @@ class SearchWorker(QThread):
                         item.mpn = mapping.get("mpn", "")
                         lcsc_code = mapping.get("lcsc_code", "")
                         item.digikey_part_number = mapping.get("digikey_code", "")
+                        approved_digikey_code = item.digikey_part_number
                         # An approval may intentionally contain only an MPN or
                         # DigiKey code. Do not call the LCSC detail API with an
                         # empty code: it always returns no components and turns
@@ -602,6 +724,8 @@ class SearchWorker(QThread):
                     if dk_result:
                         suggested_digikey = dk_result.digikey_part_number or ""
                     enrich_bom_item_digikey(item, dk_result)
+                    if approved_digikey_code:
+                        item.digikey_part_number = approved_digikey_code
                 elif dk_searcher.is_configured and is_unapproved:
                     # Pending için DigiKey önerisini sadece DB'de hiç kayıt yokken topla
                     existing = self.db_manager.get_internal_mapping(internal_code)
@@ -633,6 +757,9 @@ class SearchWorker(QThread):
 
         except Exception as e:
             self.error.emit(str(e))
+        finally:
+            searcher.close()
+            dk_searcher.close()
 
 
 # ═══════════════════════════════════════════════════════════════════

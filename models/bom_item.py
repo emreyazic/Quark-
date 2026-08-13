@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import ClassVar, Optional
+from typing import ClassVar, Optional, Union
 
 
 @dataclass
@@ -50,7 +50,7 @@ class BomItem:
     description: str = ""
     designator: str = ""
     footprint: str = ""
-    quantity: int = 0
+    quantity: Union[int, float, str] = 0
     value: str = ""
     manufacturer: str = ""
     mpn: str = ""  # Manufacturer Part Number

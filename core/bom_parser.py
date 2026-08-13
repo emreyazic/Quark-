@@ -294,18 +294,19 @@ class BomParser:
                     return default
                 return str(val).strip()
 
-            def get_int_val(col_idx: Optional[int], default=0) -> int:
+            def get_quantity_val(col_idx: Optional[int], default=""):
                 raw = get_val(col_idx, "")
                 if raw == "":
                     return default
                 try:
-                    return int(float(raw))
+                    number = float(raw)
+                    return int(number) if number.is_integer() else number
                 except (ValueError, TypeError):
-                    return default
+                    return raw
 
             # Clean MPN value to remove Excel artifacts
             mpn = clean_mpn_value(get_val(mapping.mpn))
-            quantity = get_int_val(mapping.quantity, 0)
+            quantity = get_quantity_val(mapping.quantity)
 
             # Handle Board Name assignment logic
             board_val = get_val(mapping.board_identifier)

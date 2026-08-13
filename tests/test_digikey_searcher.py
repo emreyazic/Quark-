@@ -57,5 +57,14 @@ def test_digikey_uses_live_selected_variation_stock_and_quantity_price(monkeypat
     result = searcher.search_mpn("MPN1", required_stock=60)
     assert result.digikey_part_number == "DK-MPN1-CT-ND"
     assert result.stock == 123
-    assert result.unit_price == 0.30
+    assert result.unit_price == 0.50
     searcher.close()
+
+
+def test_digikey_prefers_cut_tape_before_other_moq_one_variations():
+    variations = [
+        {"DigiKeyProductNumber": "TRAY", "MinimumOrderQuantity": 1, "PackageType": {"Name": "Tray"}},
+        {"DigiKeyProductNumber": "CT", "MinimumOrderQuantity": 1, "PackageType": {"Name": "Cut Tape (CT)"}},
+    ]
+
+    assert DigiKeySearcher._select_variation(variations)["DigiKeyProductNumber"] == "CT"

@@ -127,11 +127,14 @@ class DigiKeySearcher:
         for variation in variations:
             package = variation.get("PackageType", {})
             package_name = package.get("Name", "") if isinstance(package, dict) else str(package)
+            if "cut tape" in package_name.lower():
+                return variation
+        for variation in variations:
             try:
                 moq = int(variation.get("MinimumOrderQuantity", 0) or 0)
             except (TypeError, ValueError):
-                moq = 0
-            if "cut tape" in package_name.lower() or moq == 1:
+                continue
+            if moq == 1:
                 return variation
         return variations[0] if variations else None
 

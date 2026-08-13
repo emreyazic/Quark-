@@ -120,9 +120,14 @@ class DatabaseManager:
                         price_breaks_raw TEXT,
                         package TEXT,
                         category TEXT,
+                        source TEXT NOT NULL DEFAULT '',
                         timestamp REAL NOT NULL
                     )
                 ''')
+                cursor.execute("PRAGMA table_info(api_cache)")
+                api_cache_columns = [info[1] for info in cursor.fetchall()]
+                if 'source' not in api_cache_columns:
+                    cursor.execute("ALTER TABLE api_cache ADD COLUMN source TEXT NOT NULL DEFAULT ''")
                 
                 # Table 3: local_jlc_library  (MPN -> LCSC kalıcı eşleme, JOP API'den senkronize)
                 cursor.execute('''
@@ -179,8 +184,10 @@ class DatabaseManager:
                 cursor = conn.cursor()
                 cursor.execute("SELECT * FROM internal_mappings WHERE comment_code = ?", (comment_code,))
                 existing = cursor.fetchone()
-                lcsc_source = "MANUAL" if existing and lcsc_code != existing["last_found_lcsc"] else "AUTO"
-                digikey_source = "MANUAL" if existing and digikey_code != existing["last_found_digikey"] else "AUTO"
+                last_found_lcsc = existing["last_found_lcsc"] if existing else ""
+                last_found_digikey = existing["last_found_digikey"] if existing else ""
+                lcsc_source = "MANUAL" if lcsc_code != last_found_lcsc else "AUTO"
+                digikey_source = "MANUAL" if digikey_code != last_found_digikey else "AUTO"
                 lcsc_status = "MANUAL_OVERRIDE" if lcsc_source == "MANUAL" else "AUTO_APPROVED"
                 digikey_status = "MANUAL_OVERRIDE" if digikey_source == "MANUAL" else "AUTO_APPROVED"
                 cursor.execute('''
@@ -202,7 +209,8 @@ class DatabaseManager:
                         previous_found_digikey = '',
                         updated_at = excluded.updated_at
                 ''', (comment_code, mpn, lcsc_code, digikey_code, 1 if approved else 0, time.time(),
-                      lcsc_code, digikey_code, lcsc_source, digikey_source, lcsc_status, digikey_status))
+                      last_found_lcsc, last_found_digikey,
+                      lcsc_source, digikey_source, lcsc_status, digikey_status))
                 conn.commit()
 
     def insert_pending_suggestion(self, comment_code: str, mpn: str = "", lcsc_code: str = "", digikey_code: str = "") -> None:
@@ -326,7 +334,7 @@ class DatabaseManager:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    "SELECT lcsc_code, stock, price_breaks_raw, package, category, timestamp FROM api_cache WHERE lcsc_code = ?", 
+                    "SELECT lcsc_code, stock, price_breaks_raw, package, category, source, timestamp FROM api_cache WHERE lcsc_code = ?",
                     (lcsc_code,)
                 )
                 row = cursor.fetchone()
@@ -334,21 +342,31 @@ class DatabaseManager:
                     return dict(row)
                 return None
 
-    def upsert_api_cache(self, lcsc_code: str, stock: int, price_breaks_raw: str, package: str, category: str, timestamp: float) -> None:
+    def upsert_api_cache(
+        self,
+        lcsc_code: str,
+        stock: int,
+        price_breaks_raw: str,
+        package: str,
+        category: str,
+        timestamp: float,
+        source: str = "",
+    ) -> None:
         """Inserts or updates cached API data for an LCSC code."""
         with self._lock:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
-                    INSERT INTO api_cache (lcsc_code, stock, price_breaks_raw, package, category, timestamp)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT INTO api_cache (lcsc_code, stock, price_breaks_raw, package, category, source, timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(lcsc_code) DO UPDATE SET
                         stock = excluded.stock,
                         price_breaks_raw = excluded.price_breaks_raw,
                         package = excluded.package,
                         category = excluded.category,
+                        source = excluded.source,
                         timestamp = excluded.timestamp
-                ''', (lcsc_code, stock, price_breaks_raw, package, category, timestamp))
+                ''', (lcsc_code, stock, price_breaks_raw, package, category, source, timestamp))
                 conn.commit()
 
     def clear_old_cache(self, max_age_seconds: float) -> None:

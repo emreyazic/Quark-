@@ -177,7 +177,7 @@ class ManualSearchWorker(QThread):
                     "searched_mpn": mpn_clean,
                     "matched_mpn": dk_result.matched_mpn,
                     "manufacturer": dk_result.manufacturer,
-                    "part_number": "",  # Blank for DigiKey
+                    "part_number": dk_result.digikey_part_number,
                     "stock": str(dk_result.stock),
                     "unit_price": f"${dk_result.unit_price:.4f}" if dk_result.unit_price else "",
                     "match_type": "✅ Exact Match",
@@ -192,7 +192,7 @@ class ManualSearchWorker(QThread):
                         "searched_mpn": mpn_clean,
                         "matched_mpn": c["mpn"],
                         "manufacturer": c.get("manufacturer", ""),
-                        "part_number": "",  # Blank for DigiKey
+                        "part_number": c.get("digikey_pn", ""),
                         "stock": str(c.get("stock", "")),
                         "unit_price": "",
                         "match_type": "✅ Exact" if is_exact else "⚠ Partial",
@@ -260,13 +260,17 @@ class MappingRefreshWorker(QThread):
                 # Resolve only the MPN→LCSC mapping. A lookup failure must not
                 # clear the existing code, which is enforced in the DB method.
                 try:
-                    lcsc_code = searcher._resolve_lcsc_from_mpn(mpn) or ""
+                    resolved_lcsc = searcher._resolve_lcsc_from_mpn(mpn)
+                    lcsc_code = None if searcher.last_resolution_failed else (resolved_lcsc or "")
                 except Exception:
                     lcsc_code = None
 
                 try:
                     digikey_result = digikey_searcher.search_mpn(mpn, include_live_data=False)
-                    digikey_code = digikey_result.digikey_part_number or ""
+                    digikey_code = (
+                        None if digikey_result.error
+                        else (digikey_result.digikey_part_number or "")
+                    )
                 except Exception:
                     digikey_code = None
 
@@ -372,14 +376,17 @@ class ComponentLibraryImportWorker(QThread):
             searcher_lock = threading.Lock()
             digikey_worker_counter = 0
 
-            def search_lcsc(mpn: str) -> str:
+            def search_lcsc(mpn: str) -> Optional[str]:
                 if not hasattr(local_state, "jlc_searcher"):
                     local_state.jlc_searcher = JlcpcbSearcher(
                         APP_ID, ACCESS_KEY, SECRET_KEY, self.db_manager
                     )
                     with searcher_lock:
                         jlc_searchers.append(local_state.jlc_searcher)
-                return local_state.jlc_searcher._resolve_lcsc_from_mpn(mpn) or ""
+                resolved = local_state.jlc_searcher._resolve_lcsc_from_mpn(mpn)
+                if getattr(local_state.jlc_searcher, "last_resolution_failed", False):
+                    return None
+                return resolved or ""
 
             def search_digikey(mpn: str) -> Optional[str]:
                 nonlocal digikey_worker_counter
@@ -557,7 +564,7 @@ class MainWindow(QMainWindow):
         self._stack.setCurrentIndex(0)
 
         # ── Footer ──────────────────────────────────────────────────
-        footer = QLabel("Powered by jlcsearch.tscircuit.com community API")
+        footer = QLabel("Supplier data: JLCPCB/LCSC and DigiKey")
         footer.setStyleSheet(
             "color: #3a5068; font-size: 10px; padding: 8px 0 0 0; background: transparent;"
         )

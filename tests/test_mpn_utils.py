@@ -8,6 +8,7 @@ from core.mpn_utils import (
     is_mpn_like,
     is_manufacturer_like,
     select_unit_price,
+    select_digikey_price,
 )
 
 def test_normalize_mpn():
@@ -52,6 +53,14 @@ def test_is_manufacturer_like():
 def test_select_unit_price():
     price_json = '[{"qFrom": 20, "qTo": 180, "price": 0.022142857}, {"qFrom": 200, "qTo": null, "price": 0.017}]'
     assert select_unit_price(price_json, 50) == 0.022143
-    assert select_unit_price(price_json, 250) == 0.017
+    assert select_unit_price(price_json, 250) == 0.022143
     assert select_unit_price(price_json, 10) == 0.022143  # Fallback to first
     assert select_unit_price("", 10) is None
+
+
+def test_supplier_unit_prices_do_not_change_with_quantity():
+    jlcpcb_prices = '[{"qFrom": 1, "qTo": 9, "price": 2.0}, {"qFrom": 10, "qTo": null, "price": 1.0}]'
+    digikey_prices = [(1, 2.0), (10, 1.0)]
+
+    assert select_unit_price(jlcpcb_prices, 1000) == 2.0
+    assert select_digikey_price(digikey_prices, 1000) == 2.0
