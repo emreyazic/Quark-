@@ -155,8 +155,8 @@ class ProjectExcelWriter(BaseExcelWriter):
         
         headers = [
             "Board Name", "Description", "Designator", "Quantity (Per Board / Total)", 
-            "Value", "Manufacturer", "MPN", "Design Item ID", "JLCPCB Part Number", 
-            "Unit Price (JLCPCB / DigiKey)", "Status"
+            "Value", "Manufacturer", "MPN", "Design Item ID", "JLCPCB Part Number", "JLCPCB Stock", "DigiKey Stock",
+            "JLCPCB Unit Price", "DigiKey Unit Price", "Status"
         ]
 
         ws.append(headers)
@@ -193,7 +193,10 @@ class ProjectExcelWriter(BaseExcelWriter):
                 enriched.mpn,
                 enriched.comment,
                 enriched.jlcpcb_part_number,
-                enriched.combined_unit_price,
+                enriched.available_stock_qty if enriched.available_stock_qty is not None else "-",
+                enriched.digikey_stock_qty if enriched.digikey_stock_qty is not None else "-",
+                enriched.unit_price,
+                enriched.digikey_unit_price,
                 enriched.status
             ]
                 
@@ -202,7 +205,8 @@ class ProjectExcelWriter(BaseExcelWriter):
             ws.cell(row=ws.max_row, column=4).alignment = self.wrap_alignment
             
             # Only status coloring left since we removed multi-column pricing
-            cell = ws.cell(row=ws.max_row, column=11)
+            self._format_supplier_price_cells(ws, ws.max_row, 12, 13, enriched)
+            cell = ws.cell(row=ws.max_row, column=14)
             fill = self._get_status_fill(enriched.status, bool(enriched.jlcpcb_part_number))
             if fill:
                 cell.fill = fill
@@ -241,8 +245,8 @@ class ProjectExcelWriter(BaseExcelWriter):
 
             headers = [
                 "Board Name", "Description", "Designator", "Quantity (Per Board / Total)", 
-                "Value", "Manufacturer", "MPN", "Design Item ID", "JLCPCB Part Number", 
-                "Unit Price (JLCPCB / DigiKey)", "Status"
+                "Value", "Manufacturer", "MPN", "Design Item ID", "JLCPCB Part Number", "JLCPCB Stock", "DigiKey Stock",
+                "JLCPCB Unit Price", "DigiKey Unit Price", "Status"
             ]
             ws.append(headers)
             header_row = ws.max_row
@@ -271,13 +275,17 @@ class ProjectExcelWriter(BaseExcelWriter):
                         enriched.mpn,
                         usage.bom_item.comment,
                         enriched.jlcpcb_part_number,
-                        enriched.combined_unit_price,
+                        enriched.available_stock_qty if enriched.available_stock_qty is not None else "-",
+                        enriched.digikey_stock_qty if enriched.digikey_stock_qty is not None else "-",
+                        enriched.unit_price,
+                        enriched.digikey_unit_price,
                         enriched.status
                     ]
                     ws.append(row)
                     
                     # Status coloring
-                    cell = ws.cell(row=ws.max_row, column=11)
+                    self._format_supplier_price_cells(ws, ws.max_row, 12, 13, enriched)
+                    cell = ws.cell(row=ws.max_row, column=14)
                     fill = self._get_status_fill(enriched.status, bool(enriched.jlcpcb_part_number))
                     if fill:
                         cell.fill = fill

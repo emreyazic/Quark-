@@ -65,6 +65,7 @@ class BomItem:
     required_stock: int = 0  # Computed as (quantity * 10) + 10
     unit_price: Optional[float] = None
     digikey_unit_price: Optional[float] = None
+    digikey_stock_qty: Optional[int] = None
     digikey_part_number: str = ""
     
     jlcpcb_price_breaks_raw: str = ""
@@ -90,7 +91,10 @@ class BomItem:
         ("MPN", "mpn"),
         ("Design Item ID", "comment"),
         ("JLCPCB Part Number", "jlcpcb_part_number"),
-        ("Unit Price (JLCPCB / DigiKey)", "unit_price"),
+        ("JLCPCB Stock", "available_stock_qty"),
+        ("DigiKey Stock", "digikey_stock_qty"),
+        ("JLCPCB Unit Price", "unit_price"),
+        ("DigiKey Unit Price", "digikey_unit_price"),
         ("Status", "status"),
     ]
 
@@ -120,8 +124,8 @@ class BomItem:
     def to_row(self) -> list:
         row = []
         for header, attr in self.EXPORT_COLUMNS:
-            if header == "Unit Price (JLCPCB / DigiKey)":
-                row.append(self.combined_unit_price)
+            if header == "Quantity (Per Board / Total)":
+                row.append(self.quantity)
             else:
                 val = getattr(self, attr, "")
                 row.append(val if val is not None else "")

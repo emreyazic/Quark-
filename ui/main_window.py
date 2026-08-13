@@ -230,7 +230,7 @@ class ManualSearchWorker(QThread):
 
 
 class MappingRefreshWorker(QThread):
-    """Checks existing mappings and persists only supplier codes that changed."""
+    """Checks mappings against the last automatic result, not the approved value."""
 
     progress = pyqtSignal(int, int, str)
     finished = pyqtSignal(int)
@@ -259,13 +259,13 @@ class MappingRefreshWorker(QThread):
                 try:
                     lcsc_code = searcher._resolve_lcsc_from_mpn(mpn) or ""
                 except Exception:
-                    lcsc_code = ""
+                    lcsc_code = None
 
                 try:
                     digikey_result = digikey_searcher.search_mpn(mpn)
                     digikey_code = digikey_result.digikey_part_number or ""
                 except Exception:
-                    digikey_code = ""
+                    digikey_code = None
 
                 if self.db_manager.refresh_mapping_codes(comment_code, lcsc_code, digikey_code):
                     updated_count += 1
@@ -291,6 +291,7 @@ class MainWindow(QMainWindow):
         self._search_worker: Optional[SearchWorker] = None
         self._manual_search_worker: Optional[ManualSearchWorker] = None
         self._mapping_refresh_worker: Optional[MappingRefreshWorker] = None
+        self._approval_dialog: Optional[ApprovalDialog] = None
         self._all_items: list[BomItem] = []
         self._project_aggregation_result = None
         self._search_item_component_keys: list[str] = []
@@ -299,7 +300,9 @@ class MainWindow(QMainWindow):
         self._workspace_aggregation_result = None
 
         self.setWindowTitle("Workspace BOM Aggregation Tool")
-        self.setMinimumSize(1200, 800)
+        # Keep the application usable on smaller screens; wide tables can
+        # scroll horizontally instead of preventing the window from resizing.
+        self.setMinimumSize(800, 560)
         self.resize(1400, 900)
 
         self._database_manager = DatabaseManager()
@@ -468,7 +471,7 @@ class MainWindow(QMainWindow):
 
         # Refresh Mappings button
         self._btn_refresh_mappings = QPushButton("🔄 Refresh Mappings")
-        self._btn_refresh_mappings.setToolTip("Update only changed LCSC and DigiKey codes; never clears existing mappings")
+        self._btn_refresh_mappings.setToolTip("Update only changed LCSC and DigiKey codes; changed mappings return to pending approval")
         self._btn_refresh_mappings.clicked.connect(self._refresh_mappings)
         action_layout.addWidget(self._btn_refresh_mappings)
 
@@ -790,15 +793,29 @@ class MainWindow(QMainWindow):
         )
 
     def _open_approval_dialog(self):
-        dlg = ApprovalDialog(self._database_manager, self)
-        dlg.exec()
+        # Keep mapping management available alongside the main window instead
+        # of using ``exec()``, which starts a modal event loop and blocks all
+        # interaction with the rest of the application.
+        if self._approval_dialog is None:
+            self._approval_dialog = ApprovalDialog(self._database_manager, self)
+            self._approval_dialog.setModal(False)
+            self._approval_dialog.finished.connect(self._on_approval_dialog_closed)
+        else:
+            self._approval_dialog._load_data()
+
+        self._approval_dialog.show()
+        self._approval_dialog.raise_()
+        self._approval_dialog.activateWindow()
+
+    def _on_approval_dialog_closed(self):
+        self._approval_dialog = None
 
     def _refresh_mappings(self):
         reply = QMessageBox.question(
             self, "Refresh Mappings",
             "Check all mappings against JLCPCB and DigiKey?\n\n"
-            "Only newly found codes that differ from the saved LCSC or DigiKey code will be updated. "
-            "Existing values are never cleared when a lookup fails.",
+            "Only results that differ from the previous automatic search will be sent for review. "
+            "User-approved values are never overwritten automatically.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No
         )

@@ -22,7 +22,7 @@ class ApprovalDialog(QDialog):
         super().__init__(parent)
         self.db_manager = db_manager
         self.setWindowTitle("Manage Internal Mappings")
-        self.resize(1100, 600)
+        self.resize(1450, 600)
         self.setStyleSheet("""
             #TableEditor {
                 background-color: #2d3436;
@@ -55,14 +55,18 @@ class ApprovalDialog(QDialog):
         self.tab_pending = QWidget()
         layout_pending = QVBoxLayout(self.tab_pending)
         
-        info_label_pending = QLabel("The following internal codes require your approval. Enter MPN and LCSC code, then click Approve.")
+        info_label_pending = QLabel("Review the approved value against the previous and latest automatic search results. Automatic checks never overwrite approved values.")
         layout_pending.addWidget(info_label_pending)
 
         self.table_pending = QTableWidget()
-        self.table_pending.setColumnCount(6)
-        self.table_pending.setHorizontalHeaderLabels(["Internal Code (Comment)", "Suggested MPN", "Suggested LCSC", "Suggested DigiKey", "Last Updated", "Action"])
+        self.table_pending.setColumnCount(10)
+        self.table_pending.setHorizontalHeaderLabels([
+            "Internal Code (Comment)", "MPN", "Approved LCSC", "Previous Auto LCSC",
+            "New Auto LCSC", "Approved DigiKey", "Previous Auto DigiKey",
+            "New Auto DigiKey", "Last Updated", "Action"
+        ])
         self.table_pending.setItemDelegate(TableEditorDelegate(self.table_pending))
-        self._configure_table(self.table_pending, action_width=140)
+        self._configure_pending_table()
         layout_pending.addWidget(self.table_pending)
         
         self.tabs.addTab(self.tab_pending, "Pending Approvals")
@@ -108,6 +112,16 @@ class ApprovalDialog(QDialog):
         table.horizontalHeader().setMinimumSectionSize(action_width)
         table.setColumnWidth(5, action_width)
 
+    def _configure_pending_table(self):
+        header = self.table_pending.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        for column in range(2, 8):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(8, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(9, QHeaderView.ResizeMode.Fixed)
+        self.table_pending.setColumnWidth(9, 140)
+
     def _load_data(self):
         mappings = self.db_manager.get_all_internal_mappings()
         
@@ -120,7 +134,7 @@ class ApprovalDialog(QDialog):
     def _populate_pending_table(self, pending_list):
         self.table_pending.setRowCount(len(pending_list))
         for row, mapping in enumerate(pending_list):
-            self._fill_row(self.table_pending, row, mapping)
+            self._fill_pending_row(row, mapping)
             
             btn_approve = QPushButton("✅ Approve")
             btn_approve.setObjectName("actionApproveBtn")
@@ -131,7 +145,7 @@ class ApprovalDialog(QDialog):
             h_layout = QHBoxLayout(container)
             h_layout.setContentsMargins(4, 2, 4, 2)
             h_layout.addWidget(btn_approve)
-            self.table_pending.setCellWidget(row, 5, container)
+            self.table_pending.setCellWidget(row, 9, container)
 
     def _populate_approved_table(self, approved_list):
         self.table_approved.setRowCount(len(approved_list))
@@ -176,6 +190,24 @@ class ApprovalDialog(QDialog):
         item_updated.setFlags(item_updated.flags() & ~Qt.ItemFlag.ItemIsEditable)
         table.setItem(row, 4, item_updated)
 
+    def _fill_pending_row(self, row: int, mapping: dict):
+        values = [
+            mapping.get("comment_code", ""), mapping.get("mpn", ""),
+            mapping.get("lcsc_code", ""), mapping.get("previous_found_lcsc", ""),
+            mapping.get("last_found_lcsc", ""), mapping.get("digikey_code", ""),
+            mapping.get("previous_found_digikey", ""), mapping.get("last_found_digikey", ""),
+        ]
+        for column, value in enumerate(values):
+            item = QTableWidgetItem(value or "")
+            if column in (0, 3, 4, 6, 7):
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.table_pending.setItem(row, column, item)
+        updated_at = mapping.get("updated_at")
+        updated_text = datetime.fromtimestamp(updated_at).strftime("%Y-%m-%d %H:%M") if updated_at else "—"
+        item_updated = QTableWidgetItem(updated_text)
+        item_updated.setFlags(item_updated.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        self.table_pending.setItem(row, 8, item_updated)
+
     def _on_approve_clicked(self, row: int):
         self._process_upsert(self.table_pending, row, is_approve_action=True)
 
@@ -186,7 +218,12 @@ class ApprovalDialog(QDialog):
         comment = table.item(row, 0).text().strip()
         mpn = table.item(row, 1).text().strip()
         lcsc = table.item(row, 2).text().strip()
-        digikey = table.item(row, 3).text().strip()
+        digikey_column = 5 if table is self.table_pending else 3
+        digikey = table.item(row, digikey_column).text().strip()
+        if is_approve_action:
+            # Empty approved cells mean "accept the latest automatic suggestion".
+            lcsc = lcsc or table.item(row, 4).text().strip()
+            digikey = digikey or table.item(row, 7).text().strip()
         
         if not mpn and not lcsc and not digikey:
             QMessageBox.warning(self, "Validation Error", "Please provide at least one part number (MPN, LCSC, or DigiKey).")

@@ -34,6 +34,11 @@ LCSC_GLOBAL_SEARCH_URL = "https://wmsc.lcsc.com/ftps/wm/search/v3/global"
 REQUEST_TIMEOUT = 15
 
 
+def select_result_unit_price(price_breaks_raw: str, required_stock: int) -> Optional[float]:
+    """Return the displayed single-unit (1+) price, independent of BOM quantity."""
+    return select_unit_price(price_breaks_raw, 1)
+
+
 class JlcpcbSearchResult:
     """Holds the result of a hybrid JLCPCB search."""
     def __init__(self):
@@ -333,8 +338,8 @@ class JlcpcbSearcher:
             price_ranges = exact_comp.get("priceRanges", []) or exact_comp.get("priceList", [])
             result.price_breaks_raw = json.dumps(price_ranges) if price_ranges else ""
             
-            if result.price_breaks_raw and required_stock > 0:
-                result.unit_price = select_unit_price(result.price_breaks_raw, required_stock)
+            if result.price_breaks_raw:
+                result.unit_price = select_result_unit_price(result.price_breaks_raw, required_stock)
 
             if self.db_manager and result.lcsc_code:
                 self.db_manager.upsert_api_cache(
@@ -355,6 +360,69 @@ class JlcpcbSearcher:
     def search_lcsc(self, lcsc_code: str, mpn: str, required_stock: int = 0, refresh: bool = False) -> JlcpcbSearchResult:
         """Search component directly by LCSC code using API cache or JOP OpenAPI."""
         result = JlcpcbSearchResult()
+
+        def fallback_to_lcsc_global_search() -> JlcpcbSearchResult:
+            """Get stock and price when JOP does not expose an extended part."""
+            fallback = JlcpcbSearchResult()
+            try:
+                response = self.session.post(
+                    LCSC_GLOBAL_SEARCH_URL,
+                    json={"keyword": mpn},
+                    timeout=12,
+                    headers={
+                        "User-Agent": "BOM-Enrichment-Tool/2.0",
+                        "Accept": "application/json",
+                        "Origin": "https://www.lcsc.com",
+                        "Referer": "https://www.lcsc.com/",
+                    },
+                )
+                if response.status_code != 200:
+                    return fallback
+                payload = response.json()
+                data = payload.get("result") if isinstance(payload, dict) else None
+                products = data.get("exactMatchResult") or [] if isinstance(data, dict) else []
+                target_code = lcsc_code.upper()
+                product = next(
+                    (
+                        candidate for candidate in products
+                        if is_exact_mpn_match(mpn, candidate.get("productModel", ""))
+                        and str(candidate.get("productCode", "")).upper() == target_code
+                    ),
+                    None,
+                )
+                if not product:
+                    return fallback
+
+                price_list = product.get("productPriceList") or []
+                price_breaks = []
+                for index, tier in enumerate(price_list):
+                    price = tier.get("usdPrice")
+                    if price is None:
+                        price = tier.get("productPrice")
+                    if price is None:
+                        continue
+                    quantity = int(tier.get("ladder", 1) or 1)
+                    next_quantity = price_list[index + 1].get("ladder") if index + 1 < len(price_list) else None
+                    price_breaks.append({
+                        "qFrom": quantity,
+                        "qTo": int(next_quantity) - 1 if next_quantity else None,
+                        "price": float(price),
+                    })
+
+                fallback.found = True
+                fallback.exact_match = True
+                fallback.matched_mpn = mpn
+                fallback.lcsc_code = lcsc_code
+                fallback.stock = int(product.get("stockNumber", 0) or 0)
+                fallback.package = product.get("encapStandard", "") or ""
+                fallback.category = product.get("catalogName", "") or ""
+                fallback.price_breaks_raw = json.dumps(price_breaks) if price_breaks else ""
+                if fallback.price_breaks_raw:
+                    fallback.unit_price = select_result_unit_price(fallback.price_breaks_raw, required_stock)
+                print(f"DEBUG: Found LCSC fallback data: {lcsc_code} for MPN: {mpn}")
+            except Exception:
+                pass
+            return fallback
         
         if self.db_manager and not refresh:
             cached = self.db_manager.get_api_cache(lcsc_code)
@@ -367,8 +435,8 @@ class JlcpcbSearcher:
                 result.package = cached["package"]
                 result.category = cached["category"]
                 result.price_breaks_raw = cached["price_breaks_raw"]
-                if result.price_breaks_raw and required_stock > 0:
-                    result.unit_price = select_unit_price(result.price_breaks_raw, required_stock)
+                if result.price_breaks_raw:
+                    result.unit_price = select_result_unit_price(result.price_breaks_raw, required_stock)
                 return result
         
         path = "/overseas/openapi/component/getComponentDetailByCode"
@@ -404,6 +472,18 @@ class JlcpcbSearcher:
 
             result.match_count = len(components)
             if not components:
+                fallback_result = fallback_to_lcsc_global_search()
+                if fallback_result.found:
+                    if self.db_manager:
+                        self.db_manager.upsert_api_cache(
+                            lcsc_code=fallback_result.lcsc_code,
+                            stock=fallback_result.stock,
+                            price_breaks_raw=fallback_result.price_breaks_raw,
+                            package=fallback_result.package,
+                            category=fallback_result.category,
+                            timestamp=time.time(),
+                        )
+                    return fallback_result
                 result.found = False
                 return result
 
@@ -419,8 +499,8 @@ class JlcpcbSearcher:
             price_ranges = exact_comp.get("priceRanges", []) or exact_comp.get("priceList", [])
             result.price_breaks_raw = json.dumps(price_ranges) if price_ranges else ""
             
-            if result.price_breaks_raw and required_stock > 0:
-                result.unit_price = select_unit_price(result.price_breaks_raw, required_stock)
+            if result.price_breaks_raw:
+                result.unit_price = select_result_unit_price(result.price_breaks_raw, required_stock)
 
             if self.db_manager:
                 self.db_manager.upsert_api_cache(
@@ -550,9 +630,15 @@ class SearchWorker(QThread):
                         item.mpn = mapping.get("mpn", "")
                         lcsc_code = mapping.get("lcsc_code", "")
                         item.digikey_part_number = mapping.get("digikey_code", "")
-                        result = searcher.search_lcsc(lcsc_code, item.mpn, item.required_stock, refresh=self.force_refresh)
-                        enrich_bom_item(item, result)
-                        item.skip_jlcpcb = True
+                        # An approval may intentionally contain only an MPN or
+                        # DigiKey code. Do not call the LCSC detail API with an
+                        # empty code: it always returns no components and turns
+                        # a valid approved mapping into "JLCPCB not found".
+                        # Leave such entries on the normal MPN resolver path.
+                        if lcsc_code.strip():
+                            result = searcher.search_lcsc(lcsc_code, item.mpn, item.required_stock, refresh=self.force_refresh)
+                            enrich_bom_item(item, result)
+                            item.skip_jlcpcb = True
                     else:
                         is_unapproved = True
                 
@@ -571,7 +657,11 @@ class SearchWorker(QThread):
                     # Pending parçalar için DigiKey araması yapmıyoruz — çok yavaş olur
                     # DigiKey önerisi ancak mevcut DB'de boşsa aranır
                     self.progress.emit(idx + 1, total, mpn_display, "Searching DigiKey for pricing...")
-                    dk_result = dk_searcher.search_item(item)
+                    # For approved mappings the item already has a DigiKey
+                    # catalogue number. ``search_item`` treats that number as
+                    # an MPN and rejects the returned manufacturer's MPN as a
+                    # non-exact match. Search by the real MPN for pricing.
+                    dk_result = dk_searcher.search_mpn(item.mpn) if item.digikey_part_number else dk_searcher.search_item(item)
                     if dk_result:
                         suggested_digikey = dk_result.digikey_part_number or ""
                     enrich_bom_item_digikey(item, dk_result)

@@ -77,8 +77,8 @@ class WorkspaceExcelWriter(BaseExcelWriter):
         
         headers = [
             "Board Name", "Description", "Designator", "Quantity (Per Board / Total)", 
-            "Value", "Manufacturer", "MPN", "Design Item ID", "JLCPCB Part Number", 
-            "Unit Price (JLCPCB / DigiKey)", "Status"
+            "Value", "Manufacturer", "MPN", "Design Item ID", "JLCPCB Part Number", "JLCPCB Stock", "DigiKey Stock",
+            "JLCPCB Unit Price", "DigiKey Unit Price", "Status"
         ]
 
         ws.append(headers)
@@ -104,7 +104,10 @@ class WorkspaceExcelWriter(BaseExcelWriter):
                     enriched.mpn,
                     enriched.comment,
                     enriched.jlcpcb_part_number,
-                    enriched.combined_unit_price,
+                    enriched.available_stock_qty if enriched.available_stock_qty is not None else "-",
+                    enriched.digikey_stock_qty if enriched.digikey_stock_qty is not None else "-",
+                    enriched.unit_price,
+                    enriched.digikey_unit_price,
                     enriched.status
                 ]
                     
@@ -112,7 +115,8 @@ class WorkspaceExcelWriter(BaseExcelWriter):
                 ws.cell(row=ws.max_row, column=1).alignment = self.wrap_alignment
                 ws.cell(row=ws.max_row, column=4).alignment = self.wrap_alignment
                 
-                cell = ws.cell(row=ws.max_row, column=11)
+                self._format_supplier_price_cells(ws, ws.max_row, 12, 13, enriched)
+                cell = ws.cell(row=ws.max_row, column=14)
                 fill = self._get_status_fill(enriched.status, bool(enriched.jlcpcb_part_number))
                 if fill:
                     cell.fill = fill
@@ -128,8 +132,8 @@ class WorkspaceExcelWriter(BaseExcelWriter):
         
         headers = [
             "Board Names", "Description", "Designator", "Quantity (Per Board / Total)", 
-            "Value", "Manufacturer", "MPN", "Design Item ID", "JLCPCB Part Number", 
-            "Unit Price (JLCPCB / DigiKey)", "Status"
+            "Value", "Manufacturer", "MPN", "Design Item ID", "JLCPCB Part Number", "JLCPCB Stock", "DigiKey Stock",
+            "JLCPCB Unit Price", "DigiKey Unit Price", "Status"
         ]
 
         ws.append(headers)
@@ -154,7 +158,10 @@ class WorkspaceExcelWriter(BaseExcelWriter):
                 enriched.mpn,
                 enriched.comment,
                 enriched.jlcpcb_part_number,
-                enriched.combined_unit_price,
+                enriched.available_stock_qty if enriched.available_stock_qty is not None else "-",
+                enriched.digikey_stock_qty if enriched.digikey_stock_qty is not None else "-",
+                enriched.unit_price,
+                enriched.digikey_unit_price,
                 enriched.status
             ]
                 
@@ -162,7 +169,8 @@ class WorkspaceExcelWriter(BaseExcelWriter):
             ws.cell(row=ws.max_row, column=1).alignment = self.wrap_alignment
             ws.cell(row=ws.max_row, column=4).alignment = self.wrap_alignment
             
-            cell = ws.cell(row=ws.max_row, column=11)
+            self._format_supplier_price_cells(ws, ws.max_row, 12, 13, enriched)
+            cell = ws.cell(row=ws.max_row, column=14)
             fill = self._get_status_fill(enriched.status, bool(enriched.jlcpcb_part_number))
             if fill:
                 cell.fill = fill
@@ -228,8 +236,8 @@ class WorkspaceExcelWriter(BaseExcelWriter):
             # Component Table
             headers = [
                 "Board Name", "Description", "Designator", "Quantity (Per Board / Total)", 
-                "Value", "Manufacturer", "MPN", "Design Item ID", "JLCPCB Part Number", 
-                "Unit Price (JLCPCB / DigiKey)", "Status"
+                "Value", "Manufacturer", "MPN", "Design Item ID", "JLCPCB Part Number", "JLCPCB Stock", "DigiKey Stock",
+                "JLCPCB Unit Price", "DigiKey Unit Price", "Status"
             ]
                 
             ws.append(headers)
@@ -257,7 +265,10 @@ class WorkspaceExcelWriter(BaseExcelWriter):
                         enriched.mpn,
                         enriched.comment,
                         enriched.jlcpcb_part_number,
-                        enriched.combined_unit_price,
+                        enriched.available_stock_qty if enriched.available_stock_qty is not None else "-",
+                        enriched.digikey_stock_qty if enriched.digikey_stock_qty is not None else "-",
+                        enriched.unit_price,
+                        enriched.digikey_unit_price,
                         enriched.status
                     ]
                         
@@ -265,7 +276,8 @@ class WorkspaceExcelWriter(BaseExcelWriter):
                     ws.cell(row=ws.max_row, column=1).alignment = self.wrap_alignment
                     ws.cell(row=ws.max_row, column=4).alignment = self.wrap_alignment
                     
-                    cell = ws.cell(row=ws.max_row, column=11)
+                    self._format_supplier_price_cells(ws, ws.max_row, 12, 13, enriched)
+                    cell = ws.cell(row=ws.max_row, column=14)
                     fill = self._get_status_fill(enriched.status, bool(enriched.jlcpcb_part_number))
                     if fill:
                         cell.fill = fill

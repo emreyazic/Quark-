@@ -89,6 +89,23 @@ class BaseExcelWriter:
     def _format_currency(self, cell):
         cell.number_format = '"$"#,##0.0000'
 
+    def _format_supplier_price_cells(self, ws, row: int, jlc_col: int, digikey_col: int, item: BomItem) -> None:
+        """Format separate supplier prices and highlight the cheaper option."""
+        jlc_cell = ws.cell(row=row, column=jlc_col)
+        digikey_cell = ws.cell(row=row, column=digikey_col)
+        for cell in (jlc_cell, digikey_cell):
+            if isinstance(cell.value, (int, float)):
+                self._format_currency(cell)
+        if item.unit_price is not None and item.digikey_unit_price is not None:
+            if item.unit_price < item.digikey_unit_price:
+                jlc_cell.fill, digikey_cell.fill = self.fill_green, self.fill_red
+            elif item.digikey_unit_price < item.unit_price:
+                jlc_cell.fill, digikey_cell.fill = self.fill_red, self.fill_green
+        elif item.unit_price is not None:
+            jlc_cell.fill = self.fill_green
+        elif item.digikey_unit_price is not None:
+            digikey_cell.fill = self.fill_green
+
     def _get_status_fill(self, status_text: str, has_jlcpcb_part: bool = False):
         """Returns the appropriate PatternFill based on status text and JLCPCB part presence."""
         val = str(status_text or "")

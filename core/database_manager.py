@@ -52,6 +52,32 @@ class DatabaseManager:
                     cursor.execute("ALTER TABLE internal_mappings ADD COLUMN digikey_code TEXT NOT NULL DEFAULT ''")
                 if 'updated_at' not in columns:
                     cursor.execute("ALTER TABLE internal_mappings ADD COLUMN updated_at REAL")
+                # Keep the user-approved value separate from automatic lookup history.
+                # Legacy rows are seeded from their current value so the first refresh
+                # after upgrading does not create a false change.
+                mapping_columns = {
+                    'last_found_lcsc': "TEXT NOT NULL DEFAULT ''",
+                    'last_found_digikey': "TEXT NOT NULL DEFAULT ''",
+                    'previous_found_lcsc': "TEXT NOT NULL DEFAULT ''",
+                    'previous_found_digikey': "TEXT NOT NULL DEFAULT ''",
+                    'lcsc_source': "TEXT NOT NULL DEFAULT 'AUTO'",
+                    'digikey_source': "TEXT NOT NULL DEFAULT 'AUTO'",
+                    'lcsc_status': "TEXT NOT NULL DEFAULT 'AUTO_APPROVED'",
+                    'digikey_status': "TEXT NOT NULL DEFAULT 'AUTO_APPROVED'",
+                }
+                history_columns_added = False
+                for column, definition in mapping_columns.items():
+                    if column not in columns:
+                        cursor.execute(f"ALTER TABLE internal_mappings ADD COLUMN {column} {definition}")
+                        history_columns_added = True
+                if history_columns_added:
+                    cursor.execute(
+                        """UPDATE internal_mappings
+                           SET last_found_lcsc = lcsc_code,
+                               last_found_digikey = digikey_code
+                           WHERE last_found_lcsc = '' AND last_found_digikey = ''
+                             AND (lcsc_code != '' OR digikey_code != '')"""
+                    )
                 
                 # Table 2: api_cache
                 cursor.execute('''
@@ -92,7 +118,7 @@ class DatabaseManager:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    "SELECT comment_code, mpn, lcsc_code, digikey_code, approved, updated_at FROM internal_mappings WHERE comment_code = ?",
+                    "SELECT * FROM internal_mappings WHERE comment_code = ?",
                     (comment_code,)
                 )
                 row = cursor.fetchone()
@@ -105,16 +131,32 @@ class DatabaseManager:
         with self._lock:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
+                cursor.execute("SELECT * FROM internal_mappings WHERE comment_code = ?", (comment_code,))
+                existing = cursor.fetchone()
+                lcsc_source = "MANUAL" if existing and lcsc_code != existing["last_found_lcsc"] else "AUTO"
+                digikey_source = "MANUAL" if existing and digikey_code != existing["last_found_digikey"] else "AUTO"
+                lcsc_status = "MANUAL_OVERRIDE" if lcsc_source == "MANUAL" else "AUTO_APPROVED"
+                digikey_status = "MANUAL_OVERRIDE" if digikey_source == "MANUAL" else "AUTO_APPROVED"
                 cursor.execute('''
-                    INSERT INTO internal_mappings (comment_code, mpn, lcsc_code, digikey_code, approved, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT INTO internal_mappings
+                        (comment_code, mpn, lcsc_code, digikey_code, approved, updated_at,
+                         last_found_lcsc, last_found_digikey, lcsc_source, digikey_source,
+                         lcsc_status, digikey_status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(comment_code) DO UPDATE SET
                         mpn = excluded.mpn,
                         lcsc_code = excluded.lcsc_code,
                         digikey_code = excluded.digikey_code,
                         approved = excluded.approved,
+                        lcsc_source = excluded.lcsc_source,
+                        digikey_source = excluded.digikey_source,
+                        lcsc_status = excluded.lcsc_status,
+                        digikey_status = excluded.digikey_status,
+                        previous_found_lcsc = '',
+                        previous_found_digikey = '',
                         updated_at = excluded.updated_at
-                ''', (comment_code, mpn, lcsc_code, digikey_code, 1 if approved else 0, time.time()))
+                ''', (comment_code, mpn, lcsc_code, digikey_code, 1 if approved else 0, time.time(),
+                      lcsc_code, digikey_code, lcsc_source, digikey_source, lcsc_status, digikey_status))
                 conn.commit()
 
     def insert_pending_suggestion(self, comment_code: str, mpn: str = "", lcsc_code: str = "", digikey_code: str = "") -> None:
@@ -136,8 +178,11 @@ class DatabaseManager:
                 if existing is None:
                     # Yeni kayıt — direkt ekle
                     cursor.execute(
-                        "INSERT INTO internal_mappings (comment_code, mpn, lcsc_code, digikey_code, approved, updated_at) VALUES (?, ?, ?, ?, 0, ?)",
-                        (comment_code, mpn, lcsc_code, digikey_code, time.time())
+                        """INSERT INTO internal_mappings
+                           (comment_code, mpn, lcsc_code, digikey_code, approved, updated_at,
+                            last_found_lcsc, last_found_digikey, lcsc_status, digikey_status)
+                           VALUES (?, ?, ?, ?, 0, ?, ?, ?, 'PENDING_REVIEW', 'PENDING_REVIEW')""",
+                        (comment_code, mpn, "", "", time.time(), lcsc_code, digikey_code)
                     )
                 elif existing["approved"] == 0:
                     # Mevcut pending kayıt — sadece boş alanları doldur
@@ -168,38 +213,41 @@ class DatabaseManager:
                 cursor.execute("DELETE FROM internal_mappings")
                 conn.commit()
 
-    def refresh_mapping_codes(self, comment_code: str, lcsc_code: str = "", digikey_code: str = "") -> bool:
-        """Update only newly found, changed supplier codes and return whether a change was saved.
+    def refresh_mapping_codes(self, comment_code: str, lcsc_code: Optional[str] = "", digikey_code: Optional[str] = "") -> bool:
+        """Compare completed automatic lookups with history, never approved values.
 
-        Empty lookup results are deliberately ignored, so an unavailable API can
-        never erase a user's approved or pending mapping.
+        ``None`` means the lookup failed and is ignored; an empty string is a
+        successful lookup that found no supplier code.
         """
         with self._lock:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    "SELECT lcsc_code, digikey_code FROM internal_mappings WHERE comment_code = ?",
+                    "SELECT * FROM internal_mappings WHERE comment_code = ?",
                     (comment_code,),
                 )
                 existing = cursor.fetchone()
                 if existing is None:
                     return False
 
-                changed_lcsc = lcsc_code.strip() if lcsc_code and lcsc_code.strip() != existing["lcsc_code"] else ""
-                changed_digikey = digikey_code.strip() if digikey_code and digikey_code.strip() != existing["digikey_code"] else ""
+                new_lcsc = lcsc_code.strip() if lcsc_code is not None else existing["last_found_lcsc"]
+                new_digikey = digikey_code.strip() if digikey_code is not None else existing["last_found_digikey"]
+                changed_lcsc = lcsc_code is not None and new_lcsc != existing["last_found_lcsc"]
+                changed_digikey = digikey_code is not None and new_digikey != existing["last_found_digikey"]
                 if not changed_lcsc and not changed_digikey:
                     return False
 
                 cursor.execute(
                     """UPDATE internal_mappings
-                       SET lcsc_code = ?, digikey_code = ?, updated_at = ?
+                       SET previous_found_lcsc = CASE WHEN ? THEN last_found_lcsc ELSE previous_found_lcsc END,
+                           previous_found_digikey = CASE WHEN ? THEN last_found_digikey ELSE previous_found_digikey END,
+                           last_found_lcsc = ?, last_found_digikey = ?, approved = 0,
+                           lcsc_status = CASE WHEN ? THEN 'PENDING_REVIEW' ELSE lcsc_status END,
+                           digikey_status = CASE WHEN ? THEN 'PENDING_REVIEW' ELSE digikey_status END,
+                           updated_at = ?
                        WHERE comment_code = ?""",
-                    (
-                        changed_lcsc or existing["lcsc_code"],
-                        changed_digikey or existing["digikey_code"],
-                        time.time(),
-                        comment_code,
-                    ),
+                    (changed_lcsc, changed_digikey, new_lcsc, new_digikey,
+                     changed_lcsc, changed_digikey, time.time(), comment_code),
                 )
                 conn.commit()
                 return True
@@ -209,7 +257,7 @@ class DatabaseManager:
         with self._lock:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("SELECT comment_code, mpn, lcsc_code, digikey_code, approved, updated_at FROM internal_mappings")
+                cursor.execute("SELECT * FROM internal_mappings")
                 return [dict(row) for row in cursor.fetchall()]
 
     # =========================================================

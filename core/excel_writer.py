@@ -36,12 +36,19 @@ class ExcelWriter:
         try:
             self.ws.column_dimensions[get_column_letter(headers.index("Description") + 1)].width = 40
             self.ws.column_dimensions[get_column_letter(headers.index("Designator") + 1)].width = 30
-            self.ws.column_dimensions[get_column_letter(headers.index("Unit Price (JLCPCB / DigiKey)") + 1)].width = 35
+            self.ws.column_dimensions[get_column_letter(headers.index("JLCPCB Stock") + 1)].width = 16
+            self.ws.column_dimensions[get_column_letter(headers.index("DigiKey Stock") + 1)].width = 16
+            self.ws.column_dimensions[get_column_letter(headers.index("JLCPCB Unit Price") + 1)].width = 20
+            self.ws.column_dimensions[get_column_letter(headers.index("DigiKey Unit Price") + 1)].width = 20
         except ValueError:
             pass
 
         jlcpcb_part_col_idx = headers.index("JLCPCB Part Number") + 1
-        unit_price_col_idx = headers.index("Unit Price (JLCPCB / DigiKey)") + 1
+        quantity_col_idx = headers.index("Quantity (Per Board / Total)") + 1
+        jlcpcb_stock_col_idx = headers.index("JLCPCB Stock") + 1
+        digikey_stock_col_idx = headers.index("DigiKey Stock") + 1
+        jlcpcb_price_col_idx = headers.index("JLCPCB Unit Price") + 1
+        digikey_price_col_idx = headers.index("DigiKey Unit Price") + 1
 
         for row_idx, item in enumerate(self.items, 2):
             row_data = item.to_row()
@@ -50,8 +57,11 @@ class ExcelWriter:
                 cell = self.ws.cell(row=row_idx, column=col_idx, value=val)
 
                 # Alignment
-                if col_idx in (headers.index("Quantity") + 1, headers.index("JLCPCB Part Number") + 1, unit_price_col_idx):
+                if col_idx in (quantity_col_idx, jlcpcb_part_col_idx, jlcpcb_stock_col_idx, digikey_stock_col_idx, jlcpcb_price_col_idx, digikey_price_col_idx):
                     cell.alignment = Alignment(horizontal="center")
+
+                if col_idx in (jlcpcb_price_col_idx, digikey_price_col_idx) and isinstance(val, (int, float)):
+                    cell.number_format = '"$"0.00000'
 
                 # Apply specific coloring ONLY to the JLCPCB Part Number cell
                 if col_idx == jlcpcb_part_col_idx:
@@ -62,6 +72,34 @@ class ExcelWriter:
                     else:
                         # Any other problem (missing MPN, RES, mismatch, insufficient stock) is yellow
                         cell.fill = self.fill_yellow
+
+            jlc_price = item.unit_price
+            digikey_price = item.digikey_unit_price
+            if jlc_price is not None and digikey_price is not None:
+                if jlc_price < digikey_price:
+                    self.ws.cell(row=row_idx, column=jlcpcb_price_col_idx).fill = self.fill_green
+                    self.ws.cell(row=row_idx, column=digikey_price_col_idx).fill = self.fill_red
+                elif digikey_price < jlc_price:
+                    self.ws.cell(row=row_idx, column=jlcpcb_price_col_idx).fill = self.fill_red
+                    self.ws.cell(row=row_idx, column=digikey_price_col_idx).fill = self.fill_green
+            elif jlc_price is not None:
+                self.ws.cell(row=row_idx, column=jlcpcb_price_col_idx).fill = self.fill_green
+            elif digikey_price is not None:
+                self.ws.cell(row=row_idx, column=digikey_price_col_idx).fill = self.fill_green
+
+        total_row = len(self.items) + 2
+        self.ws.cell(row=total_row, column=jlcpcb_part_col_idx, value="Total Cost")
+        self.ws.cell(row=total_row, column=jlcpcb_part_col_idx).font = header_font
+        for price_col_idx in (jlcpcb_price_col_idx, digikey_price_col_idx):
+            price_col_letter = get_column_letter(price_col_idx)
+            quantity_col_letter = get_column_letter(quantity_col_idx)
+            total_cell = self.ws.cell(
+                row=total_row,
+                column=price_col_idx,
+                value=f"=SUMPRODUCT({quantity_col_letter}2:{quantity_col_letter}{total_row - 1},{price_col_letter}2:{price_col_letter}{total_row - 1})",
+            )
+            total_cell.font = header_font
+            total_cell.number_format = '"$"0.00000'
 
         # Enable AutoFilter for the header row
         self.ws.auto_filter.ref = self.ws.dimensions

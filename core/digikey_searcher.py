@@ -335,7 +335,7 @@ def enrich_bom_item_digikey(item, search_result: DigiKeySearchResult) -> None:
     # Extract price info if available
     if search_result.found or search_result.exact_match:
         item.digikey_unit_price = search_result.unit_price
+        item.digikey_stock_qty = search_result.stock
         item.digikey_price_breaks = search_result.price_breaks
         if hasattr(item, 'digikey_part_number') and search_result.digikey_part_number:
             item.digikey_part_number = search_result.digikey_part_number
-
