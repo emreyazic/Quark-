@@ -18,7 +18,11 @@ from urllib.parse import quote
 
 import requests
 
-from core.mpn_utils import clean_mpn_value, is_exact_mpn_match, select_digikey_price
+from core.mpn_utils import clean_mpn_value, is_exact_mpn_match, normalize_digikey_price_breaks, select_digikey_price
+
+SOURCE_DIGIKEY_LIVE = "DIGIKEY_LIVE"
+SOURCE_SEARCH_FALLBACK = "SEARCH_FALLBACK"
+SOURCE_CACHE = "CACHE"
 
 
 class DigiKeySearchResult:
@@ -38,6 +42,8 @@ class DigiKeySearchResult:
         self.candidates: list[dict] = []
         self.price_breaks: list[tuple[int, float]] = []
         self.configured: bool = False  # True if DigiKey credentials are available
+        self.data_source: str = ""
+        self.warnings: list[str] = []
 
 
 class DigiKeySearcher:
@@ -77,6 +83,8 @@ class DigiKeySearcher:
         self._configured = len(self._credentials) > 0
         self._access_token: Optional[str] = None
         self._token_expires_at: float = 0
+        self._token_error: Optional[str] = None
+        self._last_live_warning: Optional[str] = None
 
         self.session = requests.Session()
         self.session.headers.update({
@@ -98,50 +106,136 @@ class DigiKeySearcher:
         if self._access_token and time.time() < self._token_expires_at:
             return self._access_token
 
-        client_id, client_secret = self._credentials[self._active_cred_index]
+        failures = []
+        while self._active_cred_index < len(self._credentials):
+            client_id, client_secret = self._credentials[self._active_cred_index]
+            try:
+                resp = self.session.post(
+                    "https://api.digikey.com/v1/oauth2/token",
+                    data={
+                        "client_id": client_id,
+                        "client_secret": client_secret,
+                        "grant_type": "client_credentials",
+                    },
+                    timeout=10,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                token = data.get("access_token") if isinstance(data, dict) else None
+                if not token:
+                    self._token_error = "DigiKey token response did not contain an access token"
+                    return None
+                self._access_token = token
+                expires_in = data.get("expires_in", 1800)
+                self._token_expires_at = time.time() + expires_in - 60
+                self._token_error = None
+                return token
+            except requests.exceptions.HTTPError as exc:
+                status = exc.response.status_code if exc.response is not None else None
+                if status not in (401, 429) and not (status is not None and status >= 500):
+                    self._token_error = f"DigiKey token request failed with HTTP {status or 'error'}"
+                    return None
+                failures.append(f"HTTP {status}")
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+                failures.append(type(exc).__name__)
+            except (ValueError, TypeError, KeyError) as exc:
+                self._token_error = f"Invalid DigiKey token response: {type(exc).__name__}"
+                return None
+            except requests.exceptions.RequestException as exc:
+                self._token_error = f"DigiKey token request failed: {type(exc).__name__}"
+                return None
 
-        try:
-            resp = self.session.post(
-                "https://api.digikey.com/v1/oauth2/token",
-                data={
-                    "client_id": client_id,
-                    "client_secret": client_secret,
-                    "grant_type": "client_credentials",
-                },
-                timeout=10,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            self._access_token = data.get("access_token")
-            # Token typically lasts ~1800 seconds; refresh 60s before expiry
-            expires_in = data.get("expires_in", 1800)
-            self._token_expires_at = time.time() + expires_in - 60
-            return self._access_token
-        except Exception as e:
             self._access_token = None
-            return None
+            self._active_cred_index += 1
+
+        detail = ", ".join(failures) if failures else "no usable credential"
+        self._token_error = (
+            "DigiKey token request failed for all configured credentials "
+            f"({detail})"
+        )
+        return None
 
     @staticmethod
-    def _select_variation(variations: list[dict]) -> Optional[dict]:
-        """Prefer a purchasable cut-tape/MOQ-1 variation."""
-        for variation in variations:
+    def _select_variation(
+        variations: list[dict],
+        target_quantity: int = 1,
+        preferred_package_type: str = "Cut Tape",
+    ) -> Optional[dict]:
+        """Select a variation deterministically for the requested quantity."""
+        def as_int(value, default=0):
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return default
+
+        def rank(variation: dict):
             package = variation.get("PackageType", {})
             package_name = package.get("Name", "") if isinstance(package, dict) else str(package)
-            if "cut tape" in package_name.lower():
-                return variation
-        for variation in variations:
+            stock_value = variation.get("QuantityAvailableforPackageType")
+            if stock_value is None:
+                stock_value = variation.get("QuantityAvailable")
+            stock = as_int(stock_value)
+            moq = as_int(variation.get("MinimumOrderQuantity"), default=2**31 - 1)
+            price_breaks = []
+            for price in variation.get("StandardPricing", []):
+                try:
+                    price_breaks.append(
+                        (int(price.get("BreakQuantity", 0)), float(price.get("UnitPrice", 0.0)))
+                    )
+                except (TypeError, ValueError):
+                    continue
+            relevant_price = select_digikey_price(
+                price_breaks, target_quantity, use_quantity_breaks=True
+            )
+            return (
+                0 if preferred_package_type.casefold() in package_name.casefold() else 1,
+                0 if stock >= target_quantity else 1,
+                0 if moq <= target_quantity else 1,
+                moq,
+                float("inf") if relevant_price is None else relevant_price,
+                str(variation.get("DigiKeyProductNumber", "")).casefold(),
+            )
+
+        return min(variations, key=rank) if variations else None
+
+    @classmethod
+    def _select_exact_product(cls, products: list[dict], target_quantity: int = 1) -> Optional[dict]:
+        """Choose deterministically among duplicate representations of one exact MPN."""
+        if not products:
+            return None
+
+        def rank(product: dict):
+            variation = cls._select_variation(
+                product.get("ProductVariations", []), target_quantity
+            )
+            variation_stock = (
+                variation.get("QuantityAvailableforPackageType")
+                if variation else None
+            )
+            if variation_stock is None and variation:
+                variation_stock = variation.get("QuantityAvailable")
             try:
-                moq = int(variation.get("MinimumOrderQuantity", 0) or 0)
+                stock = int(
+                    variation_stock
+                    if variation_stock is not None
+                    else product.get("QuantityAvailable", 0) or 0
+                )
             except (TypeError, ValueError):
-                continue
-            if moq == 1:
-                return variation
-        return variations[0] if variations else None
+                stock = 0
+            product_number = (
+                variation.get("DigiKeyProductNumber", "") if variation else ""
+            )
+            # Prefer a purchasable selected variation, then higher availability;
+            # the catalogue number makes equal-stock selection stable.
+            return (0 if variation else 1, -stock, product_number.casefold())
+
+        return min(products, key=rank)
 
     def _load_live_product(self, product_number: str, client_id: str, token: str) -> Optional[dict]:
         """Load real-time availability/pricing for the selected DigiKey code."""
         if not product_number:
             return None
+        self._last_live_warning = None
         try:
             response = self.session.get(
                 f"https://api.digikey.com/products/v4/search/{quote(product_number, safe='')}/productdetails",
@@ -160,10 +254,16 @@ class DigiKeySearcher:
             if not products and isinstance(data, dict):
                 product = data.get("Product")
                 products = [product] if isinstance(product, dict) else []
-            return products[0] if products else None
-        except Exception:
+            if products:
+                return products[0]
+            self._last_live_warning = "DigiKey live detail returned no product; keyword-search data used."
+            return None
+        except Exception as exc:
             # Keyword data is still a usable fallback if the live endpoint is
             # temporarily unavailable or rate limited.
+            self._last_live_warning = (
+                f"DigiKey live detail failed ({type(exc).__name__}); keyword-search data used."
+            )
             return None
 
     def search_item(self, item, include_live_data: bool = True) -> DigiKeySearchResult:
@@ -214,7 +314,7 @@ class DigiKeySearcher:
             client_id, _ = self._credentials[self._active_cred_index]
             token = self._get_access_token()
             if not token:
-                result.error = "Failed to obtain DigiKey API access token"
+                result.error = self._token_error or "Failed to obtain DigiKey API access token"
                 return result
 
             try:
@@ -245,70 +345,99 @@ class DigiKeySearcher:
                     result.found = False
                     return result
 
-                # Search for exact MPN match
-                for prod in products:
-                    candidate_mpn = prod.get("ManufacturerProductNumber", "")
-                    if is_exact_mpn_match(mpn_clean, candidate_mpn):
-                        result.found = True
-                        result.exact_match = True
-                        result.matched_mpn = candidate_mpn
-                        
-                        mfr_obj = prod.get("Manufacturer", {})
-                        result.manufacturer = mfr_obj.get("Name", "") if isinstance(mfr_obj, dict) else str(mfr_obj)
-                        
-                        variations = prod.get("ProductVariations", [])
-                        best_var = self._select_variation(variations)
-                        result.digikey_part_number = best_var.get("DigiKeyProductNumber", "") if best_var else ""
+                # Only exact MPN matches are eligible. Multiple API rows with
+                # that same exact MPN are duplicate representations of one
+                # product, not an ambiguity or fuzzy-match opportunity.
+                exact_products = [
+                    product
+                    for product in products
+                    if is_exact_mpn_match(
+                        mpn_clean, product.get("ManufacturerProductNumber", "")
+                    )
+                ]
+                prod = self._select_exact_product(exact_products, target_quantity)
+                if prod:
+                    result.found = True
+                    result.exact_match = True
+                    result.matched_mpn = prod.get("ManufacturerProductNumber", "")
 
-                        if include_live_data and result.digikey_part_number:
-                            live_product = self._load_live_product(result.digikey_part_number, client_id, token)
-                            if live_product:
-                                prod = live_product
-                                variations = prod.get("ProductVariations", [])
-                                matching_variation = next(
-                                    (
-                                        variation for variation in variations
-                                        if variation.get("DigiKeyProductNumber", "") == result.digikey_part_number
-                                    ),
-                                    None,
-                                )
-                                best_var = matching_variation or self._select_variation(variations)
-                                if best_var:
-                                    result.digikey_part_number = best_var.get("DigiKeyProductNumber", "") or result.digikey_part_number
+                    mfr_obj = prod.get("Manufacturer", {})
+                    result.manufacturer = mfr_obj.get("Name", "") if isinstance(mfr_obj, dict) else str(mfr_obj)
 
-                        variation_stock = best_var.get("QuantityAvailableforPackageType") if best_var else None
-                        if variation_stock is None and best_var:
-                            variation_stock = best_var.get("QuantityAvailable")
-                        result.stock = int(
-                            variation_stock
-                            if variation_stock is not None
-                            else prod.get("QuantityAvailable", 0) or 0
+                    variations = prod.get("ProductVariations", [])
+                    best_var = self._select_variation(variations, target_quantity)
+                    result.digikey_part_number = best_var.get("DigiKeyProductNumber", "") if best_var else ""
+                    result.data_source = SOURCE_SEARCH_FALLBACK
+
+                    if include_live_data and result.digikey_part_number:
+                        live_product = self._load_live_product(result.digikey_part_number, client_id, token)
+                        if live_product:
+                            result.data_source = SOURCE_DIGIKEY_LIVE
+                            prod = live_product
+                            variations = prod.get("ProductVariations", [])
+                            best_var = self._select_variation(
+                                variations, target_quantity
+                            )
+                            if best_var:
+                                result.digikey_part_number = best_var.get("DigiKeyProductNumber", "") or result.digikey_part_number
+                        else:
+                            result.warnings.append(
+                                self._last_live_warning
+                                or "DigiKey live detail unavailable; keyword-search data used."
+                            )
+                    if (
+                        include_live_data
+                        and result.digikey_part_number
+                        and result.data_source == SOURCE_SEARCH_FALLBACK
+                        and not result.warnings
+                    ):
+                        result.warnings.append(
+                            "DigiKey live detail unavailable; keyword-search data used."
                         )
-                        
-                        desc_obj = prod.get("Description", {})
-                        result.description = desc_obj.get("ProductDescription", "")
-                        
-                        std_pricing = best_var.get("StandardPricing", []) if best_var else []
-                        
-                        pbs = []
-                        for pb in std_pricing:
-                            try:
-                                bq = int(pb.get("BreakQuantity", 0))
-                                up = float(pb.get("UnitPrice", 0.0))
-                                pbs.append((bq, up))
-                            except (ValueError, TypeError):
-                                pass
-                        result.price_breaks = sorted(pbs, key=lambda x: x[0])
 
-                        result.unit_price = select_digikey_price(result.price_breaks, target_quantity)
-                        break
+                    variation_stock = best_var.get("QuantityAvailableforPackageType") if best_var else None
+                    if variation_stock is None and best_var:
+                        variation_stock = best_var.get("QuantityAvailable")
+                    result.stock = int(
+                        variation_stock
+                        if variation_stock is not None
+                        else prod.get("QuantityAvailable", 0) or 0
+                    )
+
+                    desc_obj = prod.get("Description", {})
+                    result.description = desc_obj.get("ProductDescription", "")
+
+                    std_pricing = best_var.get("StandardPricing", []) if best_var else []
+
+                    pbs = []
+                    for pb in std_pricing:
+                        try:
+                            bq = int(pb.get("BreakQuantity", 0))
+                            up = float(pb.get("UnitPrice", 0.0))
+                            pbs.append((bq, up))
+                        except (ValueError, TypeError):
+                            pass
+                    result.price_breaks, price_warnings = normalize_digikey_price_breaks(pbs)
+                    result.warnings.extend(price_warnings)
+
+                    if (
+                        include_live_data
+                        and result.data_source == SOURCE_SEARCH_FALLBACK
+                        and not any("keyword-search data used" in warning for warning in result.warnings)
+                    ):
+                        result.warnings.append(
+                            self._last_live_warning
+                            or "DigiKey live detail unavailable; keyword-search data used."
+                        )
+
+                    result.unit_price = select_digikey_price(result.price_breaks, target_quantity)
 
                 # Store candidates
                 for prod in products[:5]:
                     mfr_obj = prod.get("Manufacturer", {})
                     variations = prod.get("ProductVariations", [])
                     
-                    best_cand_var = self._select_variation(variations)
+                    best_cand_var = self._select_variation(variations, target_quantity)
                     
                     result.candidates.append({
                         "mpn": prod.get("ManufacturerProductNumber", ""),
@@ -365,29 +494,50 @@ class DigiKeySearcher:
         self.session.close()
 
 
+def clear_digikey_live_data(item) -> None:
+    """Clear only refreshable DigiKey observations, preserving approved codes."""
+    item.digikey_stock_qty = None
+    item.digikey_unit_price = None
+    item.digikey_price_breaks = []
+    item.digikey_total_price = None
+
+
 def enrich_bom_item_digikey(item, search_result: DigiKeySearchResult) -> None:
     """Enrich the BOM item with DigiKey pricing data."""
+    clear_digikey_live_data(item)
+    item.digikey_source = search_result.data_source or "DigiKey"
+    item.digikey_error = ""
     if search_result.error:
         item.digikey_part_number = ""
-        if "429" in search_result.error:
-            if item.status:
-                item.status += " (DigiKey Rate Limited)"
-            else:
-                item.status = "DigiKey Rate Limited"
+        item.digikey_status = "error"
+        item.digikey_error = search_result.error
+        existing_notes = str(getattr(item, "notes", "") or "")
+        item.notes = f"{existing_notes}; {search_result.error}".strip("; ")
+        item.refresh_status()
         return
 
     if not search_result.configured:
         item.digikey_part_number = ""
+        item.digikey_status = "not_searched"
+        item.refresh_status()
         return
 
     if not search_result.found and not search_result.exact_match:
         item.digikey_part_number = ""
+        item.digikey_status = "not_found"
+        item.refresh_status()
         return
 
     # Extract price info if available
     if search_result.found or search_result.exact_match:
+        item.digikey_status = "found"
         item.digikey_unit_price = search_result.unit_price
         item.digikey_stock_qty = search_result.stock
         item.digikey_price_breaks = search_result.price_breaks
         if hasattr(item, 'digikey_part_number') and search_result.digikey_part_number:
             item.digikey_part_number = search_result.digikey_part_number
+        if search_result.warnings:
+            warning_text = "; ".join(search_result.warnings)
+            existing_notes = str(getattr(item, "notes", "") or "")
+            item.notes = f"{existing_notes}; {warning_text}".strip("; ")
+        item.refresh_status()

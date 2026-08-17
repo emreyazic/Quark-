@@ -1,10 +1,12 @@
 from dataclasses import dataclass, field
-from typing import Union
+from typing import Optional, Union
 
 import copy
 from models.bom_item import BomItem
 from models.project import Project
 from models.workspace import Workspace
+from core.mpn_utils import normalize_mpn
+from core.mpn_utils import parse_positive_integer_quantity
 
 
 @dataclass
@@ -44,13 +46,15 @@ def build_component_key(item: BomItem) -> str:
             return ""
         return str(val).strip().upper()
 
-    mfg = norm(item.manufacturer)
-    mpn = norm(item.mpn)
+    mpn = normalize_mpn(item.mpn).upper()
     jlc = norm(item.jlcpcb_part_number)
     
-    # 1. Manufacturer + MPN
+    # 1. MPN is the product identity. Manufacturer text is deliberately not
+    # part of this key: the same exact MPN cannot represent a second product
+    # merely because one BOM says "KEMET", another says "Kemet Electronics",
+    # or leaves the manufacturer blank.
     if mpn:
-        return f"MPN:{mfg}_{mpn}" if mfg else f"MPN:{mpn}"
+        return f"MPN:{mpn}"
         
     # 2. JLCPCB / LCSC Part Number
     if jlc:
@@ -76,7 +80,7 @@ def build_component_key(item: BomItem) -> str:
         return f"DESC:{desc}"
         
     # Absolute fallback to prevent grouping completely empty rows
-    if hasattr(item, '_generated_component_key'):
+    if item._generated_component_key:
         return item._generated_component_key
         
     import uuid
@@ -103,14 +107,7 @@ def aggregate_project(project: Project) -> ProjectAggregationResult:
         for item in board.bom_items:
             # Parse line quantity
             try:
-                if item.quantity is None or str(item.quantity).strip() in ("", "TBD", "N/A", "ABC"):
-                    raise ValueError(f"Empty or non-numeric quantity: '{item.quantity}'")
-                    
-                qty_val = float(item.quantity)
-                if qty_val < 0:
-                    raise ValueError(f"Negative quantity: '{item.quantity}'")
-                if qty_val.is_integer():
-                    qty_val = int(qty_val)
+                qty_val = parse_positive_integer_quantity(item.quantity)
                     
             except (ValueError, TypeError) as e:
                 result.skipped_count += 1
@@ -147,7 +144,7 @@ def aggregate_project(project: Project) -> ProjectAggregationResult:
     return result
 
 
-def calculate_build_quantities(component: AggregatedComponent, multipliers: list[int] = None) -> dict[int, Union[int, float]]:
+def calculate_build_quantities(component: AggregatedComponent, multipliers: Optional[list[int]] = None) -> dict[int, Union[int, float]]:
     """Calculates project-level quantities for multiple build batches."""
     if multipliers is None:
         multipliers = [1, 5, 10, 50, 100]
@@ -175,6 +172,9 @@ class WorkspaceAggregatedComponent:
     source_projects: list[str] = field(default_factory=list)
     source_locations: list[str] = field(default_factory=list)
     source_board_names: list[str] = field(default_factory=list)
+    _temp_projects: set[str] = field(default_factory=set, repr=False)
+    _temp_locations: set[str] = field(default_factory=set, repr=False)
+    _temp_board_names: set[str] = field(default_factory=set, repr=False)
 
 
 @dataclass
@@ -218,14 +218,7 @@ def aggregate_workspace(workspace: Workspace) -> WorkspaceAggregationResult:
             
             for item in board.bom_items:
                 try:
-                    if item.quantity is None or str(item.quantity).strip() in ("", "TBD", "N/A", "ABC"):
-                        raise ValueError(f"Empty or non-numeric quantity: '{item.quantity}'")
-                        
-                    qty_val = float(item.quantity)
-                    if qty_val < 0:
-                        raise ValueError(f"Negative quantity: '{item.quantity}'")
-                    if qty_val.is_integer():
-                        qty_val = int(qty_val)
+                    qty_val = parse_positive_integer_quantity(item.quantity)
                         
                 except (ValueError, TypeError) as e:
                     result.skipped_count += 1
@@ -260,11 +253,6 @@ def aggregate_workspace(workspace: Workspace) -> WorkspaceAggregationResult:
                 comp.total_quantity += line_total
                 comp.usages.append(usage)
                 
-                if not hasattr(comp, '_temp_projects'):
-                    comp._temp_projects = set()
-                    comp._temp_locations = set()
-                    comp._temp_board_names = set()
-                    
                 comp._temp_projects.add(project.project_name)
                 source_location = f"{project.project_name}::{board.file_path}::{usage_board_name}"
                 comp._temp_locations.add(source_location)
@@ -277,10 +265,6 @@ def aggregate_workspace(workspace: Workspace) -> WorkspaceAggregationResult:
         comp.source_projects = sorted(list(comp._temp_projects))
         comp.source_locations = sorted(list(comp._temp_locations))
         comp.source_board_names = sorted(list(comp._temp_board_names))
-        
-        del comp._temp_projects
-        del comp._temp_locations
-        del comp._temp_board_names
         
         result.components.append(comp)
         

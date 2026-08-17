@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 from typing import List, Optional
+from core.mpn_utils import parse_positive_integer_quantity
 from models.bom_item import BomItem
 
 
@@ -17,8 +18,7 @@ class ProjectItem:
             raise ValueError("file_path cannot be empty.")
         if not self.board_name.strip():
             raise ValueError("board_name cannot be empty.")
-        if self.board_quantity < 1:
-            raise ValueError("board_quantity must be at least 1.")
+        self.board_quantity = parse_positive_integer_quantity(self.board_quantity)
 
 
 @dataclass

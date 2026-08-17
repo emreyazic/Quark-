@@ -153,8 +153,8 @@ class ApprovalDialog(QDialog):
     def _load_data(self):
         mappings = self.db_manager.get_all_internal_mappings()
         
-        pending = [m for m in mappings if m.get("approved") == 0]
-        approved = [m for m in mappings if m.get("approved") == 1]
+        pending = [m for m in mappings if m.get("lcsc_pending_change") or m.get("digikey_pending_change")]
+        approved = [m for m in mappings if m.get("lcsc_approved") or m.get("digikey_approved")]
         
         self._populate_pending_table(pending)
         self._populate_approved_table(approved)
@@ -174,6 +174,11 @@ class ApprovalDialog(QDialog):
             h_layout = QHBoxLayout(container)
             h_layout.setContentsMargins(4, 2, 4, 2)
             h_layout.addWidget(btn_approve)
+            btn_reject = QPushButton("Reject")
+            btn_reject.setObjectName("actionDeleteBtn")
+            btn_reject.setFixedHeight(34)
+            btn_reject.clicked.connect(lambda checked, r=row: self._on_reject_clicked(r))
+            h_layout.addWidget(btn_reject)
             self.table_pending.setCellWidget(row, 9, container)
 
     def _populate_approved_table(self, approved_list):
@@ -233,6 +238,7 @@ class ApprovalDialog(QDialog):
             if column in (0, 3, 4, 6, 7):
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self.table_pending.setItem(row, column, item)
+        self.table_pending.item(row, 0).setData(Qt.ItemDataRole.UserRole, mapping)
         updated_at = mapping.get("updated_at")
         updated_text = datetime.fromtimestamp(updated_at).strftime("%Y-%m-%d %H:%M") if updated_at else "—"
         item_updated = QTableWidgetItem(updated_text)
@@ -241,6 +247,14 @@ class ApprovalDialog(QDialog):
 
     def _on_approve_clicked(self, row: int):
         self._process_upsert(self.table_pending, row, is_approve_action=True)
+
+    def _on_reject_clicked(self, row: int):
+        comment = self.table_pending.item(row, 0).text().strip()
+        try:
+            self.db_manager.reject_pending_changes(comment)
+            self._load_data()
+        except Exception as e:
+            QMessageBox.critical(self, "Database Error", str(e))
 
     def _on_update_clicked(self, row: int):
         self._process_upsert(self.table_approved, row, is_approve_action=False)
@@ -252,9 +266,13 @@ class ApprovalDialog(QDialog):
         digikey_column = 5 if table is self.table_pending else 3
         digikey = table.item(row, digikey_column).text().strip()
         if is_approve_action:
-            # Empty approved cells mean "accept the latest automatic suggestion".
-            lcsc = lcsc or table.item(row, 4).text().strip()
-            digikey = digikey or table.item(row, 7).text().strip()
+            mapping = table.item(row, 0).data(Qt.ItemDataRole.UserRole) or {}
+            # Clicking Approve accepts each pending supplier's latest candidate.
+            # A deliberate edit of the approved-value cell remains a manual override.
+            if mapping.get("lcsc_pending_change") and lcsc == (mapping.get("lcsc_code", "") or "").strip():
+                lcsc = table.item(row, 4).text().strip()
+            if mapping.get("digikey_pending_change") and digikey == (mapping.get("digikey_code", "") or "").strip():
+                digikey = table.item(row, 7).text().strip()
         
         if not mpn and not lcsc and not digikey:
             QMessageBox.warning(self, "Validation Error", "Please provide at least one part number (MPN, LCSC, or DigiKey).")

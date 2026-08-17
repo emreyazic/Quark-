@@ -15,7 +15,12 @@ from typing import Optional
 import openpyxl
 
 from models.bom_item import BomFile, BomItem, ColumnMapping
-from core.mpn_utils import clean_mpn_value, is_mpn_like, is_manufacturer_like
+from core.mpn_utils import (
+    clean_mpn_value,
+    is_mpn_like,
+    is_manufacturer_like,
+    parse_positive_integer_quantity,
+)
 
 
 # Known header patterns for auto-detection.
@@ -96,6 +101,43 @@ class BomParser:
     def __init__(self):
         pass
 
+    @staticmethod
+    def _validate_file_extension(file_path: str) -> None:
+        extension = os.path.splitext(file_path)[1].lower()
+        if extension == ".xls":
+            raise ValueError(
+                "Legacy .xls files are not supported. Save the workbook as "
+                ".xlsx and try again."
+            )
+        if extension not in {".xlsx", ".xlsm"}:
+            raise ValueError(
+                f"Unsupported BOM file type '{extension or '(none)'}'. "
+                "Use an .xlsx or .xlsm workbook."
+            )
+
+    @staticmethod
+    def _read_sheet_preview(ws) -> tuple[list[str], list[list[str]], int]:
+        """Return headers, a five-row preview, and non-empty data-row count."""
+        headers = [
+            str(cell.value).strip() if cell.value is not None else ""
+            for cell in ws[1]
+        ]
+        while headers and headers[-1] == "":
+            headers.pop()
+
+        preview_rows = []
+        row_count = 0
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            row_data = list(row[: len(headers)])
+            if all(v is None or str(v).strip() == "" for v in row_data):
+                continue
+            row_count += 1
+            if len(preview_rows) < 5:
+                preview_rows.append(
+                    [str(v) if v is not None else "" for v in row_data]
+                )
+        return headers, preview_rows, row_count
+
     def load_file(self, file_path: str) -> BomFile:
         """Load an Excel BOM file and return a BomFile with auto-detected mapping.
 
@@ -105,36 +147,45 @@ class BomParser:
         Returns:
             BomFile with headers, preview rows, and auto-detected column mapping.
         """
+        self._validate_file_extension(file_path)
         wb = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
-        ws = wb.active
-        sheet_name = ws.title
+        try:
+            active_sheet = wb.active
+            assert active_sheet is not None
+            inspected_sheets = []
+            for ws in wb.worksheets:
+                if ws.sheet_state != "visible":
+                    continue
+                headers, preview_rows, row_count = self._read_sheet_preview(ws)
+                mapping = self._auto_detect_columns(headers, preview_rows)
+                inspected_sheets.append(
+                    (ws, headers, preview_rows, row_count, mapping)
+                )
 
-        # Read headers from first row
-        headers = []
-        for cell in ws[1]:
-            val = str(cell.value).strip() if cell.value is not None else ""
-            headers.append(val)
+            if not inspected_sheets:
+                raise ValueError("The workbook contains no visible worksheets.")
 
-        # Remove trailing empty headers
-        while headers and headers[-1] == "":
-            headers.pop()
+            # Preserve the active sheet when it is a BOM. If it is a cover or
+            # summary sheet, expose the first valid BOM sheet in the mapper.
+            primary = next(
+                (
+                    sheet
+                    for sheet in inspected_sheets
+                    if sheet[0].title == active_sheet.title
+                    and sheet[4].is_valid()
+                ),
+                None,
+            )
+            if primary is None:
+                primary = next(
+                    (sheet for sheet in inspected_sheets if sheet[4].is_valid()),
+                    inspected_sheets[0],
+                )
 
-        # Read preview rows (first 5 data rows)
-        preview_rows = []
-        row_count = 0
-        for idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True)):
-            row_data = list(row[: len(headers)])
-            # Skip completely empty rows
-            if all(v is None or str(v).strip() == "" for v in row_data):
-                continue
-            row_count += 1
-            if len(preview_rows) < 5:
-                preview_rows.append([str(v) if v is not None else "" for v in row_data])
-
-        wb.close()
-
-        # Auto-detect column mapping
-        mapping = self._auto_detect_columns(headers, preview_rows)
+            ws, headers, preview_rows, row_count, mapping = primary
+            sheet_name = ws.title
+        finally:
+            wb.close()
 
         bom_file = BomFile(
             file_path=file_path,
@@ -271,63 +322,75 @@ class BomParser:
                 f"MPN and Quantity columns are required."
             )
 
-        mapping = bom_file.column_mapping
         items = []
 
+        self._validate_file_extension(bom_file.file_path)
         wb = openpyxl.load_workbook(bom_file.file_path, read_only=True, data_only=True)
-        ws = wb.active
-        
         source_file_name = os.path.basename(bom_file.file_path)
+        try:
+            for ws in wb.worksheets:
+                if ws.sheet_state != "visible":
+                    continue
 
-        for row in ws.iter_rows(min_row=2, values_only=True):
-            row_list = list(row)
+                if ws.title == bom_file.sheet_name:
+                    mapping = bom_file.column_mapping
+                else:
+                    headers, preview_rows, _ = self._read_sheet_preview(ws)
+                    mapping = self._auto_detect_columns(headers, preview_rows)
 
-            # Skip completely empty rows
-            if all(v is None or str(v).strip() == "" for v in row_list):
-                continue
+                # Workbooks often contain cover/summary/helper sheets. Only
+                # worksheets that independently map MPN and Quantity are BOMs.
+                if mapping is None or not mapping.is_valid():
+                    continue
 
-            def get_val(col_idx: Optional[int], default="") -> str:
-                if col_idx is None or col_idx >= len(row_list):
-                    return default
-                val = row_list[col_idx]
-                if val is None:
-                    return default
-                return str(val).strip()
+                for row in ws.iter_rows(min_row=2, values_only=True):
+                    row_list = list(row)
 
-            def get_quantity_val(col_idx: Optional[int], default=""):
-                raw = get_val(col_idx, "")
-                if raw == "":
-                    return default
-                try:
-                    number = float(raw)
-                    return int(number) if number.is_integer() else number
-                except (ValueError, TypeError):
-                    return raw
+                    if all(v is None or str(v).strip() == "" for v in row_list):
+                        continue
 
-            # Clean MPN value to remove Excel artifacts
-            mpn = clean_mpn_value(get_val(mapping.mpn))
-            quantity = get_quantity_val(mapping.quantity)
+                    def get_val(col_idx: Optional[int], default="") -> str:
+                        if col_idx is None or col_idx >= len(row_list):
+                            return default
+                        val = row_list[col_idx]
+                        if val is None:
+                            return default
+                        return str(val).strip()
 
-            # Handle Board Name assignment logic
-            board_val = get_val(mapping.board_identifier)
-            if board_val:
-                board_name = f"Board {board_val}"
-            else:
-                board_name = bom_file.board_name
+                    def get_quantity_val(col_idx: Optional[int], default=""):
+                        raw = get_val(col_idx, "")
+                        if raw == "":
+                            return default
+                        try:
+                            return parse_positive_integer_quantity(raw)
+                        except ValueError:
+                            # Preserve the original value so aggregation can
+                            # skip it with an explicit warning.
+                            return raw
 
-            item = BomItem(
-                source_file_name=source_file_name,
-                board_name=board_name,
-                comment=get_val(mapping.comment),
-                description=get_val(mapping.description),
-                designator=get_val(mapping.designator),
-                footprint=get_val(mapping.footprint),
-                quantity=quantity,
-                value=get_val(mapping.value),
-                manufacturer=get_val(mapping.manufacturer),
-                mpn=mpn,
-            )
-            items.append(item)
+                    mpn = clean_mpn_value(get_val(mapping.mpn))
+                    quantity = get_quantity_val(mapping.quantity)
 
-        wb.close()
+                    board_val = get_val(mapping.board_identifier)
+                    if board_val:
+                        board_name = f"Board {board_val}"
+                    else:
+                        board_name = bom_file.board_name
+
+                    items.append(
+                        BomItem(
+                            source_file_name=source_file_name,
+                            board_name=board_name,
+                            comment=get_val(mapping.comment),
+                            description=get_val(mapping.description),
+                            designator=get_val(mapping.designator),
+                            footprint=get_val(mapping.footprint),
+                            quantity=quantity,
+                            value=get_val(mapping.value),
+                            manufacturer=get_val(mapping.manufacturer),
+                            mpn=mpn,
+                        )
+                    )
+        finally:
+            wb.close()
         return items

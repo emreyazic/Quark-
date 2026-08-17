@@ -1,6 +1,6 @@
 import datetime
 import os
-from typing import List, Dict, Any, Union
+from typing import List, Dict, Any, Optional, Union
 
 from openpyxl.styles import Font
 from openpyxl.utils import get_column_letter
@@ -8,7 +8,8 @@ from openpyxl.utils import get_column_letter
 from models.bom_item import BomItem
 from models.workspace import Workspace
 from services.project_aggregation import WorkspaceAggregationResult, WorkspaceAggregatedComponent
-from core.base_excel_writer import BaseExcelWriter
+from core.base_excel_writer import BaseExcelWriter, add_refresh_changes_sheet
+from core.atomic_io import atomic_save_workbook
 
 
 class WorkspaceExcelWriter(BaseExcelWriter):
@@ -20,7 +21,7 @@ class WorkspaceExcelWriter(BaseExcelWriter):
         aggregation_result: WorkspaceAggregationResult,
         enriched_items: List[BomItem],
         component_keys: List[str],
-        build_multipliers: List[int] = None,
+        build_multipliers: Optional[List[int]] = None,
         pricing_mode: str = "unit",
     ):
         BaseExcelWriter.__init__(self, pricing_mode=pricing_mode)
@@ -78,10 +79,11 @@ class WorkspaceExcelWriter(BaseExcelWriter):
         self._add_board_sheets(used_names)
         self._add_mutual_components_sheet(used_names)
         self._add_supplier_stock_sheet(self.enriched_items)
+        add_refresh_changes_sheet(self.wb, self.enriched_items)
 
         self.wb.active = self.wb.sheetnames.index("All Aggregated")
         
-        self.wb.save(output_path)
+        atomic_save_workbook(self.wb, output_path)
 
     def _add_board_sheets(self, used_names: set[str]):
         """Write each actual Board/Kart value to its own worksheet."""

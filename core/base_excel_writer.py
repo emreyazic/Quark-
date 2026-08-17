@@ -1,11 +1,79 @@
 import re
 import openpyxl
+from datetime import datetime
 from typing import Dict, Any, Optional, Union
 from openpyxl.styles import PatternFill, Font, Alignment
 from openpyxl.utils import get_column_letter
 
 from models.bom_item import BomItem
-from core.mpn_utils import select_unit_price, select_digikey_price
+from core.mpn_utils import (
+    parse_positive_integer_quantity,
+    select_unit_price,
+    select_digikey_price,
+)
+
+
+def add_refresh_changes_sheet(workbook, items: list[BomItem]) -> None:
+    """Add a supplier price/stock delta report for the latest refresh."""
+    sheet_name = "Refresh Changes"
+    if sheet_name in workbook.sheetnames:
+        del workbook[sheet_name]
+    ws = workbook.create_sheet(sheet_name)
+    headers = [
+        "MPN",
+        "Supplier",
+        "Previous Part Number",
+        "Current Part Number",
+        "Previous Stock",
+        "Current Stock",
+        "Stock Change",
+        "Previous Unit Price",
+        "Current Unit Price",
+        "Unit Price Change",
+        "Previous Observation",
+        "Current Observation",
+        "Previous Result",
+        "Current Result",
+    ]
+    ws.append(headers)
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+
+    changes = [change for item in items for change in item.supplier_changes]
+    if not changes:
+        ws.append(["No supplier price or stock changes in the latest refresh."])
+    else:
+        for change in changes:
+            previous_time = change.get("previous_observed_at")
+            current_time = change.get("current_observed_at")
+            ws.append([
+                change.get("mpn", ""),
+                change.get("supplier", ""),
+                change.get("previous_part_number", ""),
+                change.get("current_part_number", ""),
+                change.get("previous_stock"),
+                change.get("current_stock"),
+                change.get("stock_change"),
+                change.get("previous_unit_price"),
+                change.get("current_unit_price"),
+                change.get("unit_price_change"),
+                datetime.fromtimestamp(previous_time).isoformat(sep=" ", timespec="seconds")
+                if previous_time else "",
+                datetime.fromtimestamp(current_time).isoformat(sep=" ", timespec="seconds")
+                if current_time else "",
+                change.get("previous_observation_type", ""),
+                change.get("current_observation_type", ""),
+            ])
+        for row in ws.iter_rows(min_row=2, min_col=8, max_col=10):
+            for cell in row:
+                if isinstance(cell.value, (int, float)):
+                    cell.number_format = '"$"0.000000'
+
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+    for column in ws.columns:
+        width = min(max(len(str(cell.value or "")) for cell in column) + 2, 42)
+        ws.column_dimensions[column[0].column_letter].width = width
 
 class BaseExcelWriter:
     """Base class providing shared logic for Excel writers (Project and Workspace)."""
@@ -14,7 +82,9 @@ class BaseExcelWriter:
         self.pricing_mode = pricing_mode
         self.wb = openpyxl.Workbook()
         if self.wb.sheetnames:
-            self.wb.remove(self.wb.active)
+            active_sheet = self.wb.active
+            assert active_sheet is not None
+            self.wb.remove(active_sheet)
 
         self.header_font = Font(bold=True)
         self.header_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
@@ -109,7 +179,11 @@ class BaseExcelWriter:
 
     def _component_price_values(self, item: BomItem, quantity=None):
         """Return display quantity, supplier unit prices, and optional totals."""
-        pricing_quantity = max(int(quantity if quantity is not None else item.pricing_quantity or 1), 1)
+        raw_quantity = quantity if quantity is not None else item.pricing_quantity
+        try:
+            pricing_quantity = parse_positive_integer_quantity(raw_quantity)
+        except ValueError:
+            return 0, None, None, None, None
         use_breaks = self.pricing_mode == "project"
         j_price = select_unit_price(
             item.jlcpcb_price_breaks_raw,
@@ -277,7 +351,11 @@ class BaseExcelWriter:
                     item.available_stock_qty,
                     j_price,
                     j_total,
-                    item.status,
+                    (
+                        f"API Error: {item.jlcpcb_error}"
+                        if item.jlcpcb_status == "error"
+                        else item.jlcpcb_status.replace("_", " ").title()
+                    ),
                 ),
                 (
                     "DigiKey",
@@ -285,7 +363,11 @@ class BaseExcelWriter:
                     item.digikey_stock_qty,
                     d_price,
                     d_total,
-                    "Found" if item.digikey_part_number else "Not Found",
+                    (
+                        f"API Error: {item.digikey_error}"
+                        if item.digikey_status == "error"
+                        else item.digikey_status.replace("_", " ").title()
+                    ),
                 ),
             ]
             for supplier, part_number, stock, unit_price, total_price, status in supplier_rows:
@@ -335,6 +417,9 @@ class BaseExcelWriter:
         """Determines if JLCPCB data can be used based on component status and flags."""
         if not item.jlcpcb_part_number:
             return False
+
+        if item.jlcpcb_status != "not_searched":
+            return item.jlcpcb_status in ("found", "warning")
             
         status_lower = str(item.status or "").lower()
         if "not found" in status_lower:
@@ -348,19 +433,17 @@ class BaseExcelWriter:
 
     def _get_pricing_for_component_item(self, item: BomItem, multiplied_qty: Union[int, float]) -> Dict[str, Any]:
         """Calculate JLCPCB, DigiKey fallback, and DigiKey-only costs."""
-        j_price = None
-        if self._is_jlcpcb_usable(item):
-            j_price = select_unit_price(
-                item.jlcpcb_price_breaks_raw,
-                multiplied_qty,
-                use_quantity_breaks=self.pricing_mode == "project",
-            )
-            
-        d_price = select_digikey_price(
-            item.digikey_price_breaks,
-            multiplied_qty,
-            use_quantity_breaks=self.pricing_mode == "project",
+        # Use the same resolver as detail sheets. It selects a quantity tier
+        # when available and falls back to the valid scalar supplier price
+        # when a price-break list is absent.
+        pricing_quantity, j_price, d_price, _, _ = self._component_price_values(
+            item, multiplied_qty
         )
+        if pricing_quantity == 0:
+            j_price = None
+            d_price = None
+        elif not self._is_jlcpcb_usable(item):
+            j_price = None
 
         j_cost = None
         rem_dk_cost = None
@@ -370,17 +453,17 @@ class BaseExcelWriter:
         combined_cost = None
 
         if d_price is not None:
-            all_dk_cost = multiplied_qty * d_price
+            all_dk_cost = pricing_quantity * d_price
 
         if j_price is not None:
             selected_source = "JLCPCB"
             selected_price = j_price
-            j_cost = multiplied_qty * j_price
+            j_cost = pricing_quantity * j_price
             combined_cost = j_cost
         elif d_price is not None:
             selected_source = "DigiKey fallback"
             selected_price = d_price
-            rem_dk_cost = multiplied_qty * d_price
+            rem_dk_cost = pricing_quantity * d_price
             combined_cost = rem_dk_cost
 
         return {

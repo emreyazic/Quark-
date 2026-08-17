@@ -1,5 +1,7 @@
 import tempfile
 import json
+import shutil
+import zipfile
 from pathlib import Path
 import pytest
 from models.project import Project, ProjectItem
@@ -13,6 +15,7 @@ from services.project_storage import (
     workspace_from_dict,
     save_workspace,
     load_workspace,
+    export_workspace_package,
 )
 
 def test_project_storage():
@@ -216,3 +219,61 @@ def test_workspace_to_dict_format():
     assert data["projects"][0]["board_items"][0]["file_path"] == "/p1.xlsx"
     assert data["projects"][0]["board_items"][0]["board_name"] == "B1"
     assert data["projects"][0]["board_items"][0]["board_quantity"] == 1
+
+
+def test_saved_workspace_paths_follow_workspace_when_folder_is_moved(tmp_path):
+    package = tmp_path / "package"
+    bom_dir = package / "boms"
+    bom_dir.mkdir(parents=True)
+    bom_path = bom_dir / "main.xlsx"
+    bom_path.write_bytes(b"placeholder")
+
+    workspace = Workspace("Portable")
+    project = Project("Main")
+    project.add_board(ProjectItem(str(bom_path), "Main Board", 1))
+    workspace.add_project(project)
+
+    workspace_path = package / "workspace.json"
+    save_workspace(workspace, workspace_path)
+    stored = json.loads(workspace_path.read_text(encoding="utf-8"))
+    stored_board = stored["projects"][0]["board_items"][0]
+    assert stored_board["file_path"] == str(Path("boms") / "main.xlsx")
+    assert stored_board["file_path_relative"] is True
+
+    moved_package = tmp_path / "moved" / "package"
+    moved_package.parent.mkdir()
+    shutil.move(str(package), str(moved_package))
+
+    loaded = load_workspace(moved_package / "workspace.json")
+    assert loaded.projects[0].board_items[0].file_path == str(
+        (moved_package / "boms" / "main.xlsx").resolve()
+    )
+
+
+def test_portable_workspace_package_contains_loadable_relative_boms(tmp_path):
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    shared_bom = source_dir / "shared.xlsx"
+    shared_bom.write_bytes(b"xlsx-placeholder")
+
+    workspace = Workspace("Portable")
+    for project_name in ("Project A", "Project B"):
+        project = Project(project_name)
+        project.add_board(ProjectItem(str(shared_bom), f"{project_name} Board", 1))
+        workspace.add_project(project)
+
+    package_path = tmp_path / "portable.zip"
+    export_workspace_package(workspace, package_path)
+
+    with zipfile.ZipFile(package_path) as package:
+        names = package.namelist()
+        assert "workspace.json" in names
+        assert "README.txt" in names
+        assert names.count("bom_files/shared.xlsx") == 1
+        extract_dir = tmp_path / "extracted"
+        package.extractall(extract_dir)
+
+    loaded = load_workspace(extract_dir / "workspace.json")
+    expected_path = str((extract_dir / "bom_files" / "shared.xlsx").resolve())
+    assert loaded.projects[0].board_items[0].file_path == expected_path
+    assert loaded.projects[1].board_items[0].file_path == expected_path

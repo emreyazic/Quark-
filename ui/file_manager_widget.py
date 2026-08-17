@@ -3,6 +3,7 @@
 
 import os
 import json
+import copy
 from typing import Optional
 
 from PyQt6.QtCore import Qt, pyqtSignal, QSize, QMimeData
@@ -29,8 +30,15 @@ from models.bom_item import BomFile
 from core.bom_parser import BomParser
 from models.project import Project, ProjectItem
 from models.workspace import Workspace
-from services.project_storage import save_workspace, load_workspace
+from services.project_storage import (
+    export_workspace_package,
+    load_workspace,
+    save_workspace,
+)
 from core.utils import get_resource_path
+
+SUPPORTED_BOM_EXTENSIONS = (".xlsx", ".xlsm")
+
 
 class DropArea(QFrame):
     """Drag-and-drop zone for Excel files."""
@@ -65,7 +73,7 @@ class DropArea(QFrame):
         if event.mimeData().hasUrls():
             urls = event.mimeData().urls()
             for url in urls:
-                if url.toLocalFile().lower().endswith((".xlsx", ".xls")):
+                if url.toLocalFile().lower().endswith(SUPPORTED_BOM_EXTENSIONS):
                     event.acceptProposedAction()
                     self.setStyleSheet(
                         "#dropArea { border-color: #34d399; background-color: #102a28; }"
@@ -81,7 +89,7 @@ class DropArea(QFrame):
         files = []
         for url in event.mimeData().urls():
             path = url.toLocalFile()
-            if path.lower().endswith((".xlsx", ".xls")):
+            if path.lower().endswith(SUPPORTED_BOM_EXTENSIONS):
                 files.append(path)
         if files:
             self.files_dropped.emit(files)
@@ -131,7 +139,10 @@ class WorkspaceTreeWidget(QTreeWidget):
             
         if event.mimeData().hasUrls():
             urls = event.mimeData().urls()
-            valid = any(url.toLocalFile().lower().endswith((".xlsx", ".xls")) for url in urls)
+            valid = any(
+                url.toLocalFile().lower().endswith(SUPPORTED_BOM_EXTENSIONS)
+                for url in urls
+            )
             if valid:
                 event.acceptProposedAction()
                 return
@@ -144,7 +155,10 @@ class WorkspaceTreeWidget(QTreeWidget):
             
         if event.mimeData().hasUrls():
             urls = event.mimeData().urls()
-            valid = any(url.toLocalFile().lower().endswith((".xlsx", ".xls")) for url in urls)
+            valid = any(
+                url.toLocalFile().lower().endswith(SUPPORTED_BOM_EXTENSIONS)
+                for url in urls
+            )
             if valid:
                 event.acceptProposedAction()
                 return
@@ -176,7 +190,7 @@ class WorkspaceTreeWidget(QTreeWidget):
         files = []
         for url in event.mimeData().urls():
             path = url.toLocalFile()
-            if path.lower().endswith((".xlsx", ".xls")):
+            if path.lower().endswith(SUPPORTED_BOM_EXTENSIONS):
                 files.append(path)
                 
         if not files:
@@ -246,15 +260,23 @@ class FileManagerWidget(QWidget):
         ws_btn_layout2 = QHBoxLayout()
         self._btn_load_ws = QPushButton("Load Workspace")
         self._btn_save_ws = QPushButton("Save Workspace")
+        self._btn_export_package = QPushButton("Export Portable Package")
+        self._btn_export_package.setToolTip(
+            "Create a ZIP containing workspace.json and all BOM files"
+        )
         self._btn_clear_ws = QPushButton("Clear Workspace")
         self._btn_clear_ws.setObjectName("btnDanger")
         
         self._btn_load_ws.clicked.connect(self._load_workspace_clicked)
         self._btn_save_ws.clicked.connect(self._save_workspace_clicked)
+        self._btn_export_package.clicked.connect(
+            self._export_workspace_package_clicked
+        )
         self._btn_clear_ws.clicked.connect(self._clear_workspace_clicked)
         
         ws_btn_layout2.addWidget(self._btn_load_ws)
         ws_btn_layout2.addWidget(self._btn_save_ws)
+        ws_btn_layout2.addWidget(self._btn_export_package)
         ws_btn_layout2.addStretch()
         ws_btn_layout2.addWidget(self._btn_clear_ws)
         layout.addLayout(ws_btn_layout2)
@@ -363,6 +385,7 @@ class FileManagerWidget(QWidget):
         has_boards = self.has_files()
         
         self._btn_save_ws.setEnabled(has_projects or has_boards)
+        self._btn_export_package.setEnabled(has_boards)
         self._btn_clear_ws.setEnabled(has_projects or has_boards)
 
     def _get_selected_project_name(self) -> Optional[str]:
@@ -473,7 +496,7 @@ class FileManagerWidget(QWidget):
             self,
             "Select BOM Excel Files",
             "",
-            "Excel Files (*.xlsx *.xls);;All Files (*)",
+            "Excel Files (*.xlsx *.xlsm)",
         )
         if files:
             self._add_files(files)
@@ -542,38 +565,35 @@ class FileManagerWidget(QWidget):
             return
 
         for path in file_paths:
+            if not path.lower().endswith(SUPPORTED_BOM_EXTENSIONS):
+                QMessageBox.warning(
+                    self,
+                    "Unsupported BOM File",
+                    f"'{os.path.basename(path)}' cannot be read. Save legacy "
+                    ".xls files as .xlsx before importing.",
+                )
+                continue
+
             # Check project-specific duplicates
             if target_project.get_board_by_file_path(path):
                 print(f"Skipping {path}: already exists in project '{project_name}'")
                 continue
 
+            board_name = os.path.splitext(os.path.basename(path))[0]
             try:
                 if path in self._parsed_boms:
-                    # Reuse cached parser data
+                    # Reuse only immutable file metadata/mapping. BomItem
+                    # objects always belong to one project/board context.
                     bom_file = self._parsed_boms[path]
-                    
-                    # Try to reuse bom_items from another project
-                    existing_items = []
-                    for p in self._workspace.projects:
-                        b = p.get_board_by_file_path(path)
-                        if b and b.bom_items:
-                            existing_items = b.bom_items
-                            break
-                            
-                    if existing_items:
-                        bom_items = list(existing_items)  # Copy list
-                    else:
-                        bom_items = self._parser.parse_bom_items(bom_file)
                 else:
                     # Load freshly
                     bom_file = self._parser.load_file(path)
-                    bom_items = self._parser.parse_bom_items(bom_file)
                     self._parsed_boms[path] = bom_file
                     self._bom_files.append(bom_file)
+
+                bom_items = self._parse_items_for_board(bom_file, board_name)
                 
                 self._board_status[path] = f"Loaded ({len(bom_items)} items)"
-                
-                board_name = os.path.splitext(os.path.basename(path))[0]
                 board_quantity = 1
                     
                 project_item = ProjectItem(
@@ -586,7 +606,6 @@ class FileManagerWidget(QWidget):
             except Exception as e:
                 print(f"Error loading {path}: {e}")
                 self._board_status[path] = "Parse error"
-                board_name = os.path.splitext(os.path.basename(path))[0]
                 project_item = ProjectItem(
                     file_path=path,
                     board_name=board_name,
@@ -613,6 +632,32 @@ class FileManagerWidget(QWidget):
                 QMessageBox.information(self, "Success", f"Workspace saved to:\n{path}")
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to save workspace:\n{e}")
+
+    def _export_workspace_package_clicked(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Portable Workspace Package",
+            "bom_workspace_package.zip",
+            "ZIP Packages (*.zip)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".zip"):
+            path += ".zip"
+        try:
+            export_workspace_package(self._workspace, path)
+            QMessageBox.information(
+                self,
+                "Portable Package Created",
+                "Workspace and BOM files were packaged successfully:\n"
+                f"{path}\n\nExtract the ZIP before loading workspace.json.",
+            )
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Package Export Error",
+                f"Failed to create portable package:\n{exc}",
+            )
 
     def _load_workspace_clicked(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -642,25 +687,14 @@ class FileManagerWidget(QWidget):
                     try:
                         if board.file_path in self._parsed_boms:
                             bom_file = self._parsed_boms[board.file_path]
-                            
-                            existing_items = []
-                            for p in self._workspace.projects:
-                                b = p.get_board_by_file_path(board.file_path)
-                                if b and b.bom_items:
-                                    existing_items = b.bom_items
-                                    break
-                                    
-                            if existing_items:
-                                board.bom_items = list(existing_items)
-                            else:
-                                board.bom_items = self._parser.parse_bom_items(bom_file)
                         else:
                             bom_file = self._parser.load_file(board.file_path)
-                            bom_file.board_name = board.board_name
                             self._parsed_boms[board.file_path] = bom_file
                             self._bom_files.append(bom_file)
-                            
-                            board.bom_items = self._parser.parse_bom_items(bom_file)
+
+                        board.bom_items = self._parse_items_for_board(
+                            bom_file, board.board_name
+                        )
                             
                         self._board_status[board.file_path] = f"Loaded ({len(board.bom_items)} items)"
                     except Exception as e:
@@ -674,16 +708,27 @@ class FileManagerWidget(QWidget):
         self.files_changed.emit()
 
     def get_bom_files(self) -> list[BomFile]:
-        """Return the current list of loaded BOM files with updated board names."""
-        for project in self._workspace.projects:
-            for board in project.board_items:
-                if board.file_path in self._parsed_boms:
-                    self._parsed_boms[board.file_path].board_name = board.board_name
+        """Return unique cached file metadata without applying board context."""
         return self._bom_files
 
     def get_all_bom_files(self) -> list[BomFile]:
         """Return all currently parsed BOM files."""
         return self.get_bom_files()
+
+    def get_bom_file_for_board(self, file_path: str, board_name: str) -> Optional[BomFile]:
+        """Return an isolated BomFile carrying one board's display context."""
+        bom_file = self._parsed_boms.get(file_path)
+        if bom_file is None:
+            return None
+        contextual_file = copy.deepcopy(bom_file)
+        contextual_file.board_name = board_name
+        return contextual_file
+
+    def _parse_items_for_board(self, bom_file: BomFile, board_name: str):
+        """Parse fresh, independent BomItem objects for a project board."""
+        contextual_file = copy.deepcopy(bom_file)
+        contextual_file.board_name = board_name
+        return self._parser.parse_bom_items(contextual_file)
 
     def get_workspace(self) -> Workspace:
         return self._workspace

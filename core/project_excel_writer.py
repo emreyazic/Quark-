@@ -1,5 +1,5 @@
 import os
-from typing import List, Dict, Any, Union
+from typing import List, Dict, Any, Optional, Union
 from openpyxl.styles import Font
 from openpyxl.utils import get_column_letter
 import datetime
@@ -7,7 +7,8 @@ import datetime
 from models.bom_item import BomItem
 from models.project import Project
 from services.project_aggregation import ProjectAggregationResult, AggregatedComponent
-from core.base_excel_writer import BaseExcelWriter
+from core.base_excel_writer import BaseExcelWriter, add_refresh_changes_sheet
+from core.atomic_io import atomic_save_workbook
 
 
 class ProjectExcelWriter(BaseExcelWriter):
@@ -19,7 +20,7 @@ class ProjectExcelWriter(BaseExcelWriter):
         aggregation_result: ProjectAggregationResult,
         enriched_items: List[BomItem],
         component_keys: List[str],
-        build_multipliers: List[int] = None,
+        build_multipliers: Optional[List[int]] = None,
         include_raw_board_sheets: bool = True,
         pricing_mode: str = "unit",
     ):
@@ -71,8 +72,9 @@ class ProjectExcelWriter(BaseExcelWriter):
         if self.include_raw_board_sheets:
             self._add_raw_board_sheets()
         self._add_supplier_stock_sheet(self.enriched_items)
+        add_refresh_changes_sheet(self.wb, self.enriched_items)
             
-        self.wb.save(output_path)
+        atomic_save_workbook(self.wb, output_path)
 
     def _add_master_summary_sheet(self):
         ws = self.wb.create_sheet("Master Summary")

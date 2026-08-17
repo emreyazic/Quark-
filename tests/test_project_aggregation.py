@@ -12,7 +12,7 @@ from services.project_aggregation import (
 def test_build_component_key():
     # 1. MPN priority
     item1 = BomItem(mpn="12345", manufacturer="Yageo", value="10k", footprint="0603")
-    assert build_component_key(item1) == "MPN:YAGEO_12345"
+    assert build_component_key(item1) == "MPN:12345"
 
     # 2. JLCPCB priority over Value
     item2 = BomItem(jlcpcb_part_number="C123", value="10k", footprint="0603")
@@ -75,6 +75,23 @@ def test_single_board_multiplication():
     assert comp_c.total_quantity == 20
 
 
+@pytest.mark.parametrize(
+    "value",
+    [1.5, float("nan"), float("inf"), True, 0, -1],
+)
+def test_project_item_rejects_invalid_board_quantities(value):
+    with pytest.raises(ValueError):
+        ProjectItem("path", "Board", board_quantity=value)
+
+
+@pytest.mark.parametrize(("value", "expected"), [(5, 5), (5.0, 5), ("5", 5), ("5.0", 5)])
+def test_project_item_uses_shared_positive_integer_quantity_policy(value, expected):
+    board = ProjectItem("path", "Board", board_quantity=value)
+
+    assert board.board_quantity == expected
+    assert isinstance(board.board_quantity, int)
+
+
 def test_multi_board_grouping():
     project = Project("Test Project")
     
@@ -99,6 +116,33 @@ def test_multi_board_grouping():
     assert len(comp.usages) == 2
     assert comp.usages[0].board_quantity == 2
     assert comp.usages[1].board_quantity == 8
+
+
+def test_exact_mpn_groups_across_different_or_missing_manufacturer_names():
+    project = Project("Test Project")
+
+    board_a = ProjectItem("path_a", "Board A", board_quantity=1)
+    board_a.bom_items = [
+        BomItem(mpn="ABC123", manufacturer="KEMET", quantity=1)
+    ]
+    board_b = ProjectItem("path_b", "Board B", board_quantity=1)
+    board_b.bom_items = [
+        BomItem(mpn="abc123", manufacturer="Kemet Electronics", quantity=2)
+    ]
+    board_c = ProjectItem("path_c", "Board C", board_quantity=1)
+    board_c.bom_items = [
+        BomItem(mpn="  ABC123  ", manufacturer="", quantity=3)
+    ]
+    project.add_board(board_a)
+    project.add_board(board_b)
+    project.add_board(board_c)
+
+    result = aggregate_project(project)
+
+    assert len(result.components) == 1
+    assert result.components[0].component_key == "MPN:ABC123"
+    assert result.components[0].total_quantity == 6
+    assert len(result.components[0].usages) == 3
 
 
 def test_value_only_items_do_not_falsely_group():
@@ -127,6 +171,10 @@ def test_invalid_quantities_handled_gracefully():
         BomItem(mpn="R2", quantity=""),       # Invalid
         BomItem(mpn="R3", quantity="abc"),    # Invalid
         BomItem(mpn="R4", quantity=None),     # Invalid
+        BomItem(mpn="R5", quantity=0),        # Invalid
+        BomItem(mpn="R6", quantity=1.5),      # Invalid
+        BomItem(mpn="R7", quantity=float("nan")),  # Invalid
+        BomItem(mpn="R8", quantity=float("inf")),  # Invalid
     ]
     project.add_board(board)
 
@@ -134,8 +182,8 @@ def test_invalid_quantities_handled_gracefully():
     
     assert len(result.components) == 1
     assert result.components[0].component_key == "MPN:R1"
-    assert result.skipped_count == 3
-    assert len(result.warnings) == 3
+    assert result.skipped_count == 7
+    assert len(result.warnings) == 7
 
 
 def test_calculate_build_quantities():
@@ -284,14 +332,18 @@ def test_aggregate_workspace_invalid_quantity():
         BomItem(mpn="R2", quantity=""),
         BomItem(mpn="R3", quantity="abc"),
         BomItem(mpn="R4", quantity=None),
+        BomItem(mpn="R5", quantity=0),
+        BomItem(mpn="R6", quantity=1.5),
+        BomItem(mpn="R7", quantity=float("nan")),
+        BomItem(mpn="R8", quantity=float("inf")),
     ]
     p1.add_board(b1)
     ws.add_project(p1)
     
     result = aggregate_workspace(ws)
     assert len(result.components) == 1
-    assert result.skipped_count == 3
-    assert len(result.warnings) == 3
+    assert result.skipped_count == 7
+    assert len(result.warnings) == 7
 
 
 def test_aggregate_workspace_empty_handling():

@@ -1,9 +1,15 @@
+import copy
 import json
+import os
+import re
+import tempfile
+import zipfile
 from pathlib import Path
 from typing import Any, Dict, Union
 
 from models.project import Project, ProjectItem
 from models.workspace import Workspace
+from core.atomic_io import atomic_write_json
 
 def project_to_dict(project: Project) -> Dict[str, Any]:
     """
@@ -72,8 +78,7 @@ def save_project(project: Project, output_path: str) -> None:
     
     data = project_to_dict(project)
     
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    atomic_write_json(data, path)
 
 def load_project(input_path: str) -> Project:
     """
@@ -87,25 +92,44 @@ def load_project(input_path: str) -> Project:
         
     return project_from_dict(data)
 
-def workspace_to_dict(workspace: Workspace) -> Dict[str, Any]:
+def workspace_to_dict(
+    workspace: Workspace,
+    workspace_dir: Union[str, Path, None] = None,
+) -> Dict[str, Any]:
     """
     Converts a Workspace object into a JSON-serializable dictionary.
     Serializes only the workspace and project layouts, not parsed BOM data.
     """
+    base_dir = Path(workspace_dir).resolve() if workspace_dir is not None else None
+
+    def serialize_board(item: ProjectItem) -> Dict[str, Any]:
+        file_path = item.file_path
+        path_is_relative = False
+        if base_dir is not None:
+            source_path = Path(file_path)
+            if source_path.exists():
+                try:
+                    file_path = os.path.relpath(source_path.resolve(), base_dir)
+                    path_is_relative = True
+                except ValueError:
+                    file_path = str(source_path.resolve())
+
+        result = {
+            "file_path": file_path,
+            "board_name": item.board_name,
+            "board_quantity": item.board_quantity,
+        }
+        if path_is_relative:
+            result["file_path_relative"] = True
+        return result
+
     return {
         "version": 2,
         "workspace_name": workspace.workspace_name,
         "projects": [
             {
                 "project_name": project.project_name,
-                "board_items": [
-                    {
-                        "file_path": item.file_path,
-                        "board_name": item.board_name,
-                        "board_quantity": item.board_quantity,
-                    }
-                    for item in project.board_items
-                ],
+                "board_items": [serialize_board(item) for item in project.board_items],
             }
             for project in workspace.projects
         ],
@@ -179,10 +203,9 @@ def save_workspace(workspace: Workspace, output_path: Union[str, Path]) -> None:
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     
-    data = workspace_to_dict(workspace)
+    data = workspace_to_dict(workspace, path.parent)
     
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    atomic_write_json(data, path)
 
 def load_workspace(input_path: Union[str, Path]) -> Workspace:
     """
@@ -193,5 +216,85 @@ def load_workspace(input_path: Union[str, Path]) -> Workspace:
     
     with path.open("r", encoding="utf-8") as f:
         data = json.load(f)
-        
+
+    data = copy.deepcopy(data)
+    for project_data in data.get("projects", []):
+        for item_data in project_data.get("board_items", []):
+            if item_data.get("file_path_relative"):
+                item_data["file_path"] = str(
+                    (path.parent / item_data["file_path"]).resolve()
+                )
+
     return workspace_from_dict(data)
+
+
+def export_workspace_package(
+    workspace: Workspace, output_path: Union[str, Path]
+) -> None:
+    """Create a portable ZIP containing workspace.json and every source BOM."""
+    destination = Path(output_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    data = workspace_to_dict(workspace)
+    archived_by_source: dict[str, str] = {}
+    used_archive_names: set[str] = set()
+
+    def safe_name(name: str) -> str:
+        cleaned = re.sub(r'[^A-Za-z0-9._ -]+', "_", name).strip(" .")
+        return cleaned or "bom.xlsx"
+
+    source_entries: list[tuple[Path, str]] = []
+    for project, project_data in zip(workspace.projects, data["projects"]):
+        for board, board_data in zip(
+            project.board_items, project_data["board_items"]
+        ):
+            source = Path(board.file_path).resolve()
+            if not source.is_file():
+                raise FileNotFoundError(
+                    f"Cannot package missing BOM file: {board.file_path}"
+                )
+            source_key = os.path.normcase(str(source))
+            archive_name = archived_by_source.get(source_key)
+            if archive_name is None:
+                base_name = safe_name(source.name)
+                candidate = f"bom_files/{base_name}"
+                counter = 2
+                while candidate.lower() in used_archive_names:
+                    stem = Path(base_name).stem
+                    suffix = Path(base_name).suffix
+                    candidate = f"bom_files/{stem}_{counter}{suffix}"
+                    counter += 1
+                archive_name = candidate
+                archived_by_source[source_key] = archive_name
+                used_archive_names.add(candidate.lower())
+                source_entries.append((source, archive_name))
+            board_data["file_path"] = archive_name
+            board_data["file_path_relative"] = True
+
+    fd, temp_path = tempfile.mkstemp(
+        prefix=f".{destination.stem}.",
+        suffix=".zip.tmp",
+        dir=destination.parent,
+    )
+    os.close(fd)
+    try:
+        with zipfile.ZipFile(
+            temp_path, "w", compression=zipfile.ZIP_DEFLATED
+        ) as package:
+            package.writestr(
+                "workspace.json",
+                json.dumps(data, indent=2, ensure_ascii=False),
+            )
+            package.writestr(
+                "README.txt",
+                "Extract the complete package, then load workspace.json "
+                "from BOM Tool. Do not move BOM files outside bom_files.\n",
+            )
+            for source, archive_name in source_entries:
+                package.write(source, archive_name)
+        os.replace(temp_path, destination)
+    except Exception:
+        try:
+            os.unlink(temp_path)
+        except FileNotFoundError:
+            pass
+        raise

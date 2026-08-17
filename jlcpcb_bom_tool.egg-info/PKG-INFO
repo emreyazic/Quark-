@@ -5,5 +5,7 @@ Summary: JLCPCB BOM Enrichment Tool
 Requires-Python: >=3.8
 Requires-Dist: requests
 Requires-Dist: PyQt6
-Requires-Dist: pandas
 Requires-Dist: openpyxl
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"
+Requires-Dist: pyright; extra == "dev"

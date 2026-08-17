@@ -9,6 +9,7 @@ Key additions vs. original:
 
 import os
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Optional
@@ -67,6 +68,10 @@ class ManualSearchWorker(QThread):
     def __init__(self, mpn: str, parent=None):
         super().__init__(parent)
         self.mpn = mpn
+        self._cancelled = threading.Event()
+
+    def cancel(self):
+        self._cancelled.set()
 
     def run(self):
         results = []
@@ -74,6 +79,8 @@ class ManualSearchWorker(QThread):
 
         if not mpn_clean:
             self.error.emit("Please enter a valid MPN to search.")
+            return
+        if self._cancelled.is_set():
             return
 
         # ── JLCPCB Search ────────────────────────────────────────
@@ -138,8 +145,6 @@ class ManualSearchWorker(QThread):
                         "notes": "No results from JLCPCB",
                     })
 
-            jlc.close()
-
         except Exception as e:
             results.append({
                 "source": "JLCPCB",
@@ -153,6 +158,12 @@ class ManualSearchWorker(QThread):
                 "status": "Error",
                 "notes": str(e),
             })
+        finally:
+            if "jlc" in locals():
+                jlc.close()
+
+        if self._cancelled.is_set():
+            return
 
         # ── DigiKey Search ───────────────────────────────────────
         try:
@@ -214,8 +225,6 @@ class ManualSearchWorker(QThread):
                     "notes": "No results from DigiKey",
                 })
 
-            dk.close()
-
         except Exception as e:
             results.append({
                 "source": "DigiKey",
@@ -229,8 +238,12 @@ class ManualSearchWorker(QThread):
                 "status": "Error",
                 "notes": str(e),
             })
+        finally:
+            if "dk" in locals():
+                dk.close()
 
-        self.results_ready.emit(results)
+        if not self._cancelled.is_set():
+            self.results_ready.emit(results)
 
 
 class MappingRefreshWorker(QThread):
@@ -239,32 +252,47 @@ class MappingRefreshWorker(QThread):
     progress = pyqtSignal(int, int, str)
     finished = pyqtSignal(int)
     error = pyqtSignal(str)
+    warning = pyqtSignal(str)
 
     def __init__(self, db_manager: DatabaseManager, parent=None):
         super().__init__(parent)
         self.db_manager = db_manager
+        self._cancelled = threading.Event()
+
+    def cancel(self):
+        self._cancelled.set()
 
     def run(self):
         searcher = JlcpcbSearcher(APP_ID, ACCESS_KEY, SECRET_KEY, self.db_manager)
         digikey_searcher = DigiKeySearcher()
         updated_count = 0
+        lookup_errors = []
         try:
             mappings = self.db_manager.get_all_internal_mappings()
             eligible_mappings = [mapping for mapping in mappings if mapping.get("mpn", "").strip()]
             total = len(eligible_mappings)
 
             for index, mapping in enumerate(eligible_mappings, start=1):
+                if self._cancelled.is_set():
+                    return
                 comment_code = mapping["comment_code"]
                 mpn = mapping["mpn"].strip()
                 self.progress.emit(index, total, f"Refreshing {comment_code} ({mpn})")
 
                 # Resolve only the MPN→LCSC mapping. A lookup failure must not
                 # clear the existing code, which is enforced in the DB method.
+                digikey_result = None
                 try:
                     resolved_lcsc = searcher._resolve_lcsc_from_mpn(mpn)
                     lcsc_code = None if searcher.last_resolution_failed else (resolved_lcsc or "")
-                except Exception:
+                except Exception as exc:
                     lcsc_code = None
+                    lookup_errors.append(f"{comment_code} / JLCPCB: {exc}")
+                if getattr(searcher, "last_resolution_failed", False):
+                    lookup_errors.append(
+                        f"{comment_code} / JLCPCB: "
+                        f"{getattr(searcher, 'last_resolution_error', None) or 'lookup failed'}"
+                    )
 
                 try:
                     digikey_result = digikey_searcher.search_mpn(mpn, include_live_data=False)
@@ -272,18 +300,33 @@ class MappingRefreshWorker(QThread):
                         None if digikey_result.error
                         else (digikey_result.digikey_part_number or "")
                     )
-                except Exception:
+                except Exception as exc:
                     digikey_code = None
+                    lookup_errors.append(f"{comment_code} / DigiKey: {exc}")
+                if digikey_result is not None and digikey_result.error:
+                    lookup_errors.append(
+                        f"{comment_code} / DigiKey: {digikey_result.error}"
+                    )
 
                 if self.db_manager.refresh_mapping_codes(comment_code, lcsc_code, digikey_code):
                     updated_count += 1
 
-            self.finished.emit(updated_count)
+            if not self._cancelled.is_set():
+                if lookup_errors:
+                    self.warning.emit(self._format_api_warnings(lookup_errors))
+                self.finished.emit(updated_count)
         except Exception as exc:
             self.error.emit(str(exc))
         finally:
             searcher.close()
             digikey_searcher.close()
+
+    @staticmethod
+    def _format_api_warnings(errors):
+        visible = errors[:10]
+        if len(errors) > len(visible):
+            visible.append(f"... and {len(errors) - len(visible)} more")
+        return "\n".join(visible)
 
 
 class ComponentLibraryImportWorker(QThread):
@@ -292,6 +335,7 @@ class ComponentLibraryImportWorker(QThread):
     progress = pyqtSignal(int, int, str)
     finished = pyqtSignal(int, int, int)  # searched, pending/changed, skipped
     error = pyqtSignal(str)
+    warning = pyqtSignal(str)
 
     INVALID_MPN_VALUES = {"", "*", "-", "N/A", "NA", "NONE"}
     LOOKUP_CACHE_MAX_AGE = 24 * 60 * 60
@@ -302,6 +346,10 @@ class ComponentLibraryImportWorker(QThread):
         super().__init__(parent)
         self.file_path = file_path
         self.db_manager = db_manager
+        self._cancelled = threading.Event()
+
+    def cancel(self):
+        self._cancelled.set()
 
     @staticmethod
     def _normalize_header(value) -> str:
@@ -359,6 +407,8 @@ class ComponentLibraryImportWorker(QThread):
             network_jobs = []
             cached_supplier_results = 0
             for key, mpn in unique_mpns.items():
+                if self._cancelled.is_set():
+                    return
                 cached = self.db_manager.get_mpn_lookup_cache(mpn, self.LOOKUP_CACHE_MAX_AGE)
                 result = {"mpn": mpn, "lcsc": None, "digikey": None}
                 if cached and cached["lcsc_fresh"]:
@@ -375,6 +425,7 @@ class ComponentLibraryImportWorker(QThread):
 
             local_state = threading.local()
             searcher_lock = threading.Lock()
+            api_errors = []
             digikey_worker_counter = 0
 
             def search_lcsc(mpn: str) -> Optional[str]:
@@ -386,7 +437,10 @@ class ComponentLibraryImportWorker(QThread):
                         jlc_searchers.append(local_state.jlc_searcher)
                 resolved = local_state.jlc_searcher._resolve_lcsc_from_mpn(mpn)
                 if getattr(local_state.jlc_searcher, "last_resolution_failed", False):
-                    return None
+                    raise RuntimeError(
+                        local_state.jlc_searcher.last_resolution_error
+                        or "JLCPCB lookup failed"
+                    )
                 return resolved or ""
 
             def search_digikey(mpn: str) -> Optional[str]:
@@ -401,7 +455,9 @@ class ComponentLibraryImportWorker(QThread):
                     with searcher_lock:
                         digikey_searchers.append(local_state.digikey_searcher)
                 result = local_state.digikey_searcher.search_mpn(mpn, include_live_data=False)
-                if not result.configured or result.error:
+                if result.error:
+                    raise RuntimeError(result.error)
+                if not result.configured:
                     return None
                 return result.digikey_part_number or ""
 
@@ -419,42 +475,58 @@ class ComponentLibraryImportWorker(QThread):
                     future_jobs[executor.submit(function, mpn)] = (source, key, mpn)
 
                 total_jobs = len(future_jobs)
+                cache_updates = []
                 for completed, future in enumerate(as_completed(future_jobs), start=1):
+                    if self._cancelled.is_set():
+                        for pending_future in future_jobs:
+                            pending_future.cancel()
+                        return
                     source, key, mpn = future_jobs[future]
                     try:
                         value = future.result()
-                    except Exception:
+                    except Exception as exc:
                         value = None
+                        api_errors.append(f"{mpn} / {source}: {exc}")
                     results[key][source] = value
                     if value is not None:
                         if source == "lcsc":
-                            self.db_manager.upsert_mpn_lookup_cache(mpn, lcsc_code=value)
+                            cache_updates.append((mpn, value, None))
                         else:
-                            self.db_manager.upsert_mpn_lookup_cache(mpn, digikey_code=value)
+                            cache_updates.append((mpn, None, value))
                     self.progress.emit(
                         completed,
                         total_jobs,
                         f"Searching suppliers for {mpn} ({cached_supplier_results} cached results)",
                     )
+                self.db_manager.bulk_upsert_mpn_lookup_cache(cache_updates)
             finally:
                 lcsc_executor.shutdown(wait=True)
                 digikey_executor.shutdown(wait=True)
 
             pending_count = 0
             total = len(components)
+            existing_by_code = {
+                mapping["comment_code"]: mapping
+                for mapping in self.db_manager.get_all_internal_mappings()
+            }
+            new_pending_records = []
 
             for index, (internal_code, mpn) in enumerate(components, start=1):
+                if self._cancelled.is_set():
+                    return
                 lookup = results[mpn.upper()]
                 lcsc_code = lookup["lcsc"]
                 digikey_code = lookup["digikey"]
 
-                existing = self.db_manager.get_internal_mapping(internal_code)
+                existing = existing_by_code.get(internal_code)
                 if existing is None:
-                    self.db_manager.insert_pending_suggestion(
-                        internal_code,
-                        mpn,
-                        lcsc_code or "",
-                        digikey_code or "",
+                    new_pending_records.append(
+                        (
+                            internal_code,
+                            mpn,
+                            lcsc_code or "",
+                            digikey_code or "",
+                        )
                     )
                     pending_count += 1
                 elif self.db_manager.refresh_mapping_codes(internal_code, lcsc_code, digikey_code):
@@ -462,6 +534,10 @@ class ComponentLibraryImportWorker(QThread):
                 if index % 25 == 0 or index == total:
                     self.progress.emit(index, total, f"Saving pending mappings ({index}/{total})")
 
+            self.db_manager.bulk_insert_new_pending_suggestions(new_pending_records)
+
+            if api_errors:
+                self.warning.emit(MappingRefreshWorker._format_api_warnings(api_errors))
             self.finished.emit(total, pending_count, skipped)
         except Exception as exc:
             self.error.emit(str(exc))
@@ -486,6 +562,7 @@ class MainWindow(QMainWindow):
         self._manual_search_worker: Optional[ManualSearchWorker] = None
         self._mapping_refresh_worker: Optional[MappingRefreshWorker] = None
         self._component_library_import_worker: Optional[ComponentLibraryImportWorker] = None
+        self._sync_worker: Optional[LibrarySyncWorker] = None
         self._approval_dialog: Optional[ApprovalDialog] = None
         self._all_items: list[BomItem] = []
         self._project_aggregation_result = None
@@ -507,6 +584,58 @@ class MainWindow(QMainWindow):
         self._database_manager = DatabaseManager()
 
         self._setup_ui()
+
+    def _background_workers(self):
+        """Return each currently referenced worker exactly once."""
+        workers = []
+        seen = set()
+        for attribute in (
+            "_search_worker",
+            "_manual_search_worker",
+            "_mapping_refresh_worker",
+            "_component_library_import_worker",
+            "_sync_worker",
+        ):
+            worker = getattr(self, attribute, None)
+            if worker is not None and id(worker) not in seen:
+                seen.add(id(worker))
+                workers.append(worker)
+        return workers
+
+    def _stop_background_workers(self, timeout_ms: int = 60_000) -> bool:
+        """Cooperatively cancel workers and wait before allowing destruction."""
+        workers = self._background_workers()
+        for worker in workers:
+            worker.blockSignals(True)
+            cancel = getattr(worker, "cancel", None)
+            if callable(cancel):
+                cancel()
+            else:
+                worker.requestInterruption()
+
+        deadline = time.monotonic() + max(timeout_ms, 0) / 1000
+        all_stopped = True
+        for worker in workers:
+            if not worker.isRunning():
+                continue
+            remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
+            if remaining_ms == 0 or not worker.wait(remaining_ms):
+                all_stopped = False
+        return all_stopped
+
+    def closeEvent(self, event):
+        """Never destroy the window while one of its QThreads is running."""
+        if self._stop_background_workers():
+            event.accept()
+            return
+
+        event.ignore()
+        QMessageBox.warning(
+            self,
+            "Background Task Still Stopping",
+            "A background request is still shutting down. Please wait a moment "
+            "and close the application again.",
+        )
 
     def _setup_ui(self):
         central = QWidget()
@@ -1041,6 +1170,7 @@ class MainWindow(QMainWindow):
         worker.progress.connect(self._on_component_library_import_progress)
         worker.finished.connect(self._on_component_library_import_finished)
         worker.error.connect(self._on_component_library_import_error)
+        worker.warning.connect(self._on_supplier_api_warning)
         worker.start()
 
     def _on_component_library_import_progress(self, current: int, total: int, message: str):
@@ -1083,6 +1213,7 @@ class MainWindow(QMainWindow):
             self._mapping_refresh_worker.progress.connect(self._on_mapping_refresh_progress)
             self._mapping_refresh_worker.finished.connect(self._on_mapping_refresh_finished)
             self._mapping_refresh_worker.error.connect(self._on_mapping_refresh_error)
+            self._mapping_refresh_worker.warning.connect(self._on_supplier_api_warning)
             self._mapping_refresh_worker.start()
 
     def _on_mapping_refresh_progress(self, current: int, total: int, message: str):
@@ -1098,6 +1229,14 @@ class MainWindow(QMainWindow):
         self._btn_refresh_mappings.setEnabled(True)
         self._btn_refresh_mappings.setText("🔄 Refresh Mappings")
         QMessageBox.critical(self, "Refresh Error", f"Failed to refresh mappings: {message}")
+
+    def _on_supplier_api_warning(self, message: str):
+        QMessageBox.warning(
+            self,
+            "Supplier API Warnings",
+            "Some supplier lookups failed and were not treated as 'part not found':\n\n"
+            f"{message}",
+        )
 
     def _sync_jlc_library(self):
         """Starts syncing the JLC component library to local DB in the background."""
@@ -1154,6 +1293,24 @@ class MainWindow(QMainWindow):
         self._project_aggregation_result = None
         self._search_item_component_keys = []
         self._processed_input_revision = None
+
+    def _apply_approved_internal_mpn_mappings(self, workspace) -> None:
+        """Resolve approved internal-code MPNs before component grouping."""
+        mappings = {}
+        for project in workspace.projects:
+            for board in project.board_items:
+                for item in board.bom_items:
+                    internal_code = item.comment.strip() if item.comment else ""
+                    if not internal_code:
+                        continue
+                    if internal_code not in mappings:
+                        mappings[internal_code] = self._database_manager.get_internal_mapping(
+                            internal_code
+                        )
+                    mapping = mappings[internal_code]
+                    mapped_mpn = (mapping.get("mpn", "") or "").strip() if mapping else ""
+                    if mapping and mapping.get("approved") and mapped_mpn:
+                        item.mpn = mapped_mpn
 
     def _prompt_processing_options(self):
         build_quantity, accepted = QInputDialog.getInt(
@@ -1237,7 +1394,9 @@ class MainWindow(QMainWindow):
         # Re-parse items with latest mappings
         for project in workspace.projects:
             for board in project.board_items:
-                bf = next((b for b in bom_files if b.file_path == board.file_path), None)
+                bf = self._file_manager.get_bom_file_for_board(
+                    board.file_path, board.board_name
+                )
                 if bf:
                     try:
                         board.bom_items = self._parser.parse_bom_items(bf)
@@ -1253,6 +1412,8 @@ class MainWindow(QMainWindow):
                         f"Failed to find loaded file: {board.file_path}"
                     )
                     return
+
+        self._apply_approved_internal_mpn_mappings(workspace)
 
         from services.project_aggregation import aggregate_workspace, aggregate_project
         import copy
@@ -1399,7 +1560,9 @@ class MainWindow(QMainWindow):
             if unavail_writer.unavailable_items:
                 base_dir = os.path.dirname(output_path)
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                unavail_path = os.path.join(base_dir, f"JLCPCB_Not_Found_And_Unavailable_Components_{timestamp}.xlsx")
+                unavail_path = os.path.join(
+                    base_dir, f"Unavailable_Components_{timestamp}.xlsx"
+                )
                 unavail_writer.write(unavail_path)
                 self._last_unavail_path = unavail_path
                 self._progress_widget._log.appendPlainText(
@@ -1439,8 +1602,8 @@ class MainWindow(QMainWindow):
 
         # Summary cards
         total = len(items)
-        found = sum(1 for i in items if i.status == "" and i.jlcpcb_part_number)
-        not_found_count = sum(1 for i in items if i.status == "JLCPCB not found")
+        found = sum(1 for i in items if i.is_available)
+        not_found_count = sum(1 for i in items if i.is_not_found)
         mismatch = sum(1 for i in items if i.status == "No exact JLCPCB match")
         insuff = sum(1 for i in items if i.status == "Insufficient JLCPCB stock")
         manual = total - found - not_found_count - mismatch - insuff
@@ -1456,20 +1619,20 @@ class MainWindow(QMainWindow):
         self._fill_result_table(self._tab_all, items, headers)
 
         # Found tab
-        found_items = [i for i in items if i.status == "" and i.jlcpcb_part_number]
+        found_items = [i for i in items if i.is_available]
         self._fill_result_table(self._tab_found, found_items, headers)
 
         # Not found / mismatch tab
         nf_items = [
             i for i in items
-            if i.status in ("JLCPCB not found", "No exact JLCPCB match", "Insufficient JLCPCB stock")
+            if i.is_not_found or i.status in ("No exact JLCPCB match", "Insufficient JLCPCB stock")
         ]
         self._fill_result_table(self._tab_not_found, nf_items, headers)
 
         # Manual review tab
         manual_items = [
             i for i in items
-            if i.status not in ("JLCPCB not found", "No exact JLCPCB match", "Insufficient JLCPCB stock") and not (i.status == "" and i.jlcpcb_part_number)
+            if not i.is_available and not i.is_not_found and i.status not in ("No exact JLCPCB match", "Insufficient JLCPCB stock")
         ]
         self._fill_result_table(self._tab_manual, manual_items, headers)
 

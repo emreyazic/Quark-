@@ -1,12 +1,15 @@
 {
   "venvPath": ".",
   "venv": ".venv",
-  "typeCheckingMode": "off",
+  "include": [
+    "core",
+    "models",
+    "services"
+  ],
+  "exclude": ["**/__pycache__"],
+  "typeCheckingMode": "basic",
   "reportMissingImports": "none",
   "reportMissingTypeStubs": "none",
-  "reportOptionalMemberAccess": "none",
-  "reportIncompatibleMethodOverride": "none",
-  "reportGeneralTypeIssues": "none",
-  "reportOptionalOperand": "none",
-  "reportAssignmentType": "none"
+  "reportOptionalMemberAccess": "warning",
+  "reportIncompatibleMethodOverride": "warning"
 }

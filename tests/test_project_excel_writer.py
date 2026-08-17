@@ -92,6 +92,46 @@ def test_master_summary_totals_and_unpriced(tmp_path):
     assert board_ws["D4"].value == "Cost Status:"
     assert board_ws["E4"].value == "INCOMPLETE"
 
+
+def test_master_summary_and_detail_use_same_scalar_price_fallback(tmp_path):
+    project = Project("Scalar Price")
+    board = ProjectItem("path_a", "Board A", 2)
+    board.bom_items = [BomItem(mpn="R1", quantity=3)]
+    project.add_board(board)
+    agg = aggregate_project(project)
+    enriched = BomItem(
+        mpn="R1",
+        pricing_quantity=6,
+        jlcpcb_part_number="C1",
+        unit_price=1.25,
+        digikey_unit_price=2.0,
+    )
+
+    output_path = tmp_path / "scalar-price.xlsx"
+    ProjectExcelWriter(
+        project,
+        agg,
+        [enriched],
+        [agg.components[0].component_key],
+        build_multipliers=[1],
+        pricing_mode="project",
+    ).write(str(output_path))
+
+    workbook = openpyxl.load_workbook(output_path, data_only=False)
+    summary_row = next(
+        row
+        for row in workbook["Master Summary"].iter_rows(values_only=True)
+        if row[0] == "1x"
+    )
+    assert summary_row[1] == 7.5
+    assert summary_row[3] == 7.5
+
+    detail_sheet = workbook["Aggregated Components"]
+    headers = [cell.value for cell in detail_sheet[1]]
+    detail_row = [cell.value for cell in detail_sheet[2]]
+    assert detail_row[headers.index("JLCPCB Unit Price")] == 1.25
+    assert detail_row[headers.index("JLCPCB Total Price")] == 7.5
+
 def test_unpriced_in_aggregated_components_sheet(tmp_path):
     project = Project("Test")
     board = ProjectItem("path_a", "Board A", 2)

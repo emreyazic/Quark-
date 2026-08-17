@@ -62,7 +62,7 @@ class BomItem:
     matched_mpn: str = ""  # The MPN exactly matched by JLCPCB
     exact_match: bool = False  # True only if requested MPN exactly matches source MPN
     available_stock_qty: Optional[int] = None
-    required_stock: int = 0  # Computed as (quantity * 10) + 10
+    required_stock: int = 0  # Actual quantity required by the production run
     unit_price: Optional[float] = None
     digikey_unit_price: Optional[float] = None
     digikey_stock_qty: Optional[int] = None
@@ -80,8 +80,18 @@ class BomItem:
     source: str = ""  # "JLCPCB", "DigiKey", etc.
     status: str = ""  # "Found", "Not Found", "Exact MPN Mismatch", "Insufficient Stock", etc.
     notes: str = ""  # Detailed notes/error messages
+    jlcpcb_status: str = "not_searched"  # found, not_found, error, warning, not_searched
+    jlcpcb_error: str = ""
+    jlcpcb_source: str = ""
+    digikey_status: str = "not_searched"
+    digikey_error: str = ""
+    digikey_source: str = ""
     skip_reason: str = ""  # "RES-coded component", etc.
     skip_jlcpcb: bool = False  # Set to True for RES/missing MPN to bypass JLCPCB search
+    _generated_component_key: Optional[str] = field(
+        default=None, repr=False, compare=False
+    )
+    supplier_changes: list[dict] = field(default_factory=list, repr=False)
 
     # Output column order for Excel export — matches required spec
     EXPORT_COLUMNS: ClassVar[list[tuple[str, str]]] = [
@@ -123,6 +133,37 @@ class BomItem:
         if self.available_stock_qty is None:
             return False
         return self.available_stock_qty >= self.required_stock
+
+    @property
+    def is_available(self) -> bool:
+        """True when at least one supplier returned a usable result."""
+        return self.jlcpcb_status in ("found", "warning") or self.digikey_status == "found"
+
+    @property
+    def is_not_found(self) -> bool:
+        """True only when every queried supplier completed without a result."""
+        statuses = (self.jlcpcb_status, self.digikey_status)
+        queried = [status for status in statuses if status != "not_searched"]
+        return bool(queried) and all(status == "not_found" for status in queried)
+
+    def refresh_status(self) -> str:
+        """Derive the presentation status from independent supplier states."""
+        if self.is_available:
+            if self.jlcpcb_status == "warning":
+                self.status = f"Warning [{self.jlcpcb_source or 'JLCPCB'}]: {self.notes}"
+            else:
+                self.status = ""
+        elif self.is_not_found:
+            self.status = "Not Found"
+        else:
+            errors = [
+                f"JLCPCB API error: {self.jlcpcb_error}" if self.jlcpcb_status == "error" else "",
+                f"DigiKey API error: {self.digikey_error}" if self.digikey_status == "error" else "",
+            ]
+            errors = [error for error in errors if error]
+            if errors:
+                self.status = "; ".join(errors)
+        return self.status
 
     @classmethod
     def get_headers(cls) -> list[str]:

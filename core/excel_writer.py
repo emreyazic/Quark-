@@ -1,21 +1,25 @@
 import os
-from typing import List
+from typing import List, Optional, cast
 import openpyxl
 from openpyxl.styles import PatternFill, Font, Alignment
 from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.worksheet import Worksheet
 
 from models.bom_item import BomItem
+from core.atomic_io import atomic_save_workbook
+from core.mpn_utils import parse_positive_integer_quantity
+from core.base_excel_writer import add_refresh_changes_sheet
 
 
 class ExcelWriter:
     """Writes enriched BOM data to an Excel file with strict formatting rules."""
 
-    def __init__(self, items: List[BomItem], pricing_mode: str = "unit", build_multipliers: List[int] = None):
+    def __init__(self, items: List[BomItem], pricing_mode: str = "unit", build_multipliers: Optional[List[int]] = None):
         self.items = items
         self.pricing_mode = pricing_mode
         self.build_multipliers = build_multipliers or [1, 5, 10, 50, 100]
         self.wb = openpyxl.Workbook()
-        self.ws = self.wb.active
+        self.ws = cast(Worksheet, self.wb.active)
         self.ws.title = "Enriched BOM"
 
         # Define fills specifically for the JLCPCB Part Number column
@@ -95,12 +99,11 @@ class ExcelWriter:
                 self.ws.cell(row=row_idx, column=digikey_price_col_idx).fill = self.fill_green
 
         total_row = len(self.items) + 2
-        if self.pricing_mode == "project":
-            label_col_idx = headers.index("Pricing Quantity") + 1
-            total_columns = (jlcpcb_total_col_idx, digikey_total_col_idx)
-        else:
-            label_col_idx = jlcpcb_part_col_idx
-            total_columns = (jlcpcb_price_col_idx, digikey_price_col_idx)
+        # "Total Cost" must always sum extended line costs. Unit-price mode
+        # controls which unit price is selected; it must not turn the project
+        # total into a meaningless sum of per-unit prices.
+        label_col_idx = headers.index("Pricing Quantity") + 1
+        total_columns = (jlcpcb_total_col_idx, digikey_total_col_idx)
         self.ws.cell(row=total_row, column=label_col_idx, value="Total Cost")
         self.ws.cell(row=total_row, column=label_col_idx).font = header_font
         for price_col_idx in total_columns:
@@ -137,7 +140,8 @@ class ExcelWriter:
         self._add_summary_sheet()
         self._add_cost_sheets()
         self._add_supplier_stock_sheet()
-        self.wb.save(output_path)
+        add_refresh_changes_sheet(self.wb, self.items)
+        atomic_save_workbook(self.wb, output_path)
 
     @staticmethod
     def _is_price_missing(item: BomItem) -> bool:
@@ -270,14 +274,21 @@ class ExcelWriter:
         for item in items:
             row_cache = {}
             for m in multipliers:
-                scaled_qty = item.quantity * m
+                try:
+                    scaled_qty = parse_positive_integer_quantity(item.quantity) * m
+                except ValueError:
+                    scaled_qty = 0
                 
                 # Fetch JLC and DK prices
                 j_price = None
                 if item.jlcpcb_part_number and "error" not in item.status.lower() and "not found" not in item.status.lower() and "mismatch" not in item.status.lower():
                     j_price = select_unit_price(item.jlcpcb_price_breaks_raw, scaled_qty, use_quantity_breaks=self.pricing_mode == "project")
+                    if j_price is None:
+                        j_price = item.unit_price
                     
                 d_price = select_digikey_price(item.digikey_price_breaks, scaled_qty, use_quantity_breaks=self.pricing_mode == "project")
+                if d_price is None:
+                    d_price = item.digikey_unit_price
                 
                 used_source = "Missing price"
                 line_total = None
@@ -385,11 +396,16 @@ class ExcelWriter:
         ws.freeze_panes = f"A{det_start_row + 1}"
 
 class UnavailableReportWriter:
-    """Writes a specific report of items that couldn't be sourced automatically."""
+    """Write items that have no usable catalogue code from either supplier."""
 
     def __init__(self, items: List[BomItem]):
-        # Keep only items that are NOT valid
-        self.unavailable_items = [i for i in items if i.status != ""]
+        # JLCPCB status describes only one supplier. A DigiKey exact match still
+        # makes the component sourceable even when JLCPCB reports "not found".
+        self.unavailable_items = [
+            item
+            for item in items
+            if not item.jlcpcb_part_number and not item.digikey_part_number
+        ]
 
     def write(self, output_path: str) -> None:
         """Write the unavailable report data to the given Excel file path."""
@@ -398,6 +414,7 @@ class UnavailableReportWriter:
 
         wb = openpyxl.Workbook()
         ws = wb.active
+        assert ws is not None
         ws.title = "Action Required"
 
         headers = [
@@ -431,4 +448,4 @@ class UnavailableReportWriter:
         ws.auto_filter.ref = ws.dimensions
         ws.freeze_panes = "A2"
 
-        wb.save(output_path)
+        atomic_save_workbook(wb, output_path)

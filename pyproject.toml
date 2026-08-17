@@ -10,9 +10,11 @@ requires-python = ">=3.9"
 dependencies = [
     "requests",
     "PyQt6",
-    "pandas",
     "openpyxl"
 ]
+
+[project.optional-dependencies]
+dev = ["pytest", "pyright"]
 
 [tool.setuptools]
 packages = ["core", "ui", "models", "services", "resources", "saves"]
@@ -20,10 +22,11 @@ packages = ["core", "ui", "models", "services", "resources", "saves"]
 [tool.pyright]
 venvPath = "."
 venv = ".venv"
-typeCheckingMode = "off"
+typeCheckingMode = "basic"
+include = [
+    "core",
+    "models",
+    "services",
+]
 reportMissingImports = false
 reportMissingTypeStubs = false
-
-[tool.pyrefly]
-typeCheckingMode = "off"
-reportMissingImports = false

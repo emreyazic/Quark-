@@ -7,7 +7,82 @@ required stock, and distinguish manufacturer names from part numbers.
 
 import re
 import unicodedata
+import math
+import json
+import logging
 from typing import Optional
+
+
+def _positive_int(value):
+    if isinstance(value, bool):
+        raise ValueError
+    number = float(value)
+    if not math.isfinite(number) or number <= 0 or not number.is_integer():
+        raise ValueError
+    return int(number)
+
+
+def _valid_price(value):
+    if isinstance(value, bool):
+        raise ValueError
+    number = float(value)
+    if not math.isfinite(number) or number < 0:
+        raise ValueError
+    return number
+
+
+def normalize_price_breaks(price_breaks, supplier="supplier", logger=None):
+    """Normalize JLCPCB dict tiers or DigiKey tuple tiers into sorted tuples."""
+    warnings = []
+    grouped = {}
+    for raw in price_breaks or []:
+        try:
+            if isinstance(raw, dict):
+                quantity = _positive_int(raw.get("qFrom"))
+                price = _valid_price(raw.get("price"))
+                raw_to = raw.get("qTo")
+                quantity_to = None if raw_to in (None, -1, "-1", "") else _positive_int(raw_to)
+                if quantity_to is not None and quantity_to < quantity:
+                    raise ValueError
+            else:
+                quantity = _positive_int(raw[0])
+                price = _valid_price(raw[1])
+                quantity_to = None
+        except (TypeError, ValueError, IndexError, OverflowError):
+            warnings.append(f"{supplier}: invalid price break rejected: {raw!r}")
+            continue
+        candidate = (quantity, quantity_to, price)
+        previous = grouped.get(quantity)
+        if previous is not None and previous != candidate:
+            warnings.append(f"{supplier}: conflicting duplicate quantity {quantity}")
+        # Resolve duplicates independently of input order: lowest valid price,
+        # then the narrowest finite range wins.
+        grouped[quantity] = min(
+            filter(None, (previous, candidate)),
+            key=lambda tier: (tier[2], float("inf") if tier[1] is None else tier[1]),
+        )
+    if warnings:
+        (logger or logging.getLogger(__name__)).warning("; ".join(warnings))
+    return [grouped[key] for key in sorted(grouped)], warnings
+
+
+def normalize_jlcpcb_price_breaks(price_json_str: str, logger=None):
+    try:
+        raw = json.loads(price_json_str) if price_json_str else []
+    except (json.JSONDecodeError, TypeError):
+        raw = []
+    if not isinstance(raw, list):
+        raw = []
+    normalized, warnings = normalize_price_breaks(raw, "JLCPCB", logger)
+    return [
+        {"qFrom": quantity, "qTo": quantity_to, "price": price}
+        for quantity, quantity_to, price in normalized
+    ], warnings
+
+
+def normalize_digikey_price_breaks(price_breaks, logger=None):
+    normalized, warnings = normalize_price_breaks(price_breaks, "DigiKey", logger)
+    return [(quantity, price) for quantity, _, price in normalized], warnings
 
 
 # ─── Known manufacturer name fragments (case-insensitive) ───────────────────
@@ -104,12 +179,32 @@ def is_res_coded(comment: str) -> bool:
     return bool(re.match(r'^RES\d', comment_stripped, re.IGNORECASE))
 
 
-def compute_required_stock(quantity: int) -> int:
-    """Compute the required stock threshold for a BOM component.
+def parse_positive_integer_quantity(quantity) -> int:
+    """Validate and return a component quantity as a positive integer.
 
-    Formula: (Quantity × 10) + 10
+    Electronic component quantities cannot be zero, fractional, NaN, or
+    infinite. Invalid values raise ``ValueError`` instead of being rounded or
+    silently promoted to one.
     """
-    return (quantity * 10) + 10
+    if quantity is None or isinstance(quantity, bool):
+        raise ValueError(f"Invalid component quantity: {quantity!r}")
+    if isinstance(quantity, str) and not quantity.strip():
+        raise ValueError("Component quantity is empty")
+    try:
+        numeric = float(quantity)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid component quantity: {quantity!r}") from exc
+    if not math.isfinite(numeric) or numeric <= 0 or not numeric.is_integer():
+        raise ValueError(f"Component quantity must be a positive integer: {quantity!r}")
+    return int(numeric)
+
+
+def compute_required_stock(quantity) -> int:
+    """Return the actual component quantity required by the production run."""
+    try:
+        return parse_positive_integer_quantity(quantity)
+    except ValueError:
+        return 0
 
 
 def is_mpn_like(value: str) -> bool:
@@ -206,26 +301,28 @@ def select_unit_price(
         if not isinstance(breaks, list) or not breaks:
             return None
 
-        valid_breaks = []
-        for pb in breaks:
-            price = pb.get("price")
-            if price is not None:
-                valid_breaks.append((int(pb.get("qFrom") or 0), float(price)))
+        valid_breaks, _ = normalize_price_breaks(breaks, "JLCPCB")
 
         if not valid_breaks:
             return None
 
         valid_breaks.sort(key=lambda tier: tier[0])
         if not use_quantity_breaks:
-            return round(valid_breaks[0][1], 6)
+            return round(valid_breaks[0][2], 6)
 
-        selected = valid_breaks[0][1]
-        for minimum_quantity, price in valid_breaks:
-            if quantity >= minimum_quantity:
-                selected = price
-            else:
-                break
-        return round(selected, 6)
+        if quantity < valid_breaks[0][0]:
+            return round(valid_breaks[0][2], 6)
+
+        selected = None
+        for minimum_quantity, maximum_quantity, price in valid_breaks:
+            if quantity < minimum_quantity:
+                continue
+            if maximum_quantity is not None and quantity > maximum_quantity:
+                continue
+            # If malformed data contains overlapping ranges, prefer the most
+            # specific/latest range (the one with the highest qFrom).
+            selected = price
+        return round(selected, 6) if selected is not None else None
 
     except (json.JSONDecodeError, TypeError, KeyError, ValueError):
         pass
@@ -250,7 +347,9 @@ def select_digikey_price(
     if not price_breaks:
         return None
 
-    ordered = sorted(price_breaks, key=lambda tier: tier[0])
+    ordered, _ = normalize_digikey_price_breaks(price_breaks)
+    if not ordered:
+        return None
     if not use_quantity_breaks:
         return ordered[0][1]
 
