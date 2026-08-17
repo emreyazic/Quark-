@@ -64,3 +64,16 @@ def test_supplier_unit_prices_do_not_change_with_quantity():
 
     assert select_unit_price(jlcpcb_prices, 1000) == 2.0
     assert select_digikey_price(digikey_prices, 1000) == 2.0
+
+
+def test_supplier_project_pricing_uses_applicable_quantity_tier():
+    jlcpcb_prices = '[{"qFrom": 1, "qTo": 9, "price": 5.0}, {"qFrom": 10, "qTo": null, "price": 3.5}]'
+    digikey_prices = [(1, 5.0), (10, 3.5)]
+
+    jlcpcb_unit = select_unit_price(jlcpcb_prices, 15, use_quantity_breaks=True)
+    digikey_unit = select_digikey_price(digikey_prices, 15, use_quantity_breaks=True)
+
+    assert jlcpcb_unit == 3.5
+    assert digikey_unit == 3.5
+    assert 15 * jlcpcb_unit == 52.5
+    assert 15 * digikey_unit == 52.5

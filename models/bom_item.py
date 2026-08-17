@@ -67,6 +67,9 @@ class BomItem:
     digikey_unit_price: Optional[float] = None
     digikey_stock_qty: Optional[int] = None
     digikey_part_number: str = ""
+    pricing_quantity: Union[int, float] = 1
+    jlcpcb_total_price: Optional[float] = None
+    digikey_total_price: Optional[float] = None
     
     jlcpcb_price_breaks_raw: str = ""
     digikey_price_breaks: list[tuple[int, float]] = field(default_factory=list)
@@ -96,6 +99,9 @@ class BomItem:
         ("DigiKey Stock", "digikey_stock_qty"),
         ("JLCPCB Unit Price", "unit_price"),
         ("DigiKey Unit Price", "digikey_unit_price"),
+        ("Pricing Quantity", "pricing_quantity"),
+        ("JLCPCB Total Price", "jlcpcb_total_price"),
+        ("DigiKey Total Price", "digikey_total_price"),
         ("Status", "status"),
     ]
 

@@ -271,7 +271,7 @@ def test_aggregate_workspace_source_tracking():
     assert usage.item == item
     
     assert comp.source_projects == ["ProjectX"]
-    assert comp.source_locations == ["ProjectX::file_x.xlsx"]
+    assert comp.source_locations == ["ProjectX::file_x.xlsx::BoardX"]
     assert comp.source_board_names == ["BoardX"]
 
 

@@ -21,6 +21,7 @@ from core.mpn_utils import (
     is_res_coded,
     compute_required_stock,
     select_unit_price,
+    select_digikey_price,
 )
 from core.database_manager import DatabaseManager
 
@@ -628,13 +629,14 @@ class SearchWorker(QThread):
     finished_all = pyqtSignal(list)
     error = pyqtSignal(str)
 
-    def __init__(self, items: list[BomItem], app_id: str, access_key: str, secret_key: str, parent=None, force_refresh: bool = False):
+    def __init__(self, items: list[BomItem], app_id: str, access_key: str, secret_key: str, parent=None, force_refresh: bool = False, pricing_mode: str = "unit"):
         super().__init__(parent)
         self.items = items
         self.app_id = app_id
         self.access_key = access_key
         self.secret_key = secret_key
         self.force_refresh = force_refresh
+        self.pricing_mode = pricing_mode
         self._cancelled = False
         self._mutex = QMutex()
         self.db_manager = DatabaseManager()
@@ -749,6 +751,29 @@ class SearchWorker(QThread):
                     )
                     item.status = "Pending Approval"
                     item.jlcpcb_part_number = ""
+
+                use_quantity_breaks = self.pricing_mode == "project"
+                pricing_quantity = max(int(item.pricing_quantity or 1), 1)
+                if item.jlcpcb_price_breaks_raw:
+                    item.unit_price = select_unit_price(
+                        item.jlcpcb_price_breaks_raw,
+                        pricing_quantity,
+                        use_quantity_breaks=use_quantity_breaks,
+                    )
+                if item.digikey_price_breaks:
+                    item.digikey_unit_price = select_digikey_price(
+                        item.digikey_price_breaks,
+                        pricing_quantity,
+                        use_quantity_breaks=use_quantity_breaks,
+                    )
+                item.jlcpcb_total_price = (
+                    pricing_quantity * item.unit_price
+                    if item.unit_price is not None else None
+                )
+                item.digikey_total_price = (
+                    pricing_quantity * item.digikey_unit_price
+                    if item.digikey_unit_price is not None else None
+                )
 
                 self.item_result.emit(idx, item)
                 self.progress.emit(idx + 1, total, mpn_display, item.status)

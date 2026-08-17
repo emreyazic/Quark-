@@ -173,10 +173,10 @@ def test_jlcpcb_negative_status_fallback_to_digikey(tmp_path):
             comb = row[3]
             dk_only = row[4]
             
-            # Since JLCPCB has a negative status, it should fallback to DK
-            assert jlc_cost == 0.0
-            assert dk_cost == 0.50
-            assert comb == 0.50
+            # Stock is informational; a valid JLCPCB code/price remains costed.
+            assert jlc_cost == 0.10
+            assert dk_cost == 0.0
+            assert comb == 0.10
             assert dk_only == 0.50
 
 def test_board_quantity_math(tmp_path):

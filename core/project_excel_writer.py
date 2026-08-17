@@ -20,7 +20,8 @@ class ProjectExcelWriter(BaseExcelWriter):
         enriched_items: List[BomItem],
         component_keys: List[str],
         build_multipliers: List[int] = None,
-        include_raw_board_sheets: bool = True
+        include_raw_board_sheets: bool = True,
+        pricing_mode: str = "unit",
     ):
         if len(enriched_items) != len(component_keys):
             raise ValueError(
@@ -56,10 +57,10 @@ class ProjectExcelWriter(BaseExcelWriter):
             c.component_key: c for c in self.aggregation_result.components
         }
 
-        BaseExcelWriter.__init__(self)
+        BaseExcelWriter.__init__(self, pricing_mode=pricing_mode)
 
     def _get_pricing_for_component(self, comp_key: str, multiplied_qty: Union[int, float]) -> Dict[str, Any]:
-        """Calculates JLCPCB, Remaining DigiKey, and DigiKey-Only prices/costs for a single multiplier."""
+        """Calculate JLCPCB, DigiKey fallback, and DigiKey-only costs."""
         item = self.enriched_by_key[comp_key]
         return self._get_pricing_for_component_item(item, multiplied_qty)
 
@@ -82,10 +83,21 @@ class ProjectExcelWriter(BaseExcelWriter):
         
         ws.append(["Project Name:", self.project.project_name])
         ws.append(["Generated At:", datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
-        ws.append(["Number of Boards:", len(self.project.board_items)])
+        actual_board_names = {
+            usage.board_name
+            for component in self.aggregation_result.components
+            for usage in component.usages
+        }
+        ws.append(["Number of Boards:", len(actual_board_names)])
+        ws.append(["Number of BOM Files:", len(self.project.board_items)])
         ws.append(["Unique Components:", len(self.component_keys)])
         ws.append(["Skipped Rows:", self.aggregation_result.skipped_count])
         ws.append(["Build Multipliers:", ", ".join(map(str, self.build_multipliers))])
+        ws.append([
+            "Mixed Sourcing Logic:",
+            "Use JLCPCB when its code and price exist; use DigiKey only as fallback. "
+            "The same component is never counted twice.",
+        ])
         ws.append([])
 
         # Board Composition
@@ -111,8 +123,8 @@ class ProjectExcelWriter(BaseExcelWriter):
         ws[f"A{ws.max_row}"].font = Font(bold=True, size=14)
         
         ws.append([
-            "Build Qty", "JLCPCB Cost", "Remaining DigiKey Cost", 
-            "Combined Total", "DigiKey-Only Total"
+            "Build Qty", "JLCPCB Cost", "DigiKey Fallback Cost",
+            "Mixed Sourcing Total", "DigiKey-Only Total"
         ])
         for cell in ws[ws.max_row]:
             cell.font = self.header_font
@@ -157,10 +169,11 @@ class ProjectExcelWriter(BaseExcelWriter):
         headers = [
             "Board Name", "Description", "Designator", "Quantity (Per Board / Total)", 
             "Value", "Manufacturer", "MPN", "Design Item ID", "JLCPCB Part Number", "DigiKey Part Number", "JLCPCB Stock", "DigiKey Stock",
-            "JLCPCB Unit Price", "DigiKey Unit Price", "Status"
+            "JLCPCB Unit Price", "DigiKey Unit Price", "Pricing Quantity", "JLCPCB Total Price", "DigiKey Total Price", "Status"
         ]
 
         ws.append(headers)
+        data_start_row = 2
         for cell in ws[1]:
             cell.font = self.header_font
             cell.alignment = self.header_alignment
@@ -183,6 +196,7 @@ class ProjectExcelWriter(BaseExcelWriter):
                 boards_usage.append(f"{u.board_name}: {self._fmt_qty(u.total_quantity)}")
             boards_str = "\n".join(boards_usage)
             quantities_str = self._format_usage_quantities(comp.usages)
+            pricing_quantity, j_price, d_price, j_total, d_total = self._component_price_values(enriched)
 
             row = [
                 boards_str,
@@ -197,8 +211,11 @@ class ProjectExcelWriter(BaseExcelWriter):
                 enriched.digikey_part_number,
                 enriched.available_stock_qty if enriched.available_stock_qty is not None else "-",
                 enriched.digikey_stock_qty if enriched.digikey_stock_qty is not None else "-",
-                enriched.unit_price,
-                enriched.digikey_unit_price,
+                j_price,
+                d_price,
+                pricing_quantity,
+                j_total,
+                d_total,
                 enriched.status
             ]
                 
@@ -208,12 +225,19 @@ class ProjectExcelWriter(BaseExcelWriter):
             
             # Only status coloring left since we removed multi-column pricing
             self._format_supplier_price_cells(ws, ws.max_row, 13, 14, enriched)
-            cell = ws.cell(row=ws.max_row, column=15)
+            for total_col in (16, 17):
+                if isinstance(ws.cell(row=ws.max_row, column=total_col).value, (int, float)):
+                    self._format_currency(ws.cell(row=ws.max_row, column=total_col))
+            cell = ws.cell(row=ws.max_row, column=18)
             fill = self._get_status_fill(enriched.status, bool(enriched.jlcpcb_part_number))
             if fill:
                 cell.fill = fill
 
-        ws.auto_filter.ref = ws.dimensions
+        data_end_row = ws.max_row
+        self._add_price_totals_box(
+            ws, 1, data_start_row, data_end_row, self.build_multipliers[0]
+        )
+        ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{data_end_row}"
         ws.freeze_panes = "A2"
         self._auto_fit_columns(ws)
 
@@ -248,7 +272,7 @@ class ProjectExcelWriter(BaseExcelWriter):
             headers = [
                 "Board Name", "Description", "Designator", "Quantity (Per Board / Total)", 
                 "Value", "Manufacturer", "MPN", "Design Item ID", "JLCPCB Part Number", "DigiKey Part Number", "JLCPCB Stock", "DigiKey Stock",
-                "JLCPCB Unit Price", "DigiKey Unit Price", "Status"
+                "JLCPCB Unit Price", "DigiKey Unit Price", "Pricing Quantity", "JLCPCB Total Price", "DigiKey Total Price", "Status"
             ]
             ws.append(headers)
             header_row = ws.max_row
@@ -265,8 +289,10 @@ class ProjectExcelWriter(BaseExcelWriter):
                 board_usages = [u for u in comp.usages if u.board_file_path == board.file_path]
                 if not board_usages:
                     continue
-                    
-                for usage in board_usages:
+                display_quantity = sum(u.total_quantity for u in board_usages) * self.build_multipliers[0]
+                pricing_quantity, j_price, d_price, j_total, d_total = self._component_price_values(enriched, display_quantity)
+
+                for usage_index, usage in enumerate(board_usages):
                     row = [
                         board.board_name,
                         enriched.description,
@@ -280,20 +306,36 @@ class ProjectExcelWriter(BaseExcelWriter):
                         enriched.digikey_part_number,
                         enriched.available_stock_qty if enriched.available_stock_qty is not None else "-",
                         enriched.digikey_stock_qty if enriched.digikey_stock_qty is not None else "-",
-                        enriched.unit_price,
-                        enriched.digikey_unit_price,
+                        j_price,
+                        d_price,
+                        pricing_quantity,
+                        j_total if usage_index == 0 else None,
+                        d_total if usage_index == 0 else None,
                         enriched.status
                     ]
                     ws.append(row)
                     
                     # Status coloring
                     self._format_supplier_price_cells(ws, ws.max_row, 13, 14, enriched)
-                    cell = ws.cell(row=ws.max_row, column=15)
+                    for total_col in (16, 17):
+                        if isinstance(ws.cell(row=ws.max_row, column=total_col).value, (int, float)):
+                            self._format_currency(ws.cell(row=ws.max_row, column=total_col))
+                    cell = ws.cell(row=ws.max_row, column=18)
                     fill = self._get_status_fill(enriched.status, bool(enriched.jlcpcb_part_number))
                     if fill:
                         cell.fill = fill
                             
-            ws.auto_filter.ref = f"A{header_row}:{get_column_letter(len(headers))}{ws.max_row}"
+            data_start_row = header_row + 1
+            data_end_row = ws.max_row
+            self._add_price_totals_box(
+                ws,
+                header_row,
+                data_start_row,
+                data_end_row,
+                self.build_multipliers[0],
+                total_label="Board Total",
+            )
+            ws.auto_filter.ref = f"A{header_row}:{get_column_letter(len(headers))}{data_end_row}"
             ws.freeze_panes = f"A{header_row + 1}"
             self._auto_fit_columns(ws)
 

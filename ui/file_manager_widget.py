@@ -46,19 +46,16 @@ class DropArea(QFrame):
         layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
         
         icon_label = QLabel("📂")
-        icon_label.setStyleSheet("font-size: 32px; background: transparent;")
+        icon_label.setObjectName("dropIcon")
+        icon_label.setStyleSheet("font-size: 28px; background: transparent;")
         icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         
         text_label = QLabel("Drag & drop BOM Excel files here")
-        text_label.setStyleSheet(
-            "font-size: 14px; color: #6b8299; font-weight: 500; background: transparent;"
-        )
+        text_label.setObjectName("dropTitle")
         text_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         
         sub_label = QLabel("or click Browse below")
-        sub_label.setStyleSheet(
-            "font-size: 11px; color: #4a5f75; background: transparent;"
-        )
+        sub_label.setObjectName("dropHint")
         sub_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         
         layout.addWidget(icon_label)
@@ -71,7 +68,7 @@ class DropArea(QFrame):
                 if url.toLocalFile().lower().endswith((".xlsx", ".xls")):
                     event.acceptProposedAction()
                     self.setStyleSheet(
-                        "#dropArea { border-color: #00b894; background-color: #1a3d42; }"
+                        "#dropArea { border-color: #34d399; background-color: #102a28; }"
                     )
                     return
         event.ignore()

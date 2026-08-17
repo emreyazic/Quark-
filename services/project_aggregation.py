@@ -121,9 +121,10 @@ def aggregate_project(project: Project) -> ProjectAggregationResult:
                 
             line_total = qty_val * board_qty
             key = build_component_key(item)
+            usage_board_name = item.board_name.strip() if item.board_name else board.board_name
             
             usage = BoardComponentUsage(
-                board_name=board.board_name,
+                board_name=usage_board_name,
                 board_file_path=board.file_path,
                 board_quantity=board_qty,
                 bom_line_quantity=qty_val,
@@ -235,10 +236,11 @@ def aggregate_workspace(workspace: Workspace) -> WorkspaceAggregationResult:
                     
                 line_total = qty_val * board_qty
                 key = build_component_key(item)
+                usage_board_name = item.board_name.strip() if item.board_name else board.board_name
                 
                 usage = WorkspaceBoardComponentUsage(
                     project_name=project.project_name,
-                    board_name=board.board_name,
+                    board_name=usage_board_name,
                     board_file_path=board.file_path,
                     board_quantity=board_qty,
                     bom_line_quantity=qty_val,
@@ -264,9 +266,9 @@ def aggregate_workspace(workspace: Workspace) -> WorkspaceAggregationResult:
                     comp._temp_board_names = set()
                     
                 comp._temp_projects.add(project.project_name)
-                source_location = f"{project.project_name}::{board.file_path}"
+                source_location = f"{project.project_name}::{board.file_path}::{usage_board_name}"
                 comp._temp_locations.add(source_location)
-                comp._temp_board_names.add(board.board_name)
+                comp._temp_board_names.add(usage_board_name)
 
     sorted_keys = sorted(components_map.keys())
     
@@ -297,4 +299,3 @@ def aggregate_workspace(workspace: Workspace) -> WorkspaceAggregationResult:
     result.components.sort(key=lambda c: c.component_key)
     result.mutual_components.sort(key=lambda c: c.component_key)
     return result
-

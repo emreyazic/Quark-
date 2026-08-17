@@ -64,31 +64,19 @@ class ProgressWidget(QWidget):
         stats_layout.setSpacing(8)
 
         self._lbl_found = QLabel("Found: 0")
-        self._lbl_found.setStyleSheet(
-            "background: #00b894; color: white; padding: 3px 10px; "
-            "border-radius: 10px; font-size: 11px; font-weight: 600;"
-        )
+        self._lbl_found.setObjectName("badgeFound")
         stats_layout.addWidget(self._lbl_found)
 
         self._lbl_not_found = QLabel("Not Found: 0")
-        self._lbl_not_found.setStyleSheet(
-            "background: #e74c3c; color: white; padding: 3px 10px; "
-            "border-radius: 10px; font-size: 11px; font-weight: 600;"
-        )
+        self._lbl_not_found.setObjectName("badgeNotFound")
         stats_layout.addWidget(self._lbl_not_found)
 
         self._lbl_oos = QLabel("Low Stock / Mismatch: 0")
-        self._lbl_oos.setStyleSheet(
-            "background: #f39c12; color: white; padding: 3px 10px; "
-            "border-radius: 10px; font-size: 11px; font-weight: 600;"
-        )
+        self._lbl_oos.setObjectName("badgeOOS")
         stats_layout.addWidget(self._lbl_oos)
 
         self._lbl_other = QLabel("Other: 0")
-        self._lbl_other.setStyleSheet(
-            "background: #6c5ce7; color: white; padding: 3px 10px; "
-            "border-radius: 10px; font-size: 11px; font-weight: 600;"
-        )
+        self._lbl_other.setObjectName("badgeOther")
         stats_layout.addWidget(self._lbl_other)
 
         status_row.addWidget(self._stats_frame)
@@ -206,5 +194,5 @@ class ProgressWidget(QWidget):
 
     def _on_cancel(self):
         self._btn_cancel.setEnabled(False)
-        self._btn_cancel.setText("Cancelling...")
+        self._btn_cancel.setText("Cancel")
         self.cancel_requested.emit()

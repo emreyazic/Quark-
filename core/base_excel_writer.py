@@ -10,7 +10,8 @@ from core.mpn_utils import select_unit_price, select_digikey_price
 class BaseExcelWriter:
     """Base class providing shared logic for Excel writers (Project and Workspace)."""
     
-    def __init__(self):
+    def __init__(self, pricing_mode: str = "unit"):
+        self.pricing_mode = pricing_mode
         self.wb = openpyxl.Workbook()
         if self.wb.sheetnames:
             self.wb.remove(self.wb.active)
@@ -106,6 +107,81 @@ class BaseExcelWriter:
         elif item.digikey_unit_price is not None:
             digikey_cell.fill = self.fill_green
 
+    def _component_price_values(self, item: BomItem, quantity=None):
+        """Return display quantity, supplier unit prices, and optional totals."""
+        pricing_quantity = max(int(quantity if quantity is not None else item.pricing_quantity or 1), 1)
+        use_breaks = self.pricing_mode == "project"
+        j_price = select_unit_price(
+            item.jlcpcb_price_breaks_raw,
+            pricing_quantity,
+            use_quantity_breaks=use_breaks,
+        ) if item.jlcpcb_price_breaks_raw else item.unit_price
+        d_price = select_digikey_price(
+            item.digikey_price_breaks,
+            pricing_quantity,
+            use_quantity_breaks=use_breaks,
+        ) if item.digikey_price_breaks else item.digikey_unit_price
+        return (
+            pricing_quantity,
+            j_price,
+            d_price,
+            pricing_quantity * j_price if j_price is not None else None,
+            pricing_quantity * d_price if d_price is not None else None,
+        )
+
+    def _add_price_totals_box(
+        self,
+        ws,
+        header_row: int,
+        data_start_row: int,
+        data_end_row: int,
+        build_quantity: int,
+        total_label: str = "Project Total",
+    ) -> None:
+        """Add supplier totals and per-produced-board-set costs below a detail table."""
+        if data_end_row < data_start_row:
+            return
+
+        headers = [str(cell.value or "") for cell in ws[header_row]]
+        try:
+            jlc_total_col = headers.index("JLCPCB Total Price") + 1
+            digikey_total_col = headers.index("DigiKey Total Price") + 1
+        except ValueError:
+            return
+        if "Pricing Quantity" in headers:
+            label_col = headers.index("Pricing Quantity") + 1
+        elif "Pricing Pool Quantity" in headers:
+            label_col = headers.index("Pricing Pool Quantity") + 1
+        else:
+            return
+
+        total_row = data_end_row + 2
+        per_board_row = total_row + 1
+        build_quantity = max(int(build_quantity or 1), 1)
+
+        ws.cell(row=total_row, column=label_col, value=total_label)
+        ws.cell(row=per_board_row, column=label_col, value="Cost Per Board Set")
+        for row in (total_row, per_board_row):
+            ws.cell(row=row, column=label_col).font = self.header_font
+            ws.cell(row=row, column=label_col).fill = self.fill_yellow
+
+        for total_col in (jlc_total_col, digikey_total_col):
+            col_letter = get_column_letter(total_col)
+            total_cell = ws.cell(
+                row=total_row,
+                column=total_col,
+                value=f"=SUM({col_letter}{data_start_row}:{col_letter}{data_end_row})",
+            )
+            per_board_cell = ws.cell(
+                row=per_board_row,
+                column=total_col,
+                value=f"={col_letter}{total_row}/{build_quantity}",
+            )
+            for cell in (total_cell, per_board_cell):
+                cell.font = self.header_font
+                cell.fill = self.fill_yellow
+                self._format_currency(cell)
+
     def _add_supplier_stock_sheet(self, items: list[BomItem]) -> None:
         """Write one JLCPCB row and one DigiKey row per component."""
         sheet_name = "Supplier Stock"
@@ -114,7 +190,7 @@ class BaseExcelWriter:
         ws = self.wb.create_sheet(sheet_name)
         headers = [
             "MPN", "Design Item ID", "Supplier", "Supplier Part Number",
-            "Stock", "Unit Price", "Required Stock", "Status",
+            "Stock", "Unit Price", "Pricing Quantity", "Total Price", "Required Stock", "Status",
         ]
         ws.append(headers)
         for cell in ws[1]:
@@ -122,23 +198,26 @@ class BaseExcelWriter:
             cell.alignment = self.header_alignment
 
         for item in items:
+            pricing_quantity, j_price, d_price, j_total, d_total = self._component_price_values(item)
             supplier_rows = [
                 (
                     "JLCPCB",
                     item.jlcpcb_part_number,
                     item.available_stock_qty,
-                    item.unit_price,
+                    j_price,
+                    j_total,
                     item.status,
                 ),
                 (
                     "DigiKey",
                     item.digikey_part_number,
                     item.digikey_stock_qty,
-                    item.digikey_unit_price,
+                    d_price,
+                    d_total,
                     "Found" if item.digikey_part_number else "Not Found",
                 ),
             ]
-            for supplier, part_number, stock, unit_price, status in supplier_rows:
+            for supplier, part_number, stock, unit_price, total_price, status in supplier_rows:
                 ws.append([
                     item.mpn,
                     item.comment,
@@ -146,11 +225,15 @@ class BaseExcelWriter:
                     part_number or "-",
                     stock if stock is not None else "-",
                     unit_price,
+                    pricing_quantity,
+                    total_price,
                     item.required_stock,
                     status or "",
                 ])
                 if isinstance(unit_price, (int, float)):
                     self._format_currency(ws.cell(row=ws.max_row, column=6))
+                if isinstance(total_price, (int, float)):
+                    self._format_currency(ws.cell(row=ws.max_row, column=8))
 
         ws.auto_filter.ref = ws.dimensions
         ws.freeze_panes = "A2"
@@ -181,15 +264,11 @@ class BaseExcelWriter:
         """Determines if JLCPCB data can be used based on component status and flags."""
         if not item.jlcpcb_part_number:
             return False
-        if getattr(item, 'skip_jlcpcb', False):
-            return False
             
         status_lower = str(item.status or "").lower()
         if "not found" in status_lower:
             return False
         if "no exact" in status_lower:
-            return False
-        if "insufficient" in status_lower:
             return False
         if "error" in status_lower:
             return False
@@ -197,12 +276,20 @@ class BaseExcelWriter:
         return True
 
     def _get_pricing_for_component_item(self, item: BomItem, multiplied_qty: Union[int, float]) -> Dict[str, Any]:
-        """Calculates JLCPCB, Remaining DigiKey, and DigiKey-Only prices/costs for a single multiplier."""
+        """Calculate JLCPCB, DigiKey fallback, and DigiKey-only costs."""
         j_price = None
         if self._is_jlcpcb_usable(item):
-            j_price = select_unit_price(item.jlcpcb_price_breaks_raw, multiplied_qty)
+            j_price = select_unit_price(
+                item.jlcpcb_price_breaks_raw,
+                multiplied_qty,
+                use_quantity_breaks=self.pricing_mode == "project",
+            )
             
-        d_price = select_digikey_price(item.digikey_price_breaks, multiplied_qty)
+        d_price = select_digikey_price(
+            item.digikey_price_breaks,
+            multiplied_qty,
+            use_quantity_breaks=self.pricing_mode == "project",
+        )
 
         j_cost = None
         rem_dk_cost = None
@@ -220,7 +307,7 @@ class BaseExcelWriter:
             j_cost = multiplied_qty * j_price
             combined_cost = j_cost
         elif d_price is not None:
-            selected_source = "Remaining DigiKey"
+            selected_source = "DigiKey fallback"
             selected_price = d_price
             rem_dk_cost = multiplied_qty * d_price
             combined_cost = rem_dk_cost

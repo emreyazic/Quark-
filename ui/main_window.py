@@ -26,6 +26,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QInputDialog,
     QPushButton,
     QSizePolicy,
     QSplitter,
@@ -512,6 +513,7 @@ class MainWindow(QMainWindow):
 
         # ── Header ──────────────────────────────────────────────────
         header = QWidget()
+        header.setObjectName("appHeader")
         header_layout = QHBoxLayout(header)
         header_layout.setContentsMargins(0, 0, 0, 12)
 
@@ -530,10 +532,7 @@ class MainWindow(QMainWindow):
 
         # Version badge
         version_label = QLabel("v1.0")
-        version_label.setStyleSheet(
-            "background: #1a6b8a; color: white; padding: 4px 14px; "
-            "border-radius: 12px; font-size: 11px; font-weight: 600;"
-        )
+        version_label.setObjectName("versionBadge")
         header_layout.addWidget(version_label)
 
         main_layout.addWidget(header)
@@ -541,7 +540,7 @@ class MainWindow(QMainWindow):
         # ── Separator ──────────────────────────────────────────────
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setStyleSheet("background-color: #1e3a5f; max-height: 1px;")
+        sep.setObjectName("headerSeparator")
         main_layout.addWidget(sep)
         main_layout.addSpacing(12)
 
@@ -565,9 +564,7 @@ class MainWindow(QMainWindow):
 
         # ── Footer ──────────────────────────────────────────────────
         footer = QLabel("Supplier data: JLCPCB/LCSC and DigiKey")
-        footer.setStyleSheet(
-            "color: #3a5068; font-size: 10px; padding: 8px 0 0 0; background: transparent;"
-        )
+        footer.setObjectName("footerLabel")
         footer.setAlignment(Qt.AlignmentFlag.AlignCenter)
         main_layout.addWidget(footer)
 
@@ -586,8 +583,9 @@ class MainWindow(QMainWindow):
 
         # Left panel — file manager
         left_panel = QWidget()
+        left_panel.setObjectName("contentPanel")
         left_layout = QVBoxLayout(left_panel)
-        left_layout.setContentsMargins(0, 0, 8, 0)
+        left_layout.setContentsMargins(16, 16, 16, 16)
 
         self._file_manager = FileManagerWidget()
         self._file_manager.files_changed.connect(self._on_files_changed)
@@ -598,8 +596,9 @@ class MainWindow(QMainWindow):
 
         # Right panel — preview
         right_panel = QWidget()
+        right_panel.setObjectName("contentPanel")
         right_layout = QVBoxLayout(right_panel)
-        right_layout.setContentsMargins(8, 0, 0, 0)
+        right_layout.setContentsMargins(16, 16, 16, 16)
 
         preview_title = QLabel("📊  Data Preview")
         preview_title.setObjectName("sectionTitle")
@@ -623,66 +622,77 @@ class MainWindow(QMainWindow):
 
         # ── Action bar ──────────────────────────────────────────
         action_bar = QFrame()
-        action_bar.setStyleSheet(
-            "QFrame { background: #14222f; border: 1px solid #1e3a5f; "
-            "border-radius: 10px; }"
-        )
-        action_layout = QHBoxLayout(action_bar)
-        action_layout.setContentsMargins(16, 12, 16, 12)
-        action_layout.setSpacing(12)
+        action_bar.setObjectName("actionBar")
+        action_layout = QVBoxLayout(action_bar)
+        action_layout.setContentsMargins(16, 14, 16, 14)
+        action_layout.setSpacing(10)
+
+        output_row = QHBoxLayout()
+        output_row.setSpacing(10)
 
         # Output path
         out_label = QLabel("Output:")
-        out_label.setStyleSheet("color: #7ec8e3; font-weight: 600; background: transparent;")
-        action_layout.addWidget(out_label)
+        out_label.setObjectName("fieldLabel")
+        output_row.addWidget(out_label)
 
         self._output_path = QLineEdit()
         self._output_path.setPlaceholderText("Select output Excel file path...")
         self._output_path.setReadOnly(True)
-        action_layout.addWidget(self._output_path, stretch=1)
+        output_row.addWidget(self._output_path, stretch=1)
 
         btn_browse_out = QPushButton("Browse...")
         btn_browse_out.clicked.connect(self._browse_output)
-        action_layout.addWidget(btn_browse_out)
+        output_row.addWidget(btn_browse_out)
+        action_layout.addLayout(output_row)
+
+        tools_row = QHBoxLayout()
+        tools_row.setSpacing(8)
 
         # Column mapping button
         self._btn_map_columns = QPushButton("🗂  Map Columns")
         self._btn_map_columns.setToolTip("Verify or override auto-detected column mappings")
         self._btn_map_columns.clicked.connect(self._open_column_mapper)
         self._btn_map_columns.setEnabled(False)
-        action_layout.addWidget(self._btn_map_columns)
+        tools_row.addWidget(self._btn_map_columns)
 
         # Pending Approvals button
         self._btn_approvals = QPushButton("📋 Pending Approvals")
         self._btn_approvals.setToolTip("Manage pending internal code mappings")
         self._btn_approvals.clicked.connect(self._open_approval_dialog)
-        action_layout.addWidget(self._btn_approvals)
+        tools_row.addWidget(self._btn_approvals)
 
         # Sync JLC Library button
         self._btn_sync_library = QPushButton("🗄 Sync JLC Library")
         self._btn_sync_library.setToolTip("Download JLC component library to local DB for offline MPN→LCSC lookup")
         self._btn_sync_library.clicked.connect(self._sync_jlc_library)
-        action_layout.addWidget(self._btn_sync_library)
+        tools_row.addWidget(self._btn_sync_library)
 
         # Refresh Mappings button
         self._btn_refresh_mappings = QPushButton("🔄 Refresh Mappings")
         self._btn_refresh_mappings.setToolTip("Update only changed LCSC and DigiKey codes; changed mappings return to pending approval")
         self._btn_refresh_mappings.clicked.connect(self._refresh_mappings)
-        action_layout.addWidget(self._btn_refresh_mappings)
+        tools_row.addWidget(self._btn_refresh_mappings)
+        tools_row.addStretch()
+        action_layout.addLayout(tools_row)
+
+        primary_row = QHBoxLayout()
+        primary_row.setSpacing(8)
+        primary_row.addStretch()
 
         # Refresh Data button
         self._btn_refresh = QPushButton("🔄 Refresh Stock & Prices")
         self._btn_refresh.setToolTip("Ignore API cache and fetch latest data from JLCPCB API")
         self._btn_refresh.clicked.connect(lambda: self._start_processing(force_refresh=True))
         self._btn_refresh.setEnabled(False)
-        action_layout.addWidget(self._btn_refresh)
+        primary_row.addWidget(self._btn_refresh)
 
         # Process button
         self._btn_process = QPushButton("🚀  Process BOM")
         self._btn_process.setObjectName("btnProcess")
         self._btn_process.clicked.connect(lambda: self._start_processing(force_refresh=False))
         self._btn_process.setEnabled(False)
-        action_layout.addWidget(self._btn_process)
+        primary_row.addWidget(self._btn_process)
+        action_layout.addLayout(primary_row)
 
         layout.addWidget(action_bar)
 
@@ -751,9 +761,7 @@ class MainWindow(QMainWindow):
 
         # Summary cards
         self._summary_frame = QFrame()
-        self._summary_frame.setStyleSheet(
-            "QFrame { background: #14222f; border: 1px solid #1e3a5f; border-radius: 10px; }"
-        )
+        self._summary_frame.setObjectName("summaryFrame")
         summary_layout = QHBoxLayout(self._summary_frame)
         summary_layout.setContentsMargins(16, 16, 16, 16)
         summary_layout.setSpacing(12)
@@ -811,16 +819,13 @@ class MainWindow(QMainWindow):
 
         # Search bar
         search_bar = QFrame()
-        search_bar.setStyleSheet(
-            "QFrame { background: #14222f; border: 1px solid #1e3a5f; "
-            "border-radius: 10px; }"
-        )
+        search_bar.setObjectName("actionBar")
         search_layout = QHBoxLayout(search_bar)
         search_layout.setContentsMargins(16, 12, 16, 12)
         search_layout.setSpacing(12)
 
         search_label = QLabel("🔎  MPN:")
-        search_label.setStyleSheet("color: #7ec8e3; font-weight: 600; font-size: 14px; background: transparent;")
+        search_label.setObjectName("fieldLabel")
         search_layout.addWidget(search_label)
 
         self._manual_mpn_input = QLineEdit()
@@ -864,8 +869,9 @@ class MainWindow(QMainWindow):
     def _make_stat_card(self, label: str, value: str, color: str) -> QFrame:
         """Create a summary stat card widget."""
         card = QFrame()
+        card.setObjectName("statCard")
         card.setStyleSheet(
-            f"QFrame {{ background: transparent; border: 1px solid {color}; "
+            f"QFrame#statCard {{ background: #111c2e; border: 1px solid {color}; "
             f"border-radius: 8px; padding: 6px; }}"
         )
         card_layout = QVBoxLayout(card)
@@ -882,7 +888,7 @@ class MainWindow(QMainWindow):
 
         name_label = QLabel(label)
         name_label.setStyleSheet(
-            "font-size: 11px; color: #6b8299; font-weight: 500; background: transparent;"
+            "font-size: 11px; color: #a8b3c7; font-weight: 600; background: transparent;"
         )
         name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         card_layout.addWidget(name_label)
@@ -1127,8 +1133,49 @@ class MainWindow(QMainWindow):
         self._project_aggregation_result = None
         self._search_item_component_keys = []
 
-    def _start_processing(self, force_refresh: bool = False):
+    def _prompt_processing_options(self):
+        build_quantity, accepted = QInputDialog.getInt(
+            self,
+            "Production Quantity / Kart Adedi",
+            "How many board sets will be produced?\n"
+            "This multiplies the quantities already defined for each BOM/board.",
+            1,
+            1,
+            1_000_000,
+        )
+        if not accepted:
+            return None
+
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("Pricing Mode / Fiyatlandırma")
+        dialog.setIcon(QMessageBox.Icon.Question)
+        dialog.setText("Which price should be displayed?")
+        dialog.setInformativeText(
+            "Single Unit Price uses the first/base supplier price.\n"
+            "Project Quantity Pricing selects the price tier for the total required quantity "
+            "and also displays the extended total."
+        )
+        unit_button = dialog.addButton("Single Unit Price", QMessageBox.ButtonRole.AcceptRole)
+        project_button = dialog.addButton("Project Quantity Pricing", QMessageBox.ButtonRole.AcceptRole)
+        dialog.addButton(QMessageBox.StandardButton.Cancel)
+        dialog.exec()
+
+        if dialog.clickedButton() == unit_button:
+            return build_quantity, "unit"
+        if dialog.clickedButton() == project_button:
+            return build_quantity, "project"
+        return None
+
+    def _start_processing(self, force_refresh: bool = False, build_quantity: int = None, pricing_mode: str = None):
         """Parse all BOM files, then start JLCPCB search."""
+        if build_quantity is None or pricing_mode is None:
+            options = self._prompt_processing_options()
+            if options is None:
+                return
+            build_quantity, pricing_mode = options
+
+        self._build_quantity = build_quantity
+        self._pricing_mode = pricing_mode
         self._clear_processed_state()
         bom_files = self._file_manager.get_all_bom_files()
 
@@ -1217,6 +1264,7 @@ class MainWindow(QMainWindow):
         for comp in self._workspace_aggregation_result.components:
             search_item = copy.deepcopy(comp.representative_item)
             search_item.quantity = int(comp.total_quantity)
+            search_item.pricing_quantity = int(comp.total_quantity * build_quantity)
             self._all_items.append(search_item)
             self._search_item_component_keys.append(comp.component_key)
 
@@ -1231,7 +1279,14 @@ class MainWindow(QMainWindow):
         self._progress_widget.reset(len(self._all_items))
 
         # Start search worker
-        self._search_worker = SearchWorker(self._all_items, APP_ID, ACCESS_KEY, SECRET_KEY, force_refresh=force_refresh)
+        self._search_worker = SearchWorker(
+            self._all_items,
+            APP_ID,
+            ACCESS_KEY,
+            SECRET_KEY,
+            force_refresh=force_refresh,
+            pricing_mode=pricing_mode,
+        )
         self._search_worker.progress.connect(self._on_search_progress)
         self._search_worker.finished_all.connect(self._on_search_finished)
         self._search_worker.error.connect(self._on_search_error)
@@ -1255,7 +1310,9 @@ class MainWindow(QMainWindow):
                     workspace=self._processed_workspace,
                     aggregation_result=self._workspace_aggregation_result,
                     enriched_items=self._all_items,
-                    component_keys=self._search_item_component_keys
+                    component_keys=self._search_item_component_keys,
+                    build_multipliers=[self._build_quantity],
+                    pricing_mode=self._pricing_mode,
                 )
                 writer.write(output_path)
             elif self._project_aggregation_result and self._search_item_component_keys and self._processed_project:
@@ -1264,11 +1321,17 @@ class MainWindow(QMainWindow):
                     project=self._processed_project,
                     aggregation_result=self._project_aggregation_result,
                     enriched_items=self._all_items,
-                    component_keys=self._search_item_component_keys
+                    component_keys=self._search_item_component_keys,
+                    build_multipliers=[self._build_quantity],
+                    pricing_mode=self._pricing_mode,
                 )
                 writer.write(output_path)
             else:
-                writer = ExcelWriter(self._all_items)
+                writer = ExcelWriter(
+                    self._all_items,
+                    pricing_mode=self._pricing_mode,
+                    build_multipliers=[self._build_quantity],
+                )
                 writer.write(output_path)
             self._progress_widget._log.appendPlainText(
                 f"\n✅  Main Excel saved to: {output_path}"

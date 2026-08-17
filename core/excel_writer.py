@@ -10,8 +10,10 @@ from models.bom_item import BomItem
 class ExcelWriter:
     """Writes enriched BOM data to an Excel file with strict formatting rules."""
 
-    def __init__(self, items: List[BomItem]):
+    def __init__(self, items: List[BomItem], pricing_mode: str = "unit", build_multipliers: List[int] = None):
         self.items = items
+        self.pricing_mode = pricing_mode
+        self.build_multipliers = build_multipliers or [1, 5, 10, 50, 100]
         self.wb = openpyxl.Workbook()
         self.ws = self.wb.active
         self.ws.title = "Enriched BOM"
@@ -41,6 +43,8 @@ class ExcelWriter:
             self.ws.column_dimensions[get_column_letter(headers.index("DigiKey Part Number") + 1)].width = 24
             self.ws.column_dimensions[get_column_letter(headers.index("JLCPCB Unit Price") + 1)].width = 20
             self.ws.column_dimensions[get_column_letter(headers.index("DigiKey Unit Price") + 1)].width = 20
+            self.ws.column_dimensions[get_column_letter(headers.index("JLCPCB Total Price") + 1)].width = 20
+            self.ws.column_dimensions[get_column_letter(headers.index("DigiKey Total Price") + 1)].width = 20
         except ValueError:
             pass
 
@@ -50,6 +54,8 @@ class ExcelWriter:
         digikey_stock_col_idx = headers.index("DigiKey Stock") + 1
         jlcpcb_price_col_idx = headers.index("JLCPCB Unit Price") + 1
         digikey_price_col_idx = headers.index("DigiKey Unit Price") + 1
+        jlcpcb_total_col_idx = headers.index("JLCPCB Total Price") + 1
+        digikey_total_col_idx = headers.index("DigiKey Total Price") + 1
 
         for row_idx, item in enumerate(self.items, 2):
             row_data = item.to_row()
@@ -61,7 +67,7 @@ class ExcelWriter:
                 if col_idx in (quantity_col_idx, jlcpcb_part_col_idx, jlcpcb_stock_col_idx, digikey_stock_col_idx, jlcpcb_price_col_idx, digikey_price_col_idx):
                     cell.alignment = Alignment(horizontal="center")
 
-                if col_idx in (jlcpcb_price_col_idx, digikey_price_col_idx) and isinstance(val, (int, float)):
+                if col_idx in (jlcpcb_price_col_idx, digikey_price_col_idx, jlcpcb_total_col_idx, digikey_total_col_idx) and isinstance(val, (int, float)):
                     cell.number_format = '"$"0.00000'
 
                 # Apply specific coloring ONLY to the JLCPCB Part Number cell
@@ -89,15 +95,20 @@ class ExcelWriter:
                 self.ws.cell(row=row_idx, column=digikey_price_col_idx).fill = self.fill_green
 
         total_row = len(self.items) + 2
-        self.ws.cell(row=total_row, column=jlcpcb_part_col_idx, value="Total Cost")
-        self.ws.cell(row=total_row, column=jlcpcb_part_col_idx).font = header_font
-        for price_col_idx in (jlcpcb_price_col_idx, digikey_price_col_idx):
+        if self.pricing_mode == "project":
+            label_col_idx = headers.index("Pricing Quantity") + 1
+            total_columns = (jlcpcb_total_col_idx, digikey_total_col_idx)
+        else:
+            label_col_idx = jlcpcb_part_col_idx
+            total_columns = (jlcpcb_price_col_idx, digikey_price_col_idx)
+        self.ws.cell(row=total_row, column=label_col_idx, value="Total Cost")
+        self.ws.cell(row=total_row, column=label_col_idx).font = header_font
+        for price_col_idx in total_columns:
             price_col_letter = get_column_letter(price_col_idx)
-            quantity_col_letter = get_column_letter(quantity_col_idx)
             total_cell = self.ws.cell(
                 row=total_row,
                 column=price_col_idx,
-                value=f"=SUMPRODUCT({quantity_col_letter}2:{quantity_col_letter}{total_row - 1},{price_col_letter}2:{price_col_letter}{total_row - 1})",
+                value=f"=SUM({price_col_letter}2:{price_col_letter}{total_row - 1})",
             )
             total_cell.font = header_font
             total_cell.number_format = '"$"0.00000'
@@ -116,25 +127,28 @@ class ExcelWriter:
         ws = self.wb.create_sheet("Supplier Stock")
         headers = [
             "MPN", "Design Item ID", "Supplier", "Supplier Part Number",
-            "Stock", "Unit Price", "Required Stock", "Status",
+            "Stock", "Unit Price", "Pricing Quantity", "Total Price", "Required Stock", "Status",
         ]
         ws.append(headers)
         for cell in ws[1]:
             cell.font = Font(bold=True)
         for item in self.items:
             rows = [
-                ("JLCPCB", item.jlcpcb_part_number, item.available_stock_qty, item.unit_price, item.status),
-                ("DigiKey", item.digikey_part_number, item.digikey_stock_qty, item.digikey_unit_price,
+                ("JLCPCB", item.jlcpcb_part_number, item.available_stock_qty, item.unit_price, item.jlcpcb_total_price, item.status),
+                ("DigiKey", item.digikey_part_number, item.digikey_stock_qty, item.digikey_unit_price, item.digikey_total_price,
                  "Found" if item.digikey_part_number else "Not Found"),
             ]
-            for supplier, part_number, stock, unit_price, status in rows:
+            for supplier, part_number, stock, unit_price, total_price, status in rows:
                 ws.append([
                     item.mpn, item.comment, supplier, part_number or "-",
                     stock if stock is not None else "-", unit_price,
+                    item.pricing_quantity, total_price,
                     item.required_stock, status or "",
                 ])
                 if isinstance(unit_price, (int, float)):
                     ws.cell(row=ws.max_row, column=6).number_format = '"$"#,##0.0000'
+                if isinstance(total_price, (int, float)):
+                    ws.cell(row=ws.max_row, column=8).number_format = '"$"#,##0.0000'
         ws.auto_filter.ref = ws.dimensions
         ws.freeze_panes = "A2"
         for column, width in {"A": 24, "B": 20, "C": 12, "D": 26, "E": 14, "F": 16, "G": 16, "H": 28}.items():
@@ -194,12 +208,12 @@ class ExcelWriter:
         
         # --- Summary Table ---
         sum_headers = [
-            "BOM Quantity", "JLCPCB Total", "Remaining DigiKey Total",
-            "Combined Total", "All-DigiKey Total", "Missing Price Count"
+            "BOM Quantity", "JLCPCB Total", "DigiKey Fallback Total",
+            "Mixed Sourcing Total", "All-DigiKey Total", "Missing Price Count"
         ]
         ws.append(sum_headers)
         
-        multipliers = [1, 5, 10, 50, 100]
+        multipliers = self.build_multipliers
         summary_rows = {}
         for m in multipliers:
             summary_rows[m] = {
@@ -222,10 +236,10 @@ class ExcelWriter:
                 
                 # Fetch JLC and DK prices
                 j_price = None
-                if item.jlcpcb_part_number and not item.skip_jlcpcb and "error" not in item.status.lower() and "not found" not in item.status.lower() and "insufficient" not in item.status.lower() and "mismatch" not in item.status.lower():
-                    j_price = select_unit_price(item.jlcpcb_price_breaks_raw, scaled_qty)
+                if item.jlcpcb_part_number and "error" not in item.status.lower() and "not found" not in item.status.lower() and "mismatch" not in item.status.lower():
+                    j_price = select_unit_price(item.jlcpcb_price_breaks_raw, scaled_qty, use_quantity_breaks=self.pricing_mode == "project")
                     
-                d_price = select_digikey_price(item.digikey_price_breaks, scaled_qty)
+                d_price = select_digikey_price(item.digikey_price_breaks, scaled_qty, use_quantity_breaks=self.pricing_mode == "project")
                 
                 used_source = "Missing price"
                 line_total = None

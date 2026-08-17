@@ -181,13 +181,18 @@ def is_manufacturer_like(value: str) -> bool:
     return False
 
 
-def select_unit_price(price_json_str: str, quantity: int) -> Optional[float]:
-    """Return the first/base JLCPCB unit price, independent of quantity.
+def select_unit_price(
+    price_json_str: str,
+    quantity: int,
+    use_quantity_breaks: bool = False,
+) -> Optional[float]:
+    """Return the base or quantity-tier JLCPCB unit price.
 
     Args:
         price_json_str: JSON string of price breaks from JLCPCB API,
             e.g. '[{"qFrom": 20, "qTo": 180, "price": 0.022}, ...]'
-        quantity: Retained for API compatibility; it does not change the price.
+        quantity: Quantity used when ``use_quantity_breaks`` is enabled.
+        use_quantity_breaks: Select the best applicable quantity tier when true.
 
     Returns:
         The first advertised unit price, or None if unavailable.
@@ -201,22 +206,43 @@ def select_unit_price(price_json_str: str, quantity: int) -> Optional[float]:
         if not isinstance(breaks, list) or not breaks:
             return None
 
+        valid_breaks = []
         for pb in breaks:
             price = pb.get("price")
             if price is not None:
-                return round(float(price), 6)
+                valid_breaks.append((int(pb.get("qFrom") or 0), float(price)))
+
+        if not valid_breaks:
+            return None
+
+        valid_breaks.sort(key=lambda tier: tier[0])
+        if not use_quantity_breaks:
+            return round(valid_breaks[0][1], 6)
+
+        selected = valid_breaks[0][1]
+        for minimum_quantity, price in valid_breaks:
+            if quantity >= minimum_quantity:
+                selected = price
+            else:
+                break
+        return round(selected, 6)
 
     except (json.JSONDecodeError, TypeError, KeyError, ValueError):
         pass
 
     return None
 
-def select_digikey_price(price_breaks: list[tuple[int, float]], quantity: int) -> Optional[float]:
-    """Return the first/base DigiKey unit price, independent of quantity.
+def select_digikey_price(
+    price_breaks: list[tuple[int, float]],
+    quantity: int,
+    use_quantity_breaks: bool = False,
+) -> Optional[float]:
+    """Return the base or quantity-tier DigiKey unit price.
 
     Args:
         price_breaks: List of (BreakQuantity, UnitPrice) tuples, sorted by BreakQuantity ascending.
-        quantity: Retained for API compatibility; it does not change the price.
+        quantity: Quantity used when ``use_quantity_breaks`` is enabled.
+        use_quantity_breaks: Select the best applicable quantity tier when true.
 
     Returns:
         The unit price, or None if unavailable.
@@ -224,4 +250,14 @@ def select_digikey_price(price_breaks: list[tuple[int, float]], quantity: int) -
     if not price_breaks:
         return None
 
-    return price_breaks[0][1]
+    ordered = sorted(price_breaks, key=lambda tier: tier[0])
+    if not use_quantity_breaks:
+        return ordered[0][1]
+
+    selected = ordered[0][1]
+    for minimum_quantity, price in ordered:
+        if quantity >= minimum_quantity:
+            selected = price
+        else:
+            break
+    return selected
