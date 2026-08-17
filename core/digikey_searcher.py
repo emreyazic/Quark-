@@ -368,6 +368,7 @@ class DigiKeySearcher:
 def enrich_bom_item_digikey(item, search_result: DigiKeySearchResult) -> None:
     """Enrich the BOM item with DigiKey pricing data."""
     if search_result.error:
+        item.digikey_part_number = ""
         if "429" in search_result.error:
             if item.status:
                 item.status += " (DigiKey Rate Limited)"
@@ -376,9 +377,11 @@ def enrich_bom_item_digikey(item, search_result: DigiKeySearchResult) -> None:
         return
 
     if not search_result.configured:
+        item.digikey_part_number = ""
         return
 
     if not search_result.found and not search_result.exact_match:
+        item.digikey_part_number = ""
         return
 
     # Extract price info if available

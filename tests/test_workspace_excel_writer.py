@@ -260,7 +260,7 @@ def test_named_board_sheet_contains_its_own_supplier_prices(tmp_path):
         agg,
         [enriched],
         [component.component_key],
-        build_multipliers=[1],
+        build_multipliers=[5],
     ).write(str(output_path))
 
     workbook = openpyxl.load_workbook(output_path, data_only=False)
@@ -268,11 +268,51 @@ def test_named_board_sheet_contains_its_own_supplier_prices(tmp_path):
     headers = [cell.value for cell in sheet[7]]
     row = [cell.value for cell in sheet[8]]
 
-    assert row[headers.index("Board Required Quantity")] == 6
+    assert sheet["B4"].value == 10
+    assert row[headers.index("Board Required Quantity")] == 30
     assert row[headers.index("JLCPCB Unit Price")] == 2.0
     assert row[headers.index("DigiKey Unit Price")] == 2.5
-    assert row[headers.index("JLCPCB Total Price")] == 12.0
-    assert row[headers.index("DigiKey Total Price")] == 15.0
+    assert row[headers.index("JLCPCB Total Price")] == 60.0
+    assert row[headers.index("DigiKey Total Price")] == 75.0
+    assert row[headers.index("Selected Supplier")] == "JLCPCB"
+    assert row[headers.index("Mixed Sourcing Total Price")] == 60.0
+
+    total_row = 10
+    per_board_set_row = 11
+    mixed_total_col = headers.index("Mixed Sourcing Total Price") + 1
+    assert sheet.cell(total_row, mixed_total_col).value == f"=SUM(T8:T8)"
+    assert sheet.cell(per_board_set_row, mixed_total_col).value == f"=T10/5"
+    assert sheet["D1"].value == "Card Production Cost (Mixed Sourcing):"
+    assert sheet["E1"].value == "=SUM(T8:T8)"
+    assert sheet["D2"].value == "Cost Per Card:"
+    assert sheet["E2"].value == "=E1/10"
+
+
+def test_board_production_quantity_is_build_quantity_when_bom_file_quantity_is_one(tmp_path):
+    workspace = Workspace("Single Board")
+    project = Project("Device")
+    board = ProjectItem("boards/main.xlsx", "PBA_SAR_CB", 1)
+    board.bom_items = [BomItem(board_name="PBA_SAR_CB", mpn="PART", quantity=1)]
+    project.add_board(board)
+    workspace.add_project(project)
+
+    agg = aggregate_workspace(workspace)
+    component = agg.components[0]
+    output_path = tmp_path / "single-board.xlsx"
+    WorkspaceExcelWriter(
+        workspace,
+        agg,
+        [BomItem(mpn="PART")],
+        [component.component_key],
+        build_multipliers=[5],
+    ).write(str(output_path))
+
+    workbook = openpyxl.load_workbook(output_path, data_only=False)
+    sheet = workbook["PBA_SAR_CB"]
+    headers = [cell.value for cell in sheet[7]]
+    row = [cell.value for cell in sheet[8]]
+    assert sheet["B4"].value == 5
+    assert row[headers.index("Board Required Quantity")] == 5
 
 
 
@@ -309,6 +349,17 @@ def test_pricing_fallback_and_unpriced(tmp_path):
     
     wb = openpyxl.load_workbook(out_path)
     ws = wb["All Aggregated"]
+
+    board_ws = wb["B"]
+    assert board_ws["E3"].value == 1
+    assert board_ws["E4"].value == "INCOMPLETE"
+
+    project_ws = wb["Project Summary - P1"]
+    project_cost_row = next(
+        row for row in project_ws.iter_rows(values_only=True) if row[0] == "1x"
+    )
+    assert project_cost_row[5] == 1
+    assert project_cost_row[6] == "INCOMPLETE"
     
     # Headers
     headers = [cell.value for cell in ws[1]]

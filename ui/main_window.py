@@ -493,6 +493,10 @@ class MainWindow(QMainWindow):
         self._processed_project = None
         self._processed_workspace = None
         self._workspace_aggregation_result = None
+        self._input_revision = 0
+        self._processed_input_revision = None
+        self._build_quantity = 1
+        self._pricing_mode = "unit"
 
         self.setWindowTitle("Workspace BOM Aggregation Tool")
         # Keep the application usable on smaller screens; wide tables can
@@ -682,7 +686,7 @@ class MainWindow(QMainWindow):
         # Refresh Data button
         self._btn_refresh = QPushButton("🔄 Refresh Stock & Prices")
         self._btn_refresh.setToolTip("Ignore API cache and fetch latest data from JLCPCB API")
-        self._btn_refresh.clicked.connect(lambda: self._start_processing(force_refresh=True))
+        self._btn_refresh.clicked.connect(self._refresh_stock_prices)
         self._btn_refresh.setEnabled(False)
         primary_row.addWidget(self._btn_refresh)
 
@@ -901,10 +905,15 @@ class MainWindow(QMainWindow):
 
     def _on_files_changed(self):
         """Called when files are added or removed."""
+        # File membership and board quantities are inputs to aggregation and
+        # pricing.  Any change invalidates the last processed snapshot; stock
+        # refresh must not reuse its component list or quantities.
+        self._input_revision += 1
+        self._clear_processed_state()
         has_files = self._file_manager.has_files()
         self._btn_map_columns.setEnabled(has_files)
         self._btn_process.setEnabled(has_files)
-        self._btn_refresh.setEnabled(has_files)
+        self._btn_refresh.setEnabled(False)
         bom_files = self._file_manager.get_bom_files()
         if bom_files:
             self._show_preview(bom_files[0])
@@ -973,7 +982,18 @@ class MainWindow(QMainWindow):
             and bool(self._output_path.text())
         )
         self._btn_process.setEnabled(ready)
-        self._btn_refresh.setEnabled(ready)
+        self._btn_refresh.setEnabled(ready and self._has_processed_bom())
+
+    def _has_processed_bom(self) -> bool:
+        return bool(
+            self._all_items
+            and self._search_item_component_keys
+            and self._processed_input_revision == self._input_revision
+            and (
+                self._processed_workspace is not None
+                or self._processed_project is not None
+            )
+        )
 
     def _open_column_mapper(self):
         """Open column mapping dialogs for all loaded files."""
@@ -1127,11 +1147,13 @@ class MainWindow(QMainWindow):
 
     def _clear_processed_state(self):
         """Clear state from previous processing runs."""
+        self._all_items = []
         self._processed_workspace = None
         self._workspace_aggregation_result = None
         self._processed_project = None
         self._project_aggregation_result = None
         self._search_item_component_keys = []
+        self._processed_input_revision = None
 
     def _prompt_processing_options(self):
         build_quantity, accepted = QInputDialog.getInt(
@@ -1272,20 +1294,43 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "No Data", "No valid BOM items found to process.")
             return
 
-        # Switch to progress page
+        self._processed_input_revision = self._input_revision
+        self._start_search_worker(force_refresh=force_refresh)
+
+    def _refresh_stock_prices(self):
+        """Refresh supplier data for the last processed BOM without reprocessing inputs."""
+        if self._search_worker and self._search_worker.isRunning():
+            QMessageBox.information(
+                self,
+                "Search In Progress",
+                "Please wait for the current supplier search to finish.",
+            )
+            return
+
+        if not self._has_processed_bom():
+            QMessageBox.information(
+                self,
+                "Process BOM First",
+                "Process the BOM once before refreshing stock and prices.",
+            )
+            return
+
+        self._start_search_worker(force_refresh=True)
+
+    def _start_search_worker(self, force_refresh: bool):
+        """Run supplier enrichment for the already prepared component list."""
         self._stack.setCurrentIndex(1)
         self._btn_back_setup.setVisible(False)
         self._btn_view_results.setVisible(False)
         self._progress_widget.reset(len(self._all_items))
 
-        # Start search worker
         self._search_worker = SearchWorker(
             self._all_items,
             APP_ID,
             ACCESS_KEY,
             SECRET_KEY,
             force_refresh=force_refresh,
-            pricing_mode=pricing_mode,
+            pricing_mode=self._pricing_mode,
         )
         self._search_worker.progress.connect(self._on_search_progress)
         self._search_worker.finished_all.connect(self._on_search_finished)
@@ -1296,7 +1341,19 @@ class MainWindow(QMainWindow):
         self._progress_widget.update_progress(current, total, mpn, status)
 
     def _on_search_finished(self, items: list[BomItem]):
+        if self._processed_input_revision != self._input_revision:
+            self._progress_widget.set_cancelled()
+            self._progress_widget._log.appendPlainText(
+                "\n⚠️  BOM files or board quantities changed during processing. "
+                "The outdated results were discarded; run Process BOM again."
+            )
+            self._btn_back_setup.setVisible(True)
+            self._btn_view_results.setVisible(False)
+            self._validate_ready()
+            return
+
         self._all_items = items
+        self._btn_refresh.setEnabled(self._has_processed_bom())
         self._progress_widget.set_finished(True)
         self._btn_back_setup.setVisible(True)
         self._btn_view_results.setVisible(True)

@@ -581,10 +581,8 @@ def enrich_bom_item(item: BomItem, search_result: JlcpcbSearchResult) -> None:
     item.source = "JLCPCB"
     required = item.required_stock
 
-    if item.skip_jlcpcb:
-        return
-
     if search_result.error:
+        item.jlcpcb_part_number = ""
         if search_result.error == "Missing MPN":
             item.status = "Missing MPN"
         else:
@@ -592,6 +590,7 @@ def enrich_bom_item(item: BomItem, search_result: JlcpcbSearchResult) -> None:
         return
 
     if not search_result.found and not search_result.exact_match:
+        item.jlcpcb_part_number = ""
         if search_result.match_count > 0:
             item.status = "No exact JLCPCB match"
             item.matched_mpn = ""
@@ -665,6 +664,19 @@ class SearchWorker(QThread):
                 mpn_display = item.mpn if item.mpn else "(empty)"
                 self.progress.emit(idx + 1, total, mpn_display, "Searching JLCPCB...")
 
+                # Refresh live supplier observations from a clean state. Part
+                # numbers approved by the user are restored after the lookup,
+                # but stale stock/prices must never survive a failed refresh.
+                item.available_stock_qty = None
+                item.unit_price = None
+                item.jlcpcb_price_breaks_raw = ""
+                item.jlcpcb_total_price = None
+                item.digikey_stock_qty = None
+                item.digikey_unit_price = None
+                item.digikey_price_breaks = []
+                item.digikey_total_price = None
+                item.skip_jlcpcb = False
+
                 item.required_stock = compute_required_stock(item.quantity)
 
                 is_unapproved = False
@@ -674,6 +686,7 @@ class SearchWorker(QThread):
                 suggested_mpn = item.mpn or ""
                 suggested_lcsc = ""
                 suggested_digikey = ""
+                approved_lcsc_code = ""
                 approved_digikey_code = ""
                 
                 if is_res_coded(item.comment):
@@ -686,6 +699,7 @@ class SearchWorker(QThread):
                         item.mpn = mapping.get("mpn", "")
                         lcsc_code = mapping.get("lcsc_code", "")
                         item.digikey_part_number = mapping.get("digikey_code", "")
+                        approved_lcsc_code = lcsc_code.strip()
                         approved_digikey_code = item.digikey_part_number
                         # An approval may intentionally contain only an MPN or
                         # DigiKey code. Do not call the LCSC detail API with an
@@ -695,6 +709,7 @@ class SearchWorker(QThread):
                         if lcsc_code.strip():
                             result = searcher.search_lcsc(lcsc_code, item.mpn, item.required_stock, refresh=self.force_refresh)
                             enrich_bom_item(item, result)
+                            item.jlcpcb_part_number = approved_lcsc_code
                             item.skip_jlcpcb = True
                     else:
                         is_unapproved = True
@@ -778,6 +793,9 @@ class SearchWorker(QThread):
                 self.item_result.emit(idx, item)
                 self.progress.emit(idx + 1, total, mpn_display, item.status)
 
+            # During the test phase, keep exporting the partial results after
+            # cancellation so they can be inspected.  Before the final release
+            # this should be changed back to suppress successful completion.
             self.finished_all.emit(self.items)
 
         except Exception as e:

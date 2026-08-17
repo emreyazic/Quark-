@@ -124,7 +124,8 @@ class ProjectExcelWriter(BaseExcelWriter):
         
         ws.append([
             "Build Qty", "JLCPCB Cost", "DigiKey Fallback Cost",
-            "Mixed Sourcing Total", "DigiKey-Only Total"
+            "Mixed Sourcing Total", "DigiKey-Only Total",
+            "Missing Price Count", "Cost Status",
         ])
         for cell in ws[ws.max_row]:
             cell.font = self.header_font
@@ -136,6 +137,7 @@ class ProjectExcelWriter(BaseExcelWriter):
             tot_rem_dk = 0.0
             tot_comb = 0.0
             tot_dk_only = 0.0
+            missing_price_count = 0
             
             for comp_key, comp in self.component_by_key.items():
                 mult_qty = comp.total_quantity * m
@@ -144,12 +146,21 @@ class ProjectExcelWriter(BaseExcelWriter):
                 if pricing["jlcpcb_cost"] is not None: tot_jlc += pricing["jlcpcb_cost"]
                 if pricing["remaining_digikey_cost"] is not None: tot_rem_dk += pricing["remaining_digikey_cost"]
                 if pricing["combined_cost"] is not None: tot_comb += pricing["combined_cost"]
+                else: missing_price_count += 1
                 if pricing["digikey_only_cost"] is not None: tot_dk_only += pricing["digikey_only_cost"]
 
-            row = [f"{m}x", tot_jlc, tot_rem_dk, tot_comb, tot_dk_only]
+            cost_status = "COMPLETE" if missing_price_count == 0 else "INCOMPLETE"
+            row = [
+                f"{m}x", tot_jlc, tot_rem_dk, tot_comb, tot_dk_only,
+                missing_price_count, cost_status,
+            ]
             ws.append(row)
             for c_idx in range(2, 6):
                 self._format_currency(ws.cell(row=ws.max_row, column=c_idx))
+            for c_idx in (6, 7):
+                ws.cell(row=ws.max_row, column=c_idx).fill = (
+                    self.fill_green if missing_price_count == 0 else self.fill_red
+                )
 
         ws.append([])
 
@@ -234,8 +245,18 @@ class ProjectExcelWriter(BaseExcelWriter):
                 cell.fill = fill
 
         data_end_row = ws.max_row
+        missing_price_count = sum(
+            1
+            for enriched in self.enriched_by_key.values()
+            if self._selected_supplier_price(
+                enriched,
+                self._component_price_values(enriched)[1],
+                self._component_price_values(enriched)[2],
+            )[1] is None
+        )
         self._add_price_totals_box(
-            ws, 1, data_start_row, data_end_row, self.build_multipliers[0]
+            ws, 1, data_start_row, data_end_row, self.build_multipliers[0],
+            missing_price_count=missing_price_count,
         )
         ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{data_end_row}"
         ws.freeze_panes = "A2"
@@ -272,7 +293,8 @@ class ProjectExcelWriter(BaseExcelWriter):
             headers = [
                 "Board Name", "Description", "Designator", "Quantity (Per Board / Total)", 
                 "Value", "Manufacturer", "MPN", "Design Item ID", "JLCPCB Part Number", "DigiKey Part Number", "JLCPCB Stock", "DigiKey Stock",
-                "JLCPCB Unit Price", "DigiKey Unit Price", "Pricing Quantity", "JLCPCB Total Price", "DigiKey Total Price", "Status"
+                "JLCPCB Unit Price", "DigiKey Unit Price", "Pricing Quantity", "JLCPCB Total Price", "DigiKey Total Price",
+                "Selected Supplier", "Mixed Sourcing Total Price", "Status"
             ]
             ws.append(headers)
             header_row = ws.max_row
@@ -282,6 +304,7 @@ class ProjectExcelWriter(BaseExcelWriter):
                 
             # We must map usages to this specific board.
             # A board's component is found in the AggregatedComponent.usages.
+            missing_price_count = 0
             for comp_key, comp in self.component_by_key.items():
                 enriched = self.enriched_by_key[comp_key]
                 
@@ -291,6 +314,12 @@ class ProjectExcelWriter(BaseExcelWriter):
                     continue
                 display_quantity = sum(u.total_quantity for u in board_usages) * self.build_multipliers[0]
                 pricing_quantity, j_price, d_price, j_total, d_total = self._component_price_values(enriched, display_quantity)
+                selected_source, selected_price = self._selected_supplier_price(
+                    enriched, j_price, d_price
+                )
+                mixed_total = display_quantity * selected_price if selected_price is not None else None
+                if selected_price is None:
+                    missing_price_count += 1
 
                 for usage_index, usage in enumerate(board_usages):
                     row = [
@@ -311,6 +340,8 @@ class ProjectExcelWriter(BaseExcelWriter):
                         pricing_quantity,
                         j_total if usage_index == 0 else None,
                         d_total if usage_index == 0 else None,
+                        selected_source if usage_index == 0 else None,
+                        mixed_total if usage_index == 0 else None,
                         enriched.status
                     ]
                     ws.append(row)
@@ -320,7 +351,9 @@ class ProjectExcelWriter(BaseExcelWriter):
                     for total_col in (16, 17):
                         if isinstance(ws.cell(row=ws.max_row, column=total_col).value, (int, float)):
                             self._format_currency(ws.cell(row=ws.max_row, column=total_col))
-                    cell = ws.cell(row=ws.max_row, column=18)
+                    if isinstance(ws.cell(row=ws.max_row, column=19).value, (int, float)):
+                        self._format_currency(ws.cell(row=ws.max_row, column=19))
+                    cell = ws.cell(row=ws.max_row, column=20)
                     fill = self._get_status_fill(enriched.status, bool(enriched.jlcpcb_part_number))
                     if fill:
                         cell.fill = fill
@@ -334,6 +367,15 @@ class ProjectExcelWriter(BaseExcelWriter):
                 data_end_row,
                 self.build_multipliers[0],
                 total_label="Board Total",
+                missing_price_count=missing_price_count,
+            )
+            self._add_board_cost_summary(
+                ws,
+                header_row,
+                data_start_row,
+                data_end_row,
+                board.board_quantity * self.build_multipliers[0],
+                missing_price_count=missing_price_count,
             )
             ws.auto_filter.ref = f"A{header_row}:{get_column_letter(len(headers))}{data_end_row}"
             ws.freeze_panes = f"A{header_row + 1}"

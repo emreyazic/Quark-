@@ -80,9 +80,17 @@ def test_master_summary_totals_and_unpriced(tmp_path):
             assert dk_cost == 3.0
             assert comb == 4.0
             assert dk_only == 3.0
+            assert row[5] == 1
+            assert row[6] == "INCOMPLETE"
             found_totals = True
             
     assert found_totals
+
+    board_ws = wb["Board A"]
+    assert board_ws["D3"].value == "Missing Price Count:"
+    assert board_ws["E3"].value == 1
+    assert board_ws["D4"].value == "Cost Status:"
+    assert board_ws["E4"].value == "INCOMPLETE"
 
 def test_unpriced_in_aggregated_components_sheet(tmp_path):
     project = Project("Test")

@@ -1,6 +1,6 @@
 import re
 import openpyxl
-from typing import Dict, Any, Union
+from typing import Dict, Any, Optional, Union
 from openpyxl.styles import PatternFill, Font, Alignment
 from openpyxl.utils import get_column_letter
 
@@ -129,6 +129,14 @@ class BaseExcelWriter:
             pricing_quantity * d_price if d_price is not None else None,
         )
 
+    def _selected_supplier_price(self, item: BomItem, j_price, d_price):
+        """Choose the price used by the mixed-sourcing cost calculation."""
+        if self._is_jlcpcb_usable(item) and j_price is not None:
+            return "JLCPCB", j_price
+        if d_price is not None:
+            return "DigiKey fallback", d_price
+        return "Unpriced", None
+
     def _add_price_totals_box(
         self,
         ws,
@@ -137,8 +145,9 @@ class BaseExcelWriter:
         data_end_row: int,
         build_quantity: int,
         total_label: str = "Project Total",
+        missing_price_count: Optional[int] = None,
     ) -> None:
-        """Add supplier totals and per-produced-board-set costs below a detail table."""
+        """Add totals plus an explicit warning when one or more costs are unknown."""
         if data_end_row < data_start_row:
             return
 
@@ -165,7 +174,11 @@ class BaseExcelWriter:
             ws.cell(row=row, column=label_col).font = self.header_font
             ws.cell(row=row, column=label_col).fill = self.fill_yellow
 
-        for total_col in (jlc_total_col, digikey_total_col):
+        total_columns = [jlc_total_col, digikey_total_col]
+        if "Mixed Sourcing Total Price" in headers:
+            total_columns.append(headers.index("Mixed Sourcing Total Price") + 1)
+
+        for total_col in total_columns:
             col_letter = get_column_letter(total_col)
             total_cell = ws.cell(
                 row=total_row,
@@ -181,6 +194,64 @@ class BaseExcelWriter:
                 cell.font = self.header_font
                 cell.fill = self.fill_yellow
                 self._format_currency(cell)
+
+        if missing_price_count is not None:
+            missing_price_count = max(int(missing_price_count), 0)
+            missing_row = per_board_row + 1
+            status_row = missing_row + 1
+            ws.cell(row=missing_row, column=label_col, value="Missing Price Count")
+            ws.cell(row=missing_row, column=jlc_total_col, value=missing_price_count)
+            ws.cell(row=status_row, column=label_col, value="Cost Status")
+            ws.cell(
+                row=status_row,
+                column=jlc_total_col,
+                value="COMPLETE" if missing_price_count == 0 else "INCOMPLETE",
+            )
+            warning_fill = self.fill_green if missing_price_count == 0 else self.fill_red
+            for row in (missing_row, status_row):
+                for col in (label_col, jlc_total_col):
+                    cell = ws.cell(row=row, column=col)
+                    cell.font = self.header_font
+                    cell.fill = warning_fill
+
+    def _add_board_cost_summary(
+        self,
+        ws,
+        header_row: int,
+        data_start_row: int,
+        data_end_row: int,
+        build_quantity: int,
+        missing_price_count: int = 0,
+    ) -> None:
+        """Place the mixed-sourcing card cost prominently at the top of a board sheet."""
+        if data_end_row < data_start_row:
+            return
+
+        headers = [str(cell.value or "") for cell in ws[header_row]]
+        if "Mixed Sourcing Total Price" not in headers:
+            return
+
+        mixed_col = headers.index("Mixed Sourcing Total Price") + 1
+        mixed_letter = get_column_letter(mixed_col)
+        build_quantity = max(int(build_quantity or 1), 1)
+
+        ws["D1"] = "Card Production Cost (Mixed Sourcing):"
+        ws["E1"] = f"=SUM({mixed_letter}{data_start_row}:{mixed_letter}{data_end_row})"
+        ws["D2"] = "Cost Per Card:"
+        ws["E2"] = f"=E1/{build_quantity}"
+        ws["D3"] = "Missing Price Count:"
+        ws["E3"] = max(int(missing_price_count), 0)
+        ws["D4"] = "Cost Status:"
+        ws["E4"] = "COMPLETE" if missing_price_count == 0 else "INCOMPLETE"
+        for cell_ref in ("D1", "E1", "D2", "E2"):
+            ws[cell_ref].font = self.header_font
+            ws[cell_ref].fill = self.fill_yellow
+        warning_fill = self.fill_green if missing_price_count == 0 else self.fill_red
+        for cell_ref in ("D3", "E3", "D4", "E4"):
+            ws[cell_ref].font = self.header_font
+            ws[cell_ref].fill = warning_fill
+        self._format_currency(ws["E1"])
+        self._format_currency(ws["E2"])
 
     def _add_supplier_stock_sheet(self, items: list[BomItem]) -> None:
         """Write one JLCPCB row and one DigiKey row per component."""

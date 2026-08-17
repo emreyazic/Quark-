@@ -1,4 +1,9 @@
-from core.digikey_searcher import DigiKeySearcher
+from core.digikey_searcher import (
+    DigiKeySearcher,
+    DigiKeySearchResult,
+    enrich_bom_item_digikey,
+)
+from models.bom_item import BomItem
 
 
 class _Response:
@@ -68,3 +73,26 @@ def test_digikey_prefers_cut_tape_before_other_moq_one_variations():
     ]
 
     assert DigiKeySearcher._select_variation(variations)["DigiKeyProductNumber"] == "CT"
+
+
+def test_failed_digikey_refresh_clears_stale_supplier_code_and_values():
+    item = BomItem(
+        mpn="MPN1",
+        digikey_part_number="OLD-DK",
+        digikey_stock_qty=500,
+        digikey_unit_price=2.0,
+        digikey_price_breaks=[(1, 2.0)],
+    )
+    item.digikey_stock_qty = None
+    item.digikey_unit_price = None
+    item.digikey_price_breaks = []
+    result = DigiKeySearchResult()
+    result.configured = True
+    result.error = "temporary API failure"
+
+    enrich_bom_item_digikey(item, result)
+
+    assert item.digikey_part_number == ""
+    assert item.digikey_stock_qty is None
+    assert item.digikey_unit_price is None
+    assert item.digikey_price_breaks == []

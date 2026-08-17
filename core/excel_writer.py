@@ -113,6 +113,22 @@ class ExcelWriter:
             total_cell.font = header_font
             total_cell.number_format = '"$"0.00000'
 
+        missing_price_count = sum(1 for item in self.items if self._is_price_missing(item))
+        warning_col_idx = total_columns[0]
+        self.ws.cell(row=total_row + 1, column=label_col_idx, value="Missing Price Count")
+        self.ws.cell(row=total_row + 1, column=warning_col_idx, value=missing_price_count)
+        self.ws.cell(row=total_row + 2, column=label_col_idx, value="Cost Status")
+        self.ws.cell(
+            row=total_row + 2,
+            column=warning_col_idx,
+            value="COMPLETE" if missing_price_count == 0 else "INCOMPLETE",
+        )
+        warning_fill = self.fill_green if missing_price_count == 0 else self.fill_red
+        for row_idx in (total_row + 1, total_row + 2):
+            for col_idx in (label_col_idx, warning_col_idx):
+                self.ws.cell(row=row_idx, column=col_idx).font = header_font
+                self.ws.cell(row=row_idx, column=col_idx).fill = warning_fill
+
         # Enable AutoFilter for the header row
         self.ws.auto_filter.ref = self.ws.dimensions
         # Freeze the top header row
@@ -122,6 +138,19 @@ class ExcelWriter:
         self._add_cost_sheets()
         self._add_supplier_stock_sheet()
         self.wb.save(output_path)
+
+    @staticmethod
+    def _is_price_missing(item: BomItem) -> bool:
+        status_lower = str(item.status or "").lower()
+        jlc_usable = (
+            bool(item.jlcpcb_part_number)
+            and item.unit_price is not None
+            and not any(
+                marker in status_lower
+                for marker in ("not found", "no exact", "error")
+            )
+        )
+        return not jlc_usable and item.digikey_unit_price is None
 
     def _add_supplier_stock_sheet(self):
         ws = self.wb.create_sheet("Supplier Stock")
@@ -171,6 +200,14 @@ class ExcelWriter:
         ws_sum.append(["Valid (Green)", valid])
         ws_sum.append(["Manual Review (Yellow)", yellow])
         ws_sum.append(["API Errors (Red)", red])
+        missing_price_count = sum(1 for item in self.items if self._is_price_missing(item))
+        ws_sum.append(["Missing Price Count", missing_price_count])
+        ws_sum.append([
+            "Cost Status",
+            "COMPLETE" if missing_price_count == 0 else "INCOMPLETE",
+        ])
+        for cell in ws_sum[ws_sum.max_row]:
+            cell.fill = self.fill_green if missing_price_count == 0 else self.fill_red
 
         ws_sum.column_dimensions["A"].width = 30
         ws_sum.column_dimensions["B"].width = 15
@@ -209,7 +246,8 @@ class ExcelWriter:
         # --- Summary Table ---
         sum_headers = [
             "BOM Quantity", "JLCPCB Total", "DigiKey Fallback Total",
-            "Mixed Sourcing Total", "All-DigiKey Total", "Missing Price Count"
+            "Mixed Sourcing Total", "All-DigiKey Total", "Missing Price Count",
+            "Cost Status",
         ]
         ws.append(sum_headers)
         
@@ -274,11 +312,16 @@ class ExcelWriter:
             all_dk_t = summary_rows[m]["all_dk_total"]
             miss_c = summary_rows[m]["missing_count"]
             
-            row_vals = [f"{m}x", jlc_t, rem_dk_t, comb_t, all_dk_t, miss_c]
+            row_vals = [
+                f"{m}x", jlc_t, rem_dk_t, comb_t, all_dk_t, miss_c,
+                "COMPLETE" if miss_c == 0 else "INCOMPLETE",
+            ]
             for c_idx, val in enumerate(row_vals, 1):
                 cell = ws.cell(row=idx, column=c_idx, value=val)
                 if c_idx in (2, 3, 4, 5):
                     cell.number_format = "#,##0.0000"
+                if c_idx in (6, 7):
+                    cell.fill = self.fill_green if miss_c == 0 else self.fill_red
                     
         # --- Detailed Table ---
         det_start_row = len(multipliers) + 3

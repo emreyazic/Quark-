@@ -1,6 +1,7 @@
 import json
 
-from core.jlcpcb_searcher import JlcpcbSearcher
+from core.jlcpcb_searcher import JlcpcbSearcher, JlcpcbSearchResult, enrich_bom_item
+from models.bom_item import BomItem
 
 
 class _Response:
@@ -86,3 +87,49 @@ def test_jop_price_ranges_are_normalized_when_page_is_unavailable(monkeypatch):
     assert result.stock == 100
     assert result.unit_price == 1.0
     assert result.data_source == "JLCPCB_OPENAPI_V2"
+
+
+def test_enrichment_updates_an_approved_item_even_when_skip_flag_is_set():
+    item = BomItem(
+        mpn="MPN1",
+        jlcpcb_part_number="C1",
+        available_stock_qty=10,
+        unit_price=9.0,
+        skip_jlcpcb=True,
+    )
+    result = JlcpcbSearchResult()
+    result.found = True
+    result.exact_match = True
+    result.lcsc_code = "C1"
+    result.matched_mpn = "MPN1"
+    result.stock = 250
+    result.unit_price = 1.25
+    result.price_breaks_raw = '[{"qFrom": 1, "price": 1.25}]'
+
+    enrich_bom_item(item, result)
+
+    assert item.available_stock_qty == 250
+    assert item.unit_price == 1.25
+    assert item.jlcpcb_part_number == "C1"
+
+
+def test_failed_refresh_does_not_leave_old_jlcpcb_values_visible():
+    item = BomItem(
+        mpn="MPN1",
+        jlcpcb_part_number="C-OLD",
+        available_stock_qty=999,
+        unit_price=3.0,
+        jlcpcb_price_breaks_raw='[{"qFrom": 1, "price": 3.0}]',
+    )
+    item.available_stock_qty = None
+    item.unit_price = None
+    item.jlcpcb_price_breaks_raw = ""
+    result = JlcpcbSearchResult()
+    result.error = "temporary API failure"
+
+    enrich_bom_item(item, result)
+
+    assert item.jlcpcb_part_number == ""
+    assert item.available_stock_qty is None
+    assert item.unit_price is None
+    assert item.jlcpcb_price_breaks_raw == ""
