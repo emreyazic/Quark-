@@ -138,66 +138,147 @@ class BomParser:
                 )
         return headers, preview_rows, row_count
 
-    def load_file(self, file_path: str) -> BomFile:
-        """Load an Excel BOM file and return a BomFile with auto-detected mapping.
+    def inspect_sheets(self, file_path: str) -> list[BomFile]:
+        """Inspect all visible sheets in a workbook and return a BomFile for each.
+
+        Detects headers, row counts, preview rows, auto-detected column mappings,
+        and flags probable duplicate sheets.
 
         Args:
             file_path: Path to the Excel file.
 
         Returns:
-            BomFile with headers, preview rows, and auto-detected column mapping.
+            List of BomFile objects, one for each visible worksheet.
         """
         self._validate_file_extension(file_path)
         wb = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
+        base_name = os.path.splitext(os.path.basename(file_path))[0]
+        inspected_sheets: list[BomFile] = []
+        sheet_signatures: list[tuple[str, int, tuple, tuple]] = []
+
         try:
-            active_sheet = wb.active
-            assert active_sheet is not None
-            inspected_sheets = []
             for ws in wb.worksheets:
                 if ws.sheet_state != "visible":
                     continue
                 headers, preview_rows, row_count = self._read_sheet_preview(ws)
                 mapping = self._auto_detect_columns(headers, preview_rows)
-                inspected_sheets.append(
-                    (ws, headers, preview_rows, row_count, mapping)
+
+                # Duplicate sheet detection
+                # Signature: (headers, row_count, tuple of preview rows)
+                preview_sig = tuple(tuple(r) for r in preview_rows)
+                headers_sig = tuple(headers)
+                duplicate_of = None
+
+                # Check if identical to an already inspected sheet
+                if row_count > 0 or headers:
+                    for prev_title, prev_rc, prev_hdrs, prev_prev in sheet_signatures:
+                        # Exact duplicate: matching row count, headers, and preview rows
+                        if (
+                            row_count == prev_rc
+                            and headers_sig == prev_hdrs
+                            and preview_sig == prev_prev
+                        ):
+                            duplicate_of = prev_title
+                            break
+                        # High similarity: same title prefix (e.g. "Sheet1" vs "Sheet1 (Copy)")
+                        # and matching row count
+                        title_clean = re.sub(
+                            r"[\s_]*\((?:copy|\d+)\)|[\s_]+copy\b|[\s_]+kopya\b",
+                            "",
+                            ws.title,
+                            flags=re.IGNORECASE,
+                        ).strip()
+                        prev_clean = re.sub(
+                            r"[\s_]*\((?:copy|\d+)\)|[\s_]+copy\b|[\s_]+kopya\b",
+                            "",
+                            prev_title,
+                            flags=re.IGNORECASE,
+                        ).strip()
+                        if (
+                            title_clean.lower() == prev_clean.lower()
+                            and row_count == prev_rc
+                            and row_count > 0
+                        ):
+                            duplicate_of = prev_title
+                            break
+
+                sheet_signatures.append(
+                    (ws.title, row_count, headers_sig, preview_sig)
                 )
+
+                warnings = list(mapping.warnings)
+                if duplicate_of:
+                    warn_msg = (
+                        f"⚠ Probable duplicate of sheet '{duplicate_of}' "
+                        f"(identical or near-identical BOM content detected)."
+                    )
+                    warnings.append(warn_msg)
+                    mapping.warnings.append(warn_msg)
+
+                bom_file = BomFile(
+                    file_path=file_path,
+                    board_name=base_name,
+                    sheet_name=ws.title,
+                    headers=headers,
+                    column_mapping=mapping,
+                    row_count=row_count,
+                    preview_rows=preview_rows,
+                    is_valid=mapping.is_valid(),
+                    duplicate_of=duplicate_of,
+                    warnings=warnings,
+                )
+                inspected_sheets.append(bom_file)
 
             if not inspected_sheets:
                 raise ValueError("The workbook contains no visible worksheets.")
 
-            # Preserve the active sheet when it is a BOM. If it is a cover or
-            # summary sheet, expose the first valid BOM sheet in the mapper.
-            primary = next(
-                (
-                    sheet
-                    for sheet in inspected_sheets
-                    if sheet[0].title == active_sheet.title
-                    and sheet[4].is_valid()
-                ),
-                None,
-            )
-            if primary is None:
-                primary = next(
-                    (sheet for sheet in inspected_sheets if sheet[4].is_valid()),
-                    inspected_sheets[0],
-                )
-
-            ws, headers, preview_rows, row_count, mapping = primary
-            sheet_name = ws.title
+            return inspected_sheets
         finally:
             wb.close()
 
-        bom_file = BomFile(
-            file_path=file_path,
-            board_name=os.path.splitext(os.path.basename(file_path))[0],
-            sheet_name=sheet_name,
-            headers=headers,
-            column_mapping=mapping,
-            row_count=row_count,
-            preview_rows=preview_rows,
-        )
+    def load_file(self, file_path: str, sheet_name: Optional[str] = None) -> BomFile:
+        """Load an Excel BOM file and return a BomFile with auto-detected mapping.
 
-        return bom_file
+        Args:
+            file_path: Path to the Excel file.
+            sheet_name: Optional specific worksheet name to load. If None,
+                selects the active/primary valid sheet.
+
+        Returns:
+            BomFile with headers, preview rows, and auto-detected column mapping.
+        """
+        sheets = self.inspect_sheets(file_path)
+
+        if sheet_name is not None:
+            for s in sheets:
+                if s.sheet_name == sheet_name:
+                    return s
+            raise ValueError(
+                f"Worksheet '{sheet_name}' not found in '{file_path}'."
+            )
+
+        # Look for active sheet first if valid and non-duplicate
+        self._validate_file_extension(file_path)
+        wb = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
+        try:
+            active_title = wb.active.title if wb.active else None
+        finally:
+            wb.close()
+
+        if active_title:
+            active_sheet = next(
+                (s for s in sheets if s.sheet_name == active_title and s.is_valid and not s.duplicate_of),
+                None,
+            )
+            if active_sheet:
+                return active_sheet
+
+        # Prefer first valid non-duplicate sheet
+        primary = next((s for s in sheets if s.is_valid and not s.duplicate_of), None)
+        if primary is None:
+            primary = next((s for s in sheets if s.is_valid), sheets[0])
+
+        return primary
 
     def _auto_detect_columns(
         self, headers: list[str], preview_rows: list[list]
@@ -305,92 +386,120 @@ class BomParser:
             )
 
     def parse_bom_items(self, bom_file: BomFile) -> list[BomItem]:
-        """Parse all rows from a BOM file into BomItem objects.
+        """Parse rows from a single targeted BOM worksheet into BomItem objects.
+
+        Only parses the worksheet specified by bom_file.sheet_name. Does NOT
+        silently combine rows from other worksheets in the workbook.
 
         Args:
-            bom_file: A BomFile with a valid column mapping.
+            bom_file: A BomFile with a valid column mapping and sheet_name.
 
         Returns:
-            List of BomItem objects.
+            List of BomItem objects for that worksheet.
 
         Raises:
-            ValueError: If column mapping is not valid (MPN or Quantity missing).
+            ValueError: If column mapping is missing, invalid, or contains duplicate
+                mapped columns, or if required fields are missing.
         """
-        if bom_file.column_mapping is None or not bom_file.column_mapping.is_valid():
+        if bom_file.column_mapping is None:
+            raise ValueError(
+                f"Column mapping is missing for {bom_file.file_path}."
+            )
+
+        if bom_file.column_mapping.has_duplicate_mappings():
+            dup_info = bom_file.column_mapping.get_duplicate_fields()
+            dup_desc = ", ".join(
+                f"Col {col+1} mapped to {fields}" for col, fields in dup_info.items()
+            )
+            raise ValueError(
+                f"Invalid column mapping for {bom_file.file_path}: duplicate column mapping detected ({dup_desc}). "
+                "Each spreadsheet column must be mapped to at most one field."
+            )
+
+        if not bom_file.column_mapping.is_valid():
             raise ValueError(
                 f"Column mapping is incomplete for {bom_file.file_path}. "
                 f"MPN and Quantity columns are required."
             )
 
+        mapping = bom_file.column_mapping
         items = []
 
         self._validate_file_extension(bom_file.file_path)
         wb = openpyxl.load_workbook(bom_file.file_path, read_only=True, data_only=True)
         source_file_name = os.path.basename(bom_file.file_path)
         try:
-            for ws in wb.worksheets:
-                if ws.sheet_state != "visible":
-                    continue
+            ws = None
+            if bom_file.sheet_name and bom_file.sheet_name in wb.sheetnames:
+                candidate = wb[bom_file.sheet_name]
+                if candidate.sheet_state == "visible":
+                    ws = candidate
 
-                if ws.title == bom_file.sheet_name:
-                    mapping = bom_file.column_mapping
+            if ws is None:
+                # Fallback to active or first visible worksheet
+                active = wb.active
+                if active and active.sheet_state == "visible":
+                    ws = active
                 else:
-                    headers, preview_rows, _ = self._read_sheet_preview(ws)
-                    mapping = self._auto_detect_columns(headers, preview_rows)
+                    for s in wb.worksheets:
+                        if s.sheet_state == "visible":
+                            ws = s
+                            break
 
-                # Workbooks often contain cover/summary/helper sheets. Only
-                # worksheets that independently map MPN and Quantity are BOMs.
-                if mapping is None or not mapping.is_valid():
+            if ws is None:
+                raise ValueError(
+                    f"No visible worksheet found in '{bom_file.file_path}' "
+                    f"matching sheet '{bom_file.sheet_name}'."
+                )
+
+            for row in ws.iter_rows(min_row=2, values_only=True):
+                row_list = list(row)
+
+                if all(v is None or str(v).strip() == "" for v in row_list):
                     continue
 
-                for row in ws.iter_rows(min_row=2, values_only=True):
-                    row_list = list(row)
+                def get_val(col_idx: Optional[int], default="") -> str:
+                    if col_idx is None or col_idx >= len(row_list):
+                        return default
+                    val = row_list[col_idx]
+                    if val is None:
+                        return default
+                    return str(val).strip()
 
-                    if all(v is None or str(v).strip() == "" for v in row_list):
-                        continue
+                def get_quantity_val(col_idx: Optional[int], default=""):
+                    raw = get_val(col_idx, "")
+                    if raw == "":
+                        return default
+                    try:
+                        return parse_positive_integer_quantity(raw)
+                    except ValueError:
+                        # Preserve the original value so aggregation can
+                        # skip it with an explicit warning.
+                        return raw
 
-                    def get_val(col_idx: Optional[int], default="") -> str:
-                        if col_idx is None or col_idx >= len(row_list):
-                            return default
-                        val = row_list[col_idx]
-                        if val is None:
-                            return default
-                        return str(val).strip()
+                mpn = clean_mpn_value(get_val(mapping.mpn))
+                quantity = get_quantity_val(mapping.quantity)
 
-                    def get_quantity_val(col_idx: Optional[int], default=""):
-                        raw = get_val(col_idx, "")
-                        if raw == "":
-                            return default
-                        try:
-                            return parse_positive_integer_quantity(raw)
-                        except ValueError:
-                            # Preserve the original value so aggregation can
-                            # skip it with an explicit warning.
-                            return raw
+                board_val = get_val(mapping.board_identifier)
+                if board_val:
+                    board_name = f"Board {board_val}"
+                else:
+                    board_name = bom_file.board_name
 
-                    mpn = clean_mpn_value(get_val(mapping.mpn))
-                    quantity = get_quantity_val(mapping.quantity)
-
-                    board_val = get_val(mapping.board_identifier)
-                    if board_val:
-                        board_name = f"Board {board_val}"
-                    else:
-                        board_name = bom_file.board_name
-
-                    items.append(
-                        BomItem(
-                            source_file_name=source_file_name,
-                            board_name=board_name,
-                            comment=get_val(mapping.comment),
-                            description=get_val(mapping.description),
-                            designator=get_val(mapping.designator),
-                            footprint=get_val(mapping.footprint),
-                            quantity=quantity,
-                            value=get_val(mapping.value),
-                            manufacturer=get_val(mapping.manufacturer),
-                            mpn=mpn,
-                        )
+                items.append(
+                    BomItem(
+                        source_file_name=source_file_name,
+                        board_name=board_name,
+                        comment=get_val(mapping.comment),
+                        description=get_val(mapping.description),
+                        designator=get_val(mapping.designator),
+                        footprint=get_val(mapping.footprint),
+                        quantity=quantity,
+                        value=get_val(mapping.value),
+                        manufacturer=get_val(mapping.manufacturer),
+                        mpn=mpn,
                     )
+                )
         finally:
             wb.close()
         return items

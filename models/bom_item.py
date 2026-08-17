@@ -19,9 +19,44 @@ class ColumnMapping:
     confidence: float = 0.0
     warnings: list[str] = field(default_factory=list)
 
+    def get_mapped_fields(self) -> dict[str, int]:
+        """Return a mapping of field names to column indices for non-None, non-negative mappings."""
+        fields = [
+            "board_identifier",
+            "mpn",
+            "quantity",
+            "manufacturer",
+            "description",
+            "designator",
+            "comment",
+            "footprint",
+            "value",
+        ]
+        return {
+            field: getattr(self, field)
+            for field in fields
+            if getattr(self, field) is not None and getattr(self, field) >= 0
+        }
+
+    def has_duplicate_mappings(self) -> bool:
+        """Check if any spreadsheet column index is mapped to multiple fields."""
+        mapped = list(self.get_mapped_fields().values())
+        return len(mapped) != len(set(mapped))
+
+    def get_duplicate_fields(self) -> dict[int, list[str]]:
+        """Return column indices that are mapped to multiple fields."""
+        col_to_fields: dict[int, list[str]] = {}
+        for field, col in self.get_mapped_fields().items():
+            col_to_fields.setdefault(col, []).append(field)
+        return {col: fields for col, fields in col_to_fields.items() if len(fields) > 1}
+
     def is_valid(self) -> bool:
-        """Mapping is valid only if MPN and Quantity are mapped."""
-        return self.mpn is not None and self.quantity is not None
+        """Mapping is valid only if MPN and Quantity are mapped and there are no duplicate mappings."""
+        if self.mpn is None or self.quantity is None:
+            return False
+        if self.mpn < 0 or self.quantity < 0:
+            return False
+        return not self.has_duplicate_mappings()
 
 
 @dataclass
@@ -37,6 +72,8 @@ class BomFile:
     row_count: int = 0
     is_valid: bool = True
     error_message: str = ""
+    duplicate_of: Optional[str] = None
+    warnings: list[str] = field(default_factory=list)
 
 
 @dataclass

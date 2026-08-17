@@ -168,6 +168,16 @@ class ColumnMapperDialog(QDialog):
         preview_layout.addWidget(self._preview_table)
         layout.addWidget(preview_group)
 
+        # Error/Validation label
+        self._error_label = QLabel()
+        self._error_label.setWordWrap(True)
+        self._error_label.setStyleSheet(
+            "background-color: #2d1111; border: 1px solid #e74c3c; "
+            "border-radius: 6px; padding: 8px; margin: 4px 0;"
+        )
+        self._error_label.setVisible(False)
+        layout.addWidget(self._error_label)
+
         # Buttons
         btn_box = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -202,23 +212,62 @@ class ColumnMapperDialog(QDialog):
     def _validate(self) -> bool:
         """Check if required fields are mapped and no duplicate mappings exist."""
         valid = True
-        used_cols = {}
+        col_usage: dict[int, list[str]] = {}
 
+        # 1. Collect column usage across all fields
         for field_name, _, required in FIELDS:
             combo = self._combos[field_name]
             col_idx = combo.currentData()
 
-            if required and col_idx == -1:
+            if required and (col_idx is None or col_idx < 0):
                 valid = False
 
-            # Check for duplicate column mappings
             if col_idx is not None and col_idx >= 0:
-                if col_idx in used_cols:
-                    # Same column mapped to two different fields — show warning style
-                    combo.setStyleSheet("border: 2px solid #e74c3c;")
-                else:
-                    combo.setStyleSheet("")
-                    used_cols[col_idx] = field_name
+                col_usage.setdefault(col_idx, []).append(field_name)
+
+        # 2. Check for duplicate column mappings
+        has_duplicates = any(len(fields) > 1 for fields in col_usage.values())
+        if has_duplicates:
+            valid = False
+
+        # 3. Apply styles to all combo boxes based on duplicate status
+        for field_name, _, _ in FIELDS:
+            combo = self._combos[field_name]
+            col_idx = combo.currentData()
+            if col_idx is not None and col_idx >= 0 and len(col_usage.get(col_idx, [])) > 1:
+                combo.setStyleSheet("border: 2px solid #e74c3c;")
+            else:
+                combo.setStyleSheet("")
+
+        # 4. Show/update validation error label
+        if has_duplicates:
+            dup_messages = []
+            for col_idx, field_names in col_usage.items():
+                if len(field_names) > 1:
+                    hdr_name = (
+                        self.bom_file.headers[col_idx]
+                        if col_idx < len(self.bom_file.headers)
+                        else f"Col {col_idx+1}"
+                    )
+                    fields_str = ", ".join(field_names)
+                    dup_messages.append(
+                        f"Column '{hdr_name}' (Col {col_idx+1}) is mapped to multiple fields: {fields_str}."
+                    )
+            self._error_label.setText(
+                "<span style='color: #e74c3c; font-weight: 600;'>"
+                + "<br>".join(dup_messages)
+                + "<br>Each spreadsheet column must be mapped to at most one field.</span>"
+            )
+            self._error_label.setVisible(True)
+        elif not valid:
+            self._error_label.setText(
+                "<span style='color: #e74c3c; font-weight: 600;'>"
+                "Please map all required fields (MPN and Quantity)."
+                "</span>"
+            )
+            self._error_label.setVisible(True)
+        else:
+            self._error_label.setVisible(False)
 
         self._btn_ok.setEnabled(valid)
         return valid
@@ -257,12 +306,17 @@ class ColumnMapperDialog(QDialog):
 
     def _on_accept(self):
         """Build the ColumnMapping from user selections and accept."""
+        if not self._validate():
+            return
         mapping = ColumnMapping()
         for field_name, _, _ in FIELDS:
             combo = self._combos[field_name]
             col_idx = combo.currentData()
             if col_idx is not None and col_idx >= 0:
                 setattr(mapping, field_name, col_idx)
+
+        if not mapping.is_valid():
+            return
 
         mapping.confidence = 1.0  # User confirmed
         self.bom_file.column_mapping = mapping

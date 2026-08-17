@@ -28,6 +28,7 @@ from PyQt6.QtWidgets import (
 
 from models.bom_item import BomFile
 from core.bom_parser import BomParser
+from ui.sheet_selector_dialog import SheetSelectorDialog
 from models.project import Project, ProjectItem
 from models.workspace import Workspace
 from services.project_storage import (
@@ -574,45 +575,66 @@ class FileManagerWidget(QWidget):
                 )
                 continue
 
-            # Check project-specific duplicates
-            if target_project.get_board_by_file_path(path):
-                print(f"Skipping {path}: already exists in project '{project_name}'")
+            try:
+                sheets = self._parser.inspect_sheets(path)
+            except Exception as e:
+                print(f"Error inspecting {path}: {e}")
+                QMessageBox.critical(
+                    self,
+                    "Workbook Error",
+                    f"Failed to read workbook '{os.path.basename(path)}':\n{e}",
+                )
                 continue
 
-            board_name = os.path.splitext(os.path.basename(path))[0]
-            try:
-                if path in self._parsed_boms:
-                    # Reuse only immutable file metadata/mapping. BomItem
-                    # objects always belong to one project/board context.
-                    bom_file = self._parsed_boms[path]
+            if not sheets:
+                continue
+
+            # If multi-sheet or duplicate sheet detected, present SheetSelectorDialog
+            if len(sheets) > 1 or any(s.duplicate_of for s in sheets):
+                dlg = SheetSelectorDialog(sheets, self)
+                if dlg.exec() != SheetSelectorDialog.DialogCode.Accepted:
+                    continue
+                selected_sheets = dlg.get_selected_sheets()
+                if not selected_sheets:
+                    continue
+            else:
+                selected_sheets = [sheets[0]]
+
+            for bom_file in selected_sheets:
+                if len(selected_sheets) == 1 and len(sheets) == 1:
+                    board_name = os.path.splitext(os.path.basename(path))[0]
                 else:
-                    # Load freshly
-                    bom_file = self._parser.load_file(path)
-                    self._parsed_boms[path] = bom_file
+                    base = os.path.splitext(os.path.basename(path))[0]
+                    board_name = f"{base} ({bom_file.sheet_name})"
+
+                # Set board name on the BomFile
+                bom_file.board_name = board_name
+
+                # Store metadata
+                self._parsed_boms[path] = bom_file
+                if bom_file not in self._bom_files:
                     self._bom_files.append(bom_file)
 
-                bom_items = self._parse_items_for_board(bom_file, board_name)
-                
-                self._board_status[path] = f"Loaded ({len(bom_items)} items)"
-                board_quantity = 1
-                    
-                project_item = ProjectItem(
-                    file_path=path,
-                    board_name=board_name,
-                    board_quantity=board_quantity,
-                    bom_items=bom_items
-                )
-                target_project.add_board(project_item)
-            except Exception as e:
-                print(f"Error loading {path}: {e}")
-                self._board_status[path] = "Parse error"
-                project_item = ProjectItem(
-                    file_path=path,
-                    board_name=board_name,
-                    board_quantity=1,
-                    bom_items=[]
-                )
-                target_project.add_board(project_item)
+                try:
+                    bom_items = self._parse_items_for_board(bom_file, board_name)
+                    self._board_status[path] = f"Loaded ({len(bom_items)} items)"
+                    project_item = ProjectItem(
+                        file_path=path,
+                        board_name=board_name,
+                        board_quantity=1,
+                        bom_items=bom_items,
+                    )
+                    target_project.add_board(project_item)
+                except Exception as e:
+                    print(f"Error parsing items for {path} ({bom_file.sheet_name}): {e}")
+                    self._board_status[path] = "Parse error"
+                    project_item = ProjectItem(
+                        file_path=path,
+                        board_name=board_name,
+                        board_quantity=1,
+                        bom_items=[],
+                    )
+                    target_project.add_board(project_item)
 
         self._refresh_tree()
         self.files_changed.emit()
@@ -717,7 +739,18 @@ class FileManagerWidget(QWidget):
 
     def get_bom_file_for_board(self, file_path: str, board_name: str) -> Optional[BomFile]:
         """Return an isolated BomFile carrying one board's display context."""
-        bom_file = self._parsed_boms.get(file_path)
+        bom_files = getattr(self, "_bom_files", [])
+        for bf in bom_files:
+            if bf.file_path == file_path and (
+                bf.board_name == board_name
+                or f"({bf.sheet_name})" in board_name
+                or bf.sheet_name == board_name
+            ):
+                contextual_file = copy.deepcopy(bf)
+                contextual_file.board_name = board_name
+                return contextual_file
+
+        bom_file = getattr(self, "_parsed_boms", {}).get(file_path)
         if bom_file is None:
             return None
         contextual_file = copy.deepcopy(bom_file)
