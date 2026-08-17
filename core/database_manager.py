@@ -2,8 +2,34 @@ import sqlite3
 import os
 import threading
 import time
+import math
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import List, Dict, Optional, Tuple, Any
+from core.logger import get_logger
+
+logger = get_logger(__name__)
+
+DEFAULT_HISTORY_RETENTION_DAYS = 365
+MAX_HISTORY_RETENTION_DAYS = 3650
+
+
+def parse_retention_days(value: Any, default: int = DEFAULT_HISTORY_RETENTION_DAYS) -> int:
+    """Parse and validate history retention days safely."""
+    if value is None or str(value).strip() == "":
+        return default
+    try:
+        f_val = float(value)
+        if not math.isfinite(f_val) or f_val < 0:
+            logger.warning("Invalid SUPPLIER_HISTORY_RETENTION_DAYS value %r; using default %d", value, default)
+            return default
+        i_val = int(f_val)
+        if i_val > MAX_HISTORY_RETENTION_DAYS:
+            logger.warning("SUPPLIER_HISTORY_RETENTION_DAYS %r exceeds maximum; capped at %d", value, MAX_HISTORY_RETENTION_DAYS)
+            return MAX_HISTORY_RETENTION_DAYS
+        return i_val
+    except (ValueError, TypeError):
+        logger.warning("Non-numeric SUPPLIER_HISTORY_RETENTION_DAYS %r; using default %d", value, default)
+        return default
 
 class DatabaseManager:
     """Manages local SQLite database for caching and internal part mappings."""
@@ -44,8 +70,8 @@ class DatabaseManager:
 
         self._lock = self._shared_lock_for(self.db_path)
         configured_retention = os.getenv("SUPPLIER_HISTORY_RETENTION_DAYS", "365")
-        self.history_retention_days = max(
-            0, int(configured_retention if history_retention_days is None else history_retention_days)
+        self.history_retention_days = parse_retention_days(
+            configured_retention if history_retention_days is None else history_retention_days
         )
         
         # Ensure the directory exists
@@ -191,6 +217,10 @@ class DatabaseManager:
                                digikey_status = 'PENDING_REVIEW'
                            WHERE approved = 0"""
                     )
+                    cursor.execute(
+                        """INSERT INTO app_metadata (key, value) VALUES ('mapping_data_version', '2')
+                           ON CONFLICT(key) DO UPDATE SET value = excluded.value"""
+                    )
                 if mapping_data_version < 3:
                     # Builds that briefly coupled approval and pending state
                     # may have cleared supplier approval while retaining the
@@ -206,10 +236,6 @@ class DatabaseManager:
                     )
                     cursor.execute(
                         """INSERT INTO app_metadata (key, value) VALUES ('mapping_data_version', '3')
-                           ON CONFLICT(key) DO UPDATE SET value = excluded.value"""
-                    )
-                    cursor.execute(
-                        """INSERT INTO app_metadata (key, value) VALUES ('mapping_data_version', '2')
                            ON CONFLICT(key) DO UPDATE SET value = excluded.value"""
                     )
                 
@@ -518,6 +544,107 @@ class DatabaseManager:
                        WHERE comment_code = ?""",
                     (time.time(), comment_code),
                 )
+                conn.commit()
+
+    def approve_supplier_mapping(self, comment_code: str, supplier: str, code: str, mpn: Optional[str] = None) -> None:
+        """Approve or manually override a mapping for a single specific supplier without affecting the other supplier."""
+        supplier_norm = supplier.upper().strip()
+        with self._lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT * FROM internal_mappings WHERE comment_code = ?", (comment_code,))
+                existing = cursor.fetchone()
+                now = time.time()
+                clean_code = (code or "").strip()
+                new_mpn = mpn.strip() if mpn is not None else (existing["mpn"] if existing else "")
+
+                if supplier_norm in ("JLCPCB", "LCSC"):
+                    last_found = existing["last_found_lcsc"] if existing else ""
+                    source = "MANUAL" if clean_code != last_found else "AUTO"
+                    status = "MANUAL_OVERRIDE" if source == "MANUAL" else "AUTO_APPROVED"
+                    if existing:
+                        cursor.execute(
+                            """UPDATE internal_mappings
+                               SET mpn = CASE WHEN ? != '' THEN ? ELSE mpn END,
+                                   lcsc_code = ?,
+                                   lcsc_source = ?,
+                                   lcsc_status = ?,
+                                   lcsc_approved = 1,
+                                   lcsc_pending_change = 0,
+                                   previous_found_lcsc = '',
+                                   approved = 1,
+                                   updated_at = ?
+                               WHERE comment_code = ?""",
+                            (new_mpn, new_mpn, clean_code, source, status, now, comment_code)
+                        )
+                    else:
+                        cursor.execute(
+                            """INSERT INTO internal_mappings
+                               (comment_code, mpn, lcsc_code, digikey_code, approved, updated_at,
+                                last_found_lcsc, last_found_digikey, lcsc_source, digikey_source,
+                                lcsc_status, digikey_status, lcsc_approved, digikey_approved,
+                                lcsc_pending_change, digikey_pending_change)
+                               VALUES (?, ?, ?, '', 1, ?, ?, '', ?, 'AUTO', ?, 'PENDING_REVIEW', 1, 0, 0, 1)""",
+                            (comment_code, new_mpn, clean_code, now, clean_code, source, status)
+                        )
+                elif supplier_norm == "DIGIKEY":
+                    last_found = existing["last_found_digikey"] if existing else ""
+                    source = "MANUAL" if clean_code != last_found else "AUTO"
+                    status = "MANUAL_OVERRIDE" if source == "MANUAL" else "AUTO_APPROVED"
+                    if existing:
+                        cursor.execute(
+                            """UPDATE internal_mappings
+                               SET mpn = CASE WHEN ? != '' THEN ? ELSE mpn END,
+                                   digikey_code = ?,
+                                   digikey_source = ?,
+                                   digikey_status = ?,
+                                   digikey_approved = 1,
+                                   digikey_pending_change = 0,
+                                   previous_found_digikey = '',
+                                   approved = 1,
+                                   updated_at = ?
+                               WHERE comment_code = ?""",
+                            (new_mpn, new_mpn, clean_code, source, status, now, comment_code)
+                        )
+                    else:
+                        cursor.execute(
+                            """INSERT INTO internal_mappings
+                               (comment_code, mpn, lcsc_code, digikey_code, approved, updated_at,
+                                last_found_lcsc, last_found_digikey, lcsc_source, digikey_source,
+                                lcsc_status, digikey_status, lcsc_approved, digikey_approved,
+                                lcsc_pending_change, digikey_pending_change)
+                               VALUES (?, ?, '', ?, 1, ?, '', ?, 'AUTO', ?, 'PENDING_REVIEW', ?, 0, 1, 1, 0)""",
+                            (comment_code, new_mpn, clean_code, now, clean_code, source, status)
+                        )
+                else:
+                    raise ValueError(f"Unsupported supplier: {supplier}")
+                conn.commit()
+
+    def reject_supplier_pending_change(self, comment_code: str, supplier: str) -> None:
+        """Dismiss automatic candidates for a single specific supplier without changing the other supplier or approved values."""
+        supplier_norm = supplier.upper().strip()
+        with self._lock:
+            with self._get_connection() as conn:
+                if supplier_norm in ("JLCPCB", "LCSC"):
+                    conn.execute(
+                        """UPDATE internal_mappings
+                           SET lcsc_pending_change = 0,
+                               lcsc_status = CASE WHEN lcsc_approved = 1 THEN 'AUTO_APPROVED' ELSE lcsc_status END,
+                               updated_at = ?
+                           WHERE comment_code = ?""",
+                        (time.time(), comment_code),
+                    )
+                elif supplier_norm == "DIGIKEY":
+                    conn.execute(
+                        """UPDATE internal_mappings
+                           SET digikey_pending_change = 0,
+                               digikey_status = CASE WHEN digikey_approved = 1 THEN 'AUTO_APPROVED' ELSE digikey_status END,
+                               updated_at = ?
+                           WHERE comment_code = ?""",
+                        (time.time(), comment_code),
+                    )
+                else:
+                    raise ValueError(f"Unsupported supplier: {supplier}")
                 conn.commit()
                 
     def get_all_internal_mappings(self) -> list[Dict[str, Any]]:

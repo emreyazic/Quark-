@@ -226,8 +226,8 @@ def test_digikey_token_tries_next_credential_after_retryable_failure(monkeypatch
     assert searcher._active_cred_index == 1
 
 
-def test_digikey_token_tries_next_credential_after_temporary_network_failure(monkeypatch):
-    searcher = DigiKeySearcher()
+def test_digikey_token_retries_same_credential_after_temporary_network_failure(monkeypatch):
+    searcher = DigiKeySearcher(_sleep_fn=lambda _: None)
     searcher._credentials = [("first-id", "first-secret"), ("second-id", "second-secret")]
     calls = []
 
@@ -240,7 +240,8 @@ def test_digikey_token_tries_next_credential_after_temporary_network_failure(mon
     monkeypatch.setattr(searcher.session, "post", post)
 
     assert searcher._get_access_token() == "good-token"
-    assert calls == ["first-id", "second-id"]
+    assert calls == ["first-id", "first-id"]
+    assert searcher._active_cred_index == 0
 
 
 def test_digikey_token_permanent_error_does_not_retry_or_expose_secret(monkeypatch):

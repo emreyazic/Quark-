@@ -67,6 +67,7 @@ class BomFile:
     board_name: str
     sheet_name: str = ""
     headers: list[str] = field(default_factory=list)
+    header_row_index: int = 1
     preview_rows: list[list] = field(default_factory=list)
     column_mapping: Optional[ColumnMapping] = None
     row_count: int = 0
@@ -178,10 +179,10 @@ class BomItem:
 
     @property
     def is_not_found(self) -> bool:
-        """True only when every queried supplier completed without a result."""
+        """True only when every queried supplier completed without finding an exact result."""
         statuses = (self.jlcpcb_status, self.digikey_status)
         queried = [status for status in statuses if status != "not_searched"]
-        return bool(queried) and all(status == "not_found" for status in queried)
+        return bool(queried) and all(status in ("not_found", "mismatch") for status in queried)
 
     def refresh_status(self) -> str:
         """Derive the presentation status from independent supplier states."""
@@ -190,6 +191,8 @@ class BomItem:
                 self.status = f"Warning [{self.jlcpcb_source or 'JLCPCB'}]: {self.notes}"
             else:
                 self.status = ""
+        elif self.jlcpcb_status == "mismatch":
+            self.status = "No exact JLCPCB match"
         elif self.is_not_found:
             self.status = "Not Found"
         else:

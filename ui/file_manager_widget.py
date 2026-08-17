@@ -36,6 +36,9 @@ from services.project_storage import (
     save_workspace,
 )
 from core.utils import get_resource_path
+from core.logger import get_logger
+
+logger = get_logger(__name__)
 
 SUPPORTED_BOM_EXTENSIONS = (".xlsx", ".xlsm")
 
@@ -577,7 +580,7 @@ class FileManagerWidget(QWidget):
             try:
                 sheets = self._parser.inspect_sheets(path)
             except Exception as e:
-                print(f"Error inspecting {path}: {e}")
+                logger.error("Error inspecting %s: %s", path, e)
                 QMessageBox.critical(
                     self,
                     "Workbook Error",
@@ -625,7 +628,7 @@ class FileManagerWidget(QWidget):
                     )
                     target_project.add_board(project_item)
                 except Exception as e:
-                    print(f"Error parsing items for {path} ({bom_file.sheet_name}): {e}")
+                    logger.error("Error parsing items for %s (%s): %s", path, bom_file.sheet_name, e)
                     self._board_status[path] = "Parse error"
                     project_item = ProjectItem(
                         file_path=path,
@@ -719,10 +722,10 @@ class FileManagerWidget(QWidget):
                             
                         self._board_status[board.file_path] = f"Loaded ({len(board.bom_items)} items)"
                     except Exception as e:
-                        print(f"Error parsing loaded file {board.file_path}: {e}")
+                        logger.error("Error parsing loaded file %s: %s", board.file_path, e)
                         self._board_status[board.file_path] = "Parse error"
                 else:
-                    print(f"File missing: {board.file_path}")
+                    logger.warning("File missing: %s", board.file_path)
                     self._board_status[board.file_path] = "Missing file"
                 
         self._refresh_tree()

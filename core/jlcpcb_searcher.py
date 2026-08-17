@@ -29,6 +29,9 @@ from core.mpn_utils import (
     normalize_jlcpcb_price_breaks,
 )
 from core.database_manager import DatabaseManager
+from core.logger import get_logger, mask_secret
+
+logger = get_logger(__name__)
 
 # Resmi JLC Open Platform API Base URL
 API_BASE_URL = "https://open.jlcpcb.com"
@@ -59,14 +62,22 @@ def _price_break_signature(price_breaks_raw: str):
         return ()
     try:
         tiers = json.loads(price_breaks_raw)
-        return tuple(
-            (
-                int(tier.get("qFrom", 0)),
-                None if tier.get("qTo") is None else int(tier.get("qTo")),
-                round(float(tier.get("price")), 10),
-            )
-            for tier in tiers
-        )
+        if not isinstance(tiers, list):
+            return ((price_breaks_raw.strip(),),)
+        signature = []
+        for tier in tiers:
+            if not isinstance(tier, dict):
+                continue
+            q_to = tier.get("qTo")
+            price_val = tier.get("price")
+            if price_val is None:
+                continue
+            signature.append((
+                int(tier.get("qFrom", 0) or 0),
+                None if q_to is None else int(q_to),
+                round(float(price_val), 10),
+            ))
+        return tuple(signature)
     except (TypeError, ValueError, json.JSONDecodeError):
         return ((price_breaks_raw.strip(),),)
 
@@ -96,11 +107,21 @@ class JlcpcbSearchResult:
 
 class JlcpcbSearcher:
     """Searches and enriches JLCPCB parts using MPN resolution + Official JOP API."""
-    def __init__(self, app_id: str, access_key: str, secret_key: str, db_manager: Optional[DatabaseManager] = None):
+    def __init__(
+        self,
+        app_id: str,
+        access_key: str,
+        secret_key: str,
+        db_manager: Optional[DatabaseManager] = None,
+        _sleep_fn: Callable[[float], None] = time.sleep,
+        max_retries: int = 3,
+    ):
         self.app_id = app_id
         self.access_key = access_key
         self.secret_key = secret_key
         self.db_manager = db_manager
+        self._sleep_fn = _sleep_fn
+        self.max_retries = max_retries
         self.session = requests.Session()
         self.session.headers.update({
             "Content-Type": "application/json",
@@ -109,6 +130,39 @@ class JlcpcbSearcher:
         self.last_resolution_failed = False
         self.last_resolution_error: Optional[str] = None
         self._part_page_cache: Dict[str, tuple[Optional[int], str, Optional[str]]] = {}
+
+    def _request_with_retry(self, method: str, url: str, **kwargs) -> requests.Response:
+        """Perform HTTP request with exponential backoff + jitter on timeout, 429, and 5xx."""
+        attempt = 0
+        method_upper = method.upper()
+        while True:
+            try:
+                if method_upper == "GET":
+                    resp = self.session.get(url, **kwargs)
+                elif method_upper == "POST":
+                    resp = self.session.post(url, **kwargs)
+                else:
+                    resp = self.session.request(method, url, **kwargs)
+
+                if resp is not None and getattr(resp, "status_code", None) in (429, 500, 502, 503, 504) and attempt < self.max_retries:
+                    attempt += 1
+                    retry_after_hdr = getattr(resp, "headers", {}).get("Retry-After") if hasattr(resp, "headers") and resp.headers else None
+                    if retry_after_hdr and str(retry_after_hdr).isdigit():
+                        delay = min(int(retry_after_hdr), 30)
+                    else:
+                        delay = min(10.0, 0.5 * (2 ** (attempt - 1)) + random.uniform(0.1, 0.5))
+                    logger.warning("HTTP %d on %s, retrying attempt %d/%d after %.2fs", resp.status_code, url, attempt, self.max_retries, delay)
+                    self._sleep_fn(delay)
+                    continue
+                return resp
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+                if attempt < self.max_retries:
+                    attempt += 1
+                    delay = min(10.0, 0.5 * (2 ** (attempt - 1)) + random.uniform(0.1, 0.5))
+                    logger.warning("Network error (%s) on %s, retrying attempt %d/%d after %.2fs", type(exc).__name__, url, attempt, self.max_retries, delay)
+                    self._sleep_fn(delay)
+                    continue
+                raise
 
     @staticmethod
     def _normalize_jop_price_ranges(price_ranges: list[dict]) -> str:
@@ -277,7 +331,8 @@ class JlcpcbSearcher:
             return self._part_page_cache[cache_key]
 
         try:
-            response = self.session.get(
+            response = self._request_with_retry(
+                "GET",
                 JLCPCB_PART_DETAIL_URL.format(lcsc_code=quote(lcsc_code)),
                 timeout=REQUEST_TIMEOUT,
                 headers={
@@ -369,6 +424,9 @@ class JlcpcbSearcher:
         """
         self.last_resolution_failed = False
         self.last_resolution_error = None
+        if not mpn_clean:
+            return None
+
         completed_remote_lookup = False
         resolution_errors = []
 
@@ -377,12 +435,10 @@ class JlcpcbSearcher:
             lcsc = self.db_manager.lookup_lcsc_by_mpn(mpn_clean)
             if lcsc:
                 lcsc_code = str(lcsc).strip()
-                print(f"DEBUG: Found LCSC: {lcsc_code} for MPN: {mpn_clean}")
+                logger.debug("Found LCSC: %s for MPN: %s", lcsc_code, mpn_clean)
                 return lcsc_code
 
         # Community fallback helpers
-        #    Endpoint: GET /components/list.json?search=<MPN>
-        #    mfr alanı MPN'i, lcsc alanı LCSC numarasını içerir
         def get_components(response_data: Any) -> list[dict]:
             """Accept both documented object responses and legacy list responses."""
             if isinstance(response_data, dict):
@@ -392,13 +448,6 @@ class JlcpcbSearcher:
             return components if isinstance(components, list) else []
 
         def find_exact_lcsc(components: list[dict]) -> Optional[str]:
-            """Return an LCSC code only when the MPN match is unambiguous.
-
-            A search response can contain a similarly named part or multiple
-            LCSC entries for the same MPN.  Selecting the first entry in either
-            case can silently map a BOM to the wrong component, so those cases
-            must remain pending for user review.
-            """
             exact_codes: set[str] = set()
             for comp in components:
                 if not isinstance(comp, dict):
@@ -429,17 +478,15 @@ class JlcpcbSearcher:
 
             if len(exact_codes) == 1:
                 lcsc_code = exact_codes.pop()
-                print(f"DEBUG: Found LCSC: {lcsc_code} for MPN: {mpn_clean}")
+                logger.debug("Found LCSC: %s for MPN: %s", lcsc_code, mpn_clean)
                 return lcsc_code
             if len(exact_codes) > 1:
-                print(f"DEBUG: Ambiguous exact LCSC matches for MPN: {mpn_clean}: {', '.join(sorted(exact_codes))}")
+                logger.debug("Ambiguous exact LCSC matches for MPN: %s: %s", mpn_clean, ', '.join(sorted(exact_codes)))
             return None
 
-        # LCSC's own endpoint is normally faster and more complete than the
-        # community index. Query it first, then retain the community service as
-        # a fallback. Exact/ambiguous-match safeguards remain identical.
         try:
-            official_resp = self.session.post(
+            official_resp = self._request_with_retry(
+                "POST",
                 LCSC_GLOBAL_SEARCH_URL,
                 json={"keyword": mpn_clean},
                 timeout=8,
@@ -468,12 +515,10 @@ class JlcpcbSearcher:
         except Exception as exc:
             resolution_errors.append(f"LCSC search request failed: {exc}")
 
-        max_retries = 2
-        backoff = 0.5
-
-        for attempt in range(max_retries):
+        for attempt in range(self.max_retries):
             try:
-                resp = self.session.get(
+                resp = self._request_with_retry(
+                    "GET",
                     COMMUNITY_SEARCH_URL,
                     params={"search": mpn_clean},
                     timeout=8,
@@ -487,8 +532,8 @@ class JlcpcbSearcher:
                     lcsc_code = find_exact_lcsc(get_components(resp.json()))
                     if lcsc_code:
                         return lcsc_code
-                    # Tam eşleşme yoksa manufacturer_part_number parametresiyle ikinci bir deneme
-                    resp2 = self.session.get(
+                    resp2 = self._request_with_retry(
+                        "GET",
                         COMMUNITY_SEARCH_URL,
                         params={"manufacturer_part_number": mpn_clean, "limit": 5},
                         timeout=8,
@@ -498,37 +543,18 @@ class JlcpcbSearcher:
                         },
                     )
                     if resp2.status_code == 200:
-                        lcsc_code = find_exact_lcsc(get_components(resp2.json()))
-                        if lcsc_code:
-                            return lcsc_code
-
-                    # Bulunamadı ama hata yok — sessizce None dön
-                    self.last_resolution_failed = False
-                    return None
-                elif resp.status_code in (429, 503):
+                        lcsc_code2 = find_exact_lcsc(get_components(resp2.json()))
+                        if lcsc_code2:
+                            return lcsc_code2
+                    # Service responded 200 without match
+                    break
+                else:
                     resolution_errors.append(
                         f"Community search HTTP {resp.status_code}"
                     )
-                    # Rate limit — tekrar dene
-                    if attempt < max_retries - 1:
-                        time.sleep(backoff * (2 ** attempt))
-                        continue
-                resolution_errors.append(
-                    f"Community search HTTP {resp.status_code}"
-                )
-                self.last_resolution_failed = not completed_remote_lookup
-                if self.last_resolution_failed:
-                    self.last_resolution_error = "; ".join(resolution_errors)
-                return None
             except Exception as exc:
                 resolution_errors.append(f"Community search request failed: {exc}")
-                if attempt < max_retries - 1:
-                    time.sleep(backoff * (2 ** attempt))
-                    continue
-                self.last_resolution_failed = not completed_remote_lookup
-                if self.last_resolution_failed:
-                    self.last_resolution_error = "; ".join(resolution_errors)
-                return None
+                break
 
         self.last_resolution_failed = not completed_remote_lookup
         if self.last_resolution_failed:
@@ -580,7 +606,8 @@ class JlcpcbSearcher:
             """Get stock and price when JOP does not expose an extended part."""
             fallback = JlcpcbSearchResult()
             try:
-                response = self.session.post(
+                response = self._request_with_retry(
+                    "POST",
                     LCSC_GLOBAL_SEARCH_URL,
                     json={"keyword": mpn},
                     timeout=12,
@@ -635,7 +662,7 @@ class JlcpcbSearcher:
                 fallback.price_breaks_raw = json.dumps(price_breaks) if price_breaks else ""
                 if fallback.price_breaks_raw:
                     fallback.unit_price = select_result_unit_price(fallback.price_breaks_raw, required_stock)
-                print(f"DEBUG: Found LCSC fallback data: {lcsc_code} for MPN: {mpn}")
+                logger.debug("Found LCSC fallback data: %s for MPN: %s", lcsc_code, mpn)
             except Exception:
                 pass
             return fallback
@@ -682,7 +709,7 @@ class JlcpcbSearcher:
         try:
             auth_header = self._get_auth_header("POST", path, body_str)
             headers = {"Content-Type": "application/json", "Authorization": auth_header}
-            resp = self.session.post(url, data=body_str, headers=headers, timeout=REQUEST_TIMEOUT)
+            resp = self._request_with_retry("POST", url, data=body_str, headers=headers, timeout=REQUEST_TIMEOUT)
             
             if resp.status_code in [401, 403]:
                 result.error = f"API Auth Error ({resp.status_code})"
@@ -814,6 +841,9 @@ def clear_jlcpcb_live_data(item: BomItem) -> None:
     item.unit_price = None
     item.jlcpcb_price_breaks_raw = ""
     item.jlcpcb_total_price = None
+    item.jlcpcb_status = "not_searched"
+    item.jlcpcb_error = ""
+    item.jlcpcb_source = ""
 
 
 def enrich_bom_item(item: BomItem, search_result: JlcpcbSearchResult) -> None:
@@ -837,11 +867,12 @@ def enrich_bom_item(item: BomItem, search_result: JlcpcbSearchResult) -> None:
 
     if not search_result.found and not search_result.exact_match:
         item.jlcpcb_part_number = ""
-        item.jlcpcb_status = "not_found"
         if search_result.match_count > 0:
+            item.jlcpcb_status = "mismatch"
             item.status = "No exact JLCPCB match"
             item.matched_mpn = ""
         else:
+            item.jlcpcb_status = "not_found"
             item.status = "JLCPCB not found"
         item.refresh_status()
         return

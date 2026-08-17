@@ -47,10 +47,13 @@ from ui.approval_dialog import ApprovalDialog
 from ui.component_library_conflict_dialog import ComponentLibraryConflictDialog
 from core.component_library import read_component_library_file, detect_library_conflicts
 from core.database_manager import DatabaseManager
+from core.logger import get_logger
 
-APP_ID = "610325957269491714"
-ACCESS_KEY = "8a568b68cf754f46ac0c279920f8e9cb"
-SECRET_KEY = "mbEtcCNB28Nf5N1GgnbmPmpNVOKjBbjI"
+logger = get_logger(__name__)
+
+APP_ID = os.getenv("JLCPCB_APP_ID", "610325957269491714")
+ACCESS_KEY = os.getenv("JLCPCB_ACCESS_KEY", "8a568b68cf754f46ac0c279920f8e9cb")
+SECRET_KEY = os.getenv("JLCPCB_SECRET_KEY", "mbEtcCNB28Nf5N1GgnbmPmpNVOKjBbjI")
 
 # ═══════════════════════════════════════════════════════════════════
 #  Manual Search Worker
@@ -1527,6 +1530,14 @@ class MainWindow(QMainWindow):
         self._progress_widget.update_progress(current, total, mpn, status)
 
     def _on_search_finished(self, items: list[BomItem]):
+        search_worker = getattr(self, "_search_worker", None)
+        if search_worker and getattr(search_worker, "_is_cancelled", lambda: False)():
+            self._progress_widget.set_cancelled()
+            self._btn_back_setup.setVisible(True)
+            self._btn_view_results.setVisible(False)
+            self._validate_ready()
+            return
+
         if self._processed_input_revision != self._input_revision:
             self._progress_widget.set_cancelled()
             self._progress_widget._log.appendPlainText(

@@ -9,6 +9,9 @@ from PyQt6.QtGui import QFont, QIcon
 
 from ui.main_window import MainWindow
 from core.utils import get_resource_path
+from core.logger import setup_logging, get_logger
+
+logger = get_logger(__name__)
 
 
 def load_stylesheet() -> str:
@@ -18,11 +21,12 @@ def load_stylesheet() -> str:
         with open(qss_path, "r", encoding="utf-8") as f:
             return f.read()
     except FileNotFoundError:
-        print(f"Warning: Stylesheet not found at {qss_path}")
+        logger.warning("Stylesheet not found at %s", qss_path)
         return ""
 
 
 def main():
+    setup_logging()
     # High DPI support
     os.environ["QT_ENABLE_HIGHDPI_SCALING"] = "1"
 

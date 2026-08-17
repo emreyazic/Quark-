@@ -20,7 +20,11 @@ dev = [
     "build>=1.0.0"
 ]
 
+[project.scripts]
+jlcpcb-bom-tool = "main:main"
+
 [tool.setuptools]
+py-modules = ["main"]
 packages = ["core", "ui", "models", "services", "resources"]
 
 [tool.setuptools.package-data]

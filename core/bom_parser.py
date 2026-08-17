@@ -115,20 +115,74 @@ class BomParser:
                 "Use an .xlsx or .xlsm workbook."
             )
 
-    @staticmethod
-    def _read_sheet_preview(ws) -> tuple[list[str], list[list[str]], int]:
-        """Return headers, a five-row preview, and non-empty data-row count."""
-        headers = [
-            str(cell.value).strip() if cell.value is not None else ""
-            for cell in ws[1]
-        ]
-        while headers and headers[-1] == "":
-            headers.pop()
+    @classmethod
+    def _read_sheet_preview(cls, ws, max_scan_rows: int = 10) -> tuple[int, list[str], list[list[str]], int]:
+        """Scan candidate rows to find the best matching header row and return (header_row_index, headers, preview_rows, row_count)."""
+        best_row_idx = 1
+        best_score = -1
+        best_headers: list[str] = []
 
+        # Find total rows to scan (cap at max_scan_rows)
+        max_scan = min(max_scan_rows, ws.max_row or 10)
+        for r_idx in range(1, max_scan + 1):
+            row_cells = [
+                str(cell.value).strip() if cell.value is not None else ""
+                for cell in ws[r_idx]
+            ]
+            while row_cells and row_cells[-1] == "":
+                row_cells.pop()
+            if not row_cells or all(c == "" for c in row_cells):
+                continue
+
+            # Compute match score against header patterns
+            score = 0
+            mpn_matched = False
+            qty_matched = False
+            for field_name, patterns in HEADER_PATTERNS_ORDERED:
+                matched = False
+                for cell_val in row_cells:
+                    cell_lower = cell_val.lower().strip()
+                    if not cell_lower:
+                        continue
+                    for pattern in patterns:
+                        if re.search(pattern, cell_lower, re.IGNORECASE):
+                            matched = True
+                            break
+                    if matched:
+                        break
+                if matched:
+                    if field_name == "mpn":
+                        score += 10
+                        mpn_matched = True
+                    elif field_name == "quantity":
+                        score += 10
+                        qty_matched = True
+                    else:
+                        score += 2
+
+            if mpn_matched and qty_matched:
+                score += 15
+
+            if score > best_score:
+                best_score = score
+                best_row_idx = r_idx
+                best_headers = row_cells
+
+        # Fallback to row 1 if no candidate row scored well
+        if not best_headers or best_score <= 0:
+            best_row_idx = 1
+            best_headers = [
+                str(cell.value).strip() if cell.value is not None else ""
+                for cell in ws[1]
+            ]
+            while best_headers and best_headers[-1] == "":
+                best_headers.pop()
+
+        # Read preview rows and count non-empty data rows after header row
         preview_rows = []
         row_count = 0
-        for row in ws.iter_rows(min_row=2, values_only=True):
-            row_data = list(row[: len(headers)])
+        for row in ws.iter_rows(min_row=best_row_idx + 1, values_only=True):
+            row_data = list(row[: len(best_headers)])
             if all(v is None or str(v).strip() == "" for v in row_data):
                 continue
             row_count += 1
@@ -136,7 +190,7 @@ class BomParser:
                 preview_rows.append(
                     [str(v) if v is not None else "" for v in row_data]
                 )
-        return headers, preview_rows, row_count
+        return best_row_idx, best_headers, preview_rows, row_count
 
     def inspect_sheets(self, file_path: str) -> list[BomFile]:
         """Inspect all visible sheets in a workbook and return a BomFile for each.
@@ -160,7 +214,7 @@ class BomParser:
             for ws in wb.worksheets:
                 if ws.sheet_state != "visible":
                     continue
-                headers, preview_rows, row_count = self._read_sheet_preview(ws)
+                header_row_idx, headers, preview_rows, row_count = self._read_sheet_preview(ws)
                 mapping = self._auto_detect_columns(headers, preview_rows)
 
                 # Duplicate sheet detection
@@ -220,6 +274,7 @@ class BomParser:
                     board_name=base_name,
                     sheet_name=ws.title,
                     headers=headers,
+                    header_row_index=header_row_idx,
                     column_mapping=mapping,
                     row_count=row_count,
                     preview_rows=preview_rows,
@@ -452,7 +507,8 @@ class BomParser:
                     f"matching sheet '{bom_file.sheet_name}'."
                 )
 
-            for row in ws.iter_rows(min_row=2, values_only=True):
+            min_data_row = (bom_file.header_row_index or 1) + 1
+            for row in ws.iter_rows(min_row=min_data_row, values_only=True):
                 row_list = list(row)
 
                 if all(v is None or str(v).strip() == "" for v in row_list):

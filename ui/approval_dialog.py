@@ -148,7 +148,7 @@ class ApprovalDialog(QDialog):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(8, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(9, QHeaderView.ResizeMode.Fixed)
-        self.table_pending.setColumnWidth(9, 140)
+        self.table_pending.setColumnWidth(9, 220)
 
     def _load_data(self):
         mappings = self.db_manager.get_all_internal_mappings()
@@ -164,21 +164,42 @@ class ApprovalDialog(QDialog):
         for row, mapping in enumerate(pending_list):
             self._fill_pending_row(row, mapping)
             
-            btn_approve = QPushButton("Approve")
-            btn_approve.setObjectName("actionApproveBtn")
-            btn_approve.setMinimumWidth(104)
-            btn_approve.setFixedHeight(34)
-            btn_approve.clicked.connect(lambda checked, r=row: self._on_approve_clicked(r))
-            
             container = QWidget()
             h_layout = QHBoxLayout(container)
-            h_layout.setContentsMargins(4, 2, 4, 2)
-            h_layout.addWidget(btn_approve)
-            btn_reject = QPushButton("Reject")
-            btn_reject.setObjectName("actionDeleteBtn")
-            btn_reject.setFixedHeight(34)
-            btn_reject.clicked.connect(lambda checked, r=row: self._on_reject_clicked(r))
-            h_layout.addWidget(btn_reject)
+            h_layout.setContentsMargins(2, 2, 2, 2)
+            h_layout.setSpacing(4)
+            
+            has_lcsc_pending = bool(mapping.get("lcsc_pending_change"))
+            has_dk_pending = bool(mapping.get("digikey_pending_change"))
+            
+            if has_lcsc_pending and not has_dk_pending:
+                btn_app = QPushButton("Approve LCSC")
+                btn_app.setObjectName("actionApproveBtn")
+                btn_app.clicked.connect(lambda checked, r=row: self._on_approve_supplier_clicked(r, "JLCPCB"))
+                btn_rej = QPushButton("Reject LCSC")
+                btn_rej.setObjectName("actionDeleteBtn")
+                btn_rej.clicked.connect(lambda checked, r=row: self._on_reject_supplier_clicked(r, "JLCPCB"))
+                h_layout.addWidget(btn_app)
+                h_layout.addWidget(btn_rej)
+            elif has_dk_pending and not has_lcsc_pending:
+                btn_app = QPushButton("Approve DK")
+                btn_app.setObjectName("actionApproveBtn")
+                btn_app.clicked.connect(lambda checked, r=row: self._on_approve_supplier_clicked(r, "DIGIKEY"))
+                btn_rej = QPushButton("Reject DK")
+                btn_rej.setObjectName("actionDeleteBtn")
+                btn_rej.clicked.connect(lambda checked, r=row: self._on_reject_supplier_clicked(r, "DIGIKEY"))
+                h_layout.addWidget(btn_app)
+                h_layout.addWidget(btn_rej)
+            else:
+                btn_app_all = QPushButton("Approve All")
+                btn_app_all.setObjectName("actionApproveBtn")
+                btn_app_all.clicked.connect(lambda checked, r=row: self._on_approve_clicked(r))
+                btn_rej_all = QPushButton("Reject All")
+                btn_rej_all.setObjectName("actionDeleteBtn")
+                btn_rej_all.clicked.connect(lambda checked, r=row: self._on_reject_clicked(r))
+                h_layout.addWidget(btn_app_all)
+                h_layout.addWidget(btn_rej_all)
+                
             self.table_pending.setCellWidget(row, 9, container)
 
     def _populate_approved_table(self, approved_list):
@@ -247,6 +268,33 @@ class ApprovalDialog(QDialog):
 
     def _on_approve_clicked(self, row: int):
         self._process_upsert(self.table_pending, row, is_approve_action=True)
+
+    def _on_approve_supplier_clicked(self, row: int, supplier: str):
+        comment = self.table_pending.item(row, 0).text().strip()
+        mpn = self.table_pending.item(row, 1).text().strip()
+        mapping = self.table_pending.item(row, 0).data(Qt.ItemDataRole.UserRole) or {}
+        if supplier.upper() in ("JLCPCB", "LCSC"):
+            code = self.table_pending.item(row, 2).text().strip()
+            if not code or code == (mapping.get("lcsc_code", "") or "").strip():
+                code = self.table_pending.item(row, 4).text().strip()
+        else:
+            code = self.table_pending.item(row, 5).text().strip()
+            if not code or code == (mapping.get("digikey_code", "") or "").strip():
+                code = self.table_pending.item(row, 7).text().strip()
+        try:
+            self.db_manager.approve_supplier_mapping(comment, supplier, code, mpn)
+            QMessageBox.information(self, "Success", f"{supplier} mapping for '{comment}' has been approved.")
+            self._load_data()
+        except Exception as e:
+            QMessageBox.critical(self, "Database Error", str(e))
+
+    def _on_reject_supplier_clicked(self, row: int, supplier: str):
+        comment = self.table_pending.item(row, 0).text().strip()
+        try:
+            self.db_manager.reject_supplier_pending_change(comment, supplier)
+            self._load_data()
+        except Exception as e:
+            QMessageBox.critical(self, "Database Error", str(e))
 
     def _on_reject_clicked(self, row: int):
         comment = self.table_pending.item(row, 0).text().strip()

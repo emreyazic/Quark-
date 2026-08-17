@@ -1,3 +1,4 @@
+main.py
 pyproject.toml
 core/__init__.py
 core/atomic_io.py
@@ -8,6 +9,7 @@ core/database_manager.py
 core/digikey_searcher.py
 core/excel_writer.py
 core/jlcpcb_searcher.py
+core/logger.py
 core/mpn_utils.py
 core/project_excel_writer.py
 core/utils.py
@@ -15,6 +17,7 @@ core/workspace_excel_writer.py
 jlcpcb_bom_tool.egg-info/PKG-INFO
 jlcpcb_bom_tool.egg-info/SOURCES.txt
 jlcpcb_bom_tool.egg-info/dependency_links.txt
+jlcpcb_bom_tool.egg-info/entry_points.txt
 jlcpcb_bom_tool.egg-info/requires.txt
 jlcpcb_bom_tool.egg-info/top_level.txt
 models/__init__.py
@@ -30,12 +33,14 @@ services/project_aggregation.py
 services/project_storage.py
 tests/test_atomic_io.py
 tests/test_base_excel_writer.py
+tests/test_bom_header_detection.py
 tests/test_bom_parser.py
 tests/test_bom_parser_workbooks.py
 tests/test_column_mapper_and_sheet_selector_ui.py
 tests/test_component_library_conflicts.py
 tests/test_component_library_import.py
 tests/test_database_manager.py
+tests/test_database_migrations.py
 tests/test_digikey_searcher.py
 tests/test_excel_writer_totals.py
 tests/test_file_manager_board_context.py
@@ -48,6 +53,8 @@ tests/test_project_aggregation.py
 tests/test_project_excel_writer.py
 tests/test_project_storage.py
 tests/test_refresh_history.py
+tests/test_retry_and_rotation.py
+tests/test_supplier_status_semantics.py
 tests/test_supplier_stock_output.py
 tests/test_unavailable_report_writer.py
 tests/test_workspace.py

@@ -1,4 +1,5 @@
 core
+main
 models
 resources
 services

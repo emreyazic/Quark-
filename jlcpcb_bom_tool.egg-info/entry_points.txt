@@ -1,0 +1,2 @@
+[console_scripts]
+jlcpcb-bom-tool = main:main

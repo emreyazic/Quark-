@@ -13,12 +13,16 @@ The module is structured so real DigiKey API integration can be added later.
 import os
 import time
 import json
-from typing import Optional
+import random
+from typing import Optional, Callable
 from urllib.parse import quote
 
 import requests
 
 from core.mpn_utils import clean_mpn_value, is_exact_mpn_match, normalize_digikey_price_breaks, select_digikey_price
+from core.logger import get_logger, mask_secret
+
+logger = get_logger(__name__)
 
 SOURCE_DIGIKEY_LIVE = "DIGIKEY_LIVE"
 SOURCE_SEARCH_FALLBACK = "SEARCH_FALLBACK"
@@ -53,19 +57,18 @@ class DigiKeySearcher:
     If credentials are not available, all searches return a 'not configured' result.
     """
 
-    def __init__(self, credential_start_index: int = 0):
-        # You can add as many DigiKey API credentials as you want to this dictionary.
-        # Format: {"CLIENT_ID": "CLIENT_SECRET"}
-        api_keys = {
-            "0jvVH0jdJXAS3GriH88tr2yH2TVDEKW1L5V4GUEOIx9ee0qD": "rqWPc0c5aiioUIWNeh2wwaPAOYKV90sW3ncFrSbAfurhCnyhiHfKqLM0G0bIXssf",
-            "EEwC7DCEbg69k8hbWvcEaY8c08VdcJB4oPcmkQPA8gNiNyOI":"GoaPQIvy8Kvx5H35y5toeZiqSHkSoA4DPiSj8Jx9S1J3HeTg5CLNh9dMurHbKPTk",
-            "IhlhvvhqGJ6tVsnKp8gDJU3h1JZ2MAXXyA5kovVL5egXwkgF":"HzyZ2e8VY3RK7K1qeJMGEjeEDxQahTdRu1VyCAN8jA3H4A3VGFsI1lSyiK4Sar7j",
-            "A45Zq2AakXtIHa5wItLKxGpAbHWpDj7ovHUCB4xXOAUIDDVV": "rAJG8WSB0JKwCAyPhhw0Xpn9nSqZYjlCTaeUUGD4JqO87OQX8GqAilJ9eoYafJIG",
-            # "YOUR_CLIENT_ID_2": "YOUR_CLIENT_SECRET_2",
-            # "YOUR_CLIENT_ID_3": "YOUR_CLIENT_SECRET_3",
-        }
+    def __init__(
+        self,
+        credential_start_index: int = 0,
+        credentials: Optional[list[tuple[str, str]]] = None,
+        _sleep_fn: Callable[[float], None] = time.sleep,
+        max_retries: int = 3,
+    ):
+        self._sleep_fn = _sleep_fn
+        self.max_retries = max_retries
+        api_keys = {}
         
-        # Also support environment variables if set
+        # Load from environment variables
         id_env = os.environ.get("DIGIKEY_CLIENT_ID", "")
         secret_env = os.environ.get("DIGIKEY_CLIENT_SECRET", "")
         if id_env and secret_env:
@@ -73,6 +76,19 @@ class DigiKeySearcher:
             secrets = [s.strip() for s in secret_env.split(",") if s.strip()]
             for cid, csec in zip(ids, secrets):
                 api_keys[cid] = csec
+        
+        if credentials:
+            for cid, csec in credentials:
+                api_keys[cid] = csec
+
+        # Default fallback key set if not configured via env/param
+        if not api_keys:
+            api_keys = {
+                "0jvVH0jdJXAS3GriH88tr2yH2TVDEKW1L5V4GUEOIx9ee0qD": "rqWPc0c5aiioUIWNeh2wwaPAOYKV90sW3ncFrSbAfurhCnyhiHfKqLM0G0bIXssf",
+                "EEwC7DCEbg69k8hbWvcEaY8c08VdcJB4oPcmkQPA8gNiNyOI": "GoaPQIvy8Kvx5H35y5toeZiqSHkSoA4DPiSj8Jx9S1J3HeTg5CLNh9dMurHbKPTk",
+                "IhlhvvhqGJ6tVsnKp8gDJU3h1JZ2MAXXyA5kovVL5egXwkgF": "HzyZ2e8VY3RK7K1qeJMGEjeEDxQahTdRu1VyCAN8jA3H4A3VGFsI1lSyiK4Sar7j",
+                "A45Zq2AakXtIHa5wItLKxGpAbHWpDj7ovHUCB4xXOAUIDDVV": "rAJG8WSB0JKwCAyPhhw0Xpn9nSqZYjlCTaeUUGD4JqO87OQX8GqAilJ9eoYafJIG",
+            }
         
         self._credentials = list(api_keys.items())
         if self._credentials:
@@ -98,7 +114,7 @@ class DigiKeySearcher:
         return self._configured
 
     def _get_access_token(self) -> Optional[str]:
-        """Obtain or refresh OAuth2 access token from DigiKey API."""
+        """Obtain or refresh OAuth2 access token from DigiKey API with retry and credential rotation."""
         if not self._configured or self._active_cred_index >= len(self._credentials):
             return None
 
@@ -109,41 +125,65 @@ class DigiKeySearcher:
         failures = []
         while self._active_cred_index < len(self._credentials):
             client_id, client_secret = self._credentials[self._active_cred_index]
-            try:
-                resp = self.session.post(
-                    "https://api.digikey.com/v1/oauth2/token",
-                    data={
-                        "client_id": client_id,
-                        "client_secret": client_secret,
-                        "grant_type": "client_credentials",
-                    },
-                    timeout=10,
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                token = data.get("access_token") if isinstance(data, dict) else None
-                if not token:
-                    self._token_error = "DigiKey token response did not contain an access token"
+            masked_id = mask_secret(client_id)
+            attempt = 0
+            while attempt <= self.max_retries:
+                try:
+                    resp = self.session.post(
+                        "https://api.digikey.com/v1/oauth2/token",
+                        data={
+                            "client_id": client_id,
+                            "client_secret": client_secret,
+                            "grant_type": "client_credentials",
+                        },
+                        timeout=10,
+                    )
+                    if resp.status_code in (401, 403, 429):
+                        failures.append(f"HTTP {resp.status_code} ({masked_id})")
+                        logger.warning("DigiKey auth/quota failure (%d) for client %s, rotating credential", resp.status_code, masked_id)
+                        break  # Rotate credential
+
+                    if 400 <= resp.status_code < 500:
+                        self._token_error = f"DigiKey token request failed with HTTP {resp.status_code}"
+                        return None
+
+                    if resp.status_code >= 500:
+                        attempt += 1
+                        if attempt <= self.max_retries:
+                            delay = min(10.0, 0.5 * (2 ** (attempt - 1)) + random.uniform(0.1, 0.4))
+                            logger.warning("DigiKey token HTTP %d server error, retrying attempt %d/%d after %.2fs", resp.status_code, attempt, self.max_retries, delay)
+                            self._sleep_fn(delay)
+                            continue
+                        failures.append(f"HTTP {resp.status_code}")
+                        break
+
+                    resp.raise_for_status()
+                    data = resp.json()
+                    token = data.get("access_token") if isinstance(data, dict) else None
+                    if not token:
+                        self._token_error = "DigiKey token response did not contain an access token"
+                        return None
+                    self._access_token = token
+                    expires_in = data.get("expires_in", 1800)
+                    self._token_expires_at = time.time() + expires_in - 60
+                    self._token_error = None
+                    return token
+
+                except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+                    attempt += 1
+                    if attempt <= self.max_retries:
+                        delay = min(10.0, 0.5 * (2 ** (attempt - 1)) + random.uniform(0.1, 0.4))
+                        logger.warning("DigiKey token %s, retrying attempt %d/%d after %.2fs", type(exc).__name__, attempt, self.max_retries, delay)
+                        self._sleep_fn(delay)
+                        continue
+                    failures.append(type(exc).__name__)
+                    break
+                except (ValueError, TypeError, KeyError) as exc:
+                    self._token_error = f"Invalid DigiKey token response: {type(exc).__name__}"
                     return None
-                self._access_token = token
-                expires_in = data.get("expires_in", 1800)
-                self._token_expires_at = time.time() + expires_in - 60
-                self._token_error = None
-                return token
-            except requests.exceptions.HTTPError as exc:
-                status = exc.response.status_code if exc.response is not None else None
-                if status not in (401, 429) and not (status is not None and status >= 500):
-                    self._token_error = f"DigiKey token request failed with HTTP {status or 'error'}"
+                except requests.exceptions.RequestException as exc:
+                    self._token_error = f"DigiKey token request failed: {type(exc).__name__}"
                     return None
-                failures.append(f"HTTP {status}")
-            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
-                failures.append(type(exc).__name__)
-            except (ValueError, TypeError, KeyError) as exc:
-                self._token_error = f"Invalid DigiKey token response: {type(exc).__name__}"
-                return None
-            except requests.exceptions.RequestException as exc:
-                self._token_error = f"DigiKey token request failed: {type(exc).__name__}"
-                return None
 
             self._access_token = None
             self._active_cred_index += 1
@@ -500,6 +540,9 @@ def clear_digikey_live_data(item) -> None:
     item.digikey_unit_price = None
     item.digikey_price_breaks = []
     item.digikey_total_price = None
+    item.digikey_status = "not_searched"
+    item.digikey_error = ""
+    item.digikey_source = ""
 
 
 def enrich_bom_item_digikey(item, search_result: DigiKeySearchResult) -> None:
@@ -522,22 +565,21 @@ def enrich_bom_item_digikey(item, search_result: DigiKeySearchResult) -> None:
         item.refresh_status()
         return
 
-    if not search_result.found and not search_result.exact_match:
+    if not search_result.found:
         item.digikey_part_number = ""
         item.digikey_status = "not_found"
         item.refresh_status()
         return
 
     # Extract price info if available
-    if search_result.found or search_result.exact_match:
-        item.digikey_status = "found"
-        item.digikey_unit_price = search_result.unit_price
-        item.digikey_stock_qty = search_result.stock
-        item.digikey_price_breaks = search_result.price_breaks
-        if hasattr(item, 'digikey_part_number') and search_result.digikey_part_number:
-            item.digikey_part_number = search_result.digikey_part_number
-        if search_result.warnings:
-            warning_text = "; ".join(search_result.warnings)
-            existing_notes = str(getattr(item, "notes", "") or "")
-            item.notes = f"{existing_notes}; {warning_text}".strip("; ")
-        item.refresh_status()
+    item.digikey_status = "found"
+    item.digikey_unit_price = search_result.unit_price
+    item.digikey_stock_qty = search_result.stock
+    item.digikey_price_breaks = search_result.price_breaks
+    if hasattr(item, 'digikey_part_number') and search_result.digikey_part_number:
+        item.digikey_part_number = search_result.digikey_part_number
+    if search_result.warnings:
+        warning_text = "; ".join(search_result.warnings)
+        existing_notes = str(getattr(item, "notes", "") or "")
+        item.notes = f"{existing_notes}; {warning_text}".strip("; ")
+    item.refresh_status()
