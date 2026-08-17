@@ -19,12 +19,29 @@ class DatabaseManager:
 
     def __init__(self, db_path: Optional[str] = None, history_retention_days: Optional[int] = None):
         """Initialize the database manager with a path to the sqlite file."""
-        # Always keep the application database beside the project source, not
-        # beside the shell's current directory. Search workers and the UI can
-        # otherwise open different ``saves/database.sqlite`` files when the app
-        # is started from a shortcut or a different terminal directory.
-        project_root = Path(__file__).resolve().parent.parent
-        self.db_path = str(project_root / "saves" / "database.sqlite") if db_path is None else db_path
+        if db_path is not None:
+            self.db_path = db_path
+        else:
+            env_path = os.getenv("BOM_TOOL_DB_PATH")
+            if env_path:
+                self.db_path = env_path
+            else:
+                project_root = Path(__file__).resolve().parent.parent
+                default_saves = project_root / "saves"
+                try:
+                    default_saves.mkdir(parents=True, exist_ok=True)
+                    test_file = default_saves / ".write_test"
+                    test_file.touch()
+                    test_file.unlink()
+                    self.db_path = str(default_saves / "database.sqlite")
+                except (OSError, PermissionError):
+                    user_dir = (
+                        Path(os.getenv("LOCALAPPDATA") or Path.home() / ".jlcpcb_bom_tool")
+                        / "saves"
+                    )
+                    user_dir.mkdir(parents=True, exist_ok=True)
+                    self.db_path = str(user_dir / "database.sqlite")
+
         self._lock = self._shared_lock_for(self.db_path)
         configured_retention = os.getenv("SUPPLIER_HISTORY_RETENTION_DAYS", "365")
         self.history_retention_days = max(
@@ -391,6 +408,19 @@ class DatabaseManager:
         """Insert previously unknown pending mappings in one transaction."""
         if not records:
             return 0
+
+        # Deduplicate incoming records by comment_code (preserve first unique occurrence)
+        seen_codes = set()
+        unique_records = []
+        for record in records:
+            code = record[0].strip()
+            if code and code not in seen_codes:
+                seen_codes.add(code)
+                unique_records.append(record)
+
+        if not unique_records:
+            return 0
+
         with self._lock:
             with self._get_connection() as conn:
                 before = conn.total_changes
@@ -410,7 +440,7 @@ class DatabaseManager:
                             (lcsc_code or "").strip(),
                             (digikey_code or "").strip(),
                         )
-                        for comment_code, mpn, lcsc_code, digikey_code in records
+                        for comment_code, mpn, lcsc_code, digikey_code in unique_records
                     ],
                 )
                 conn.commit()
@@ -665,10 +695,10 @@ class DatabaseManager:
                 str,
                 str,
                 str,
-                str,
-                str,
                 Optional[int],
                 Optional[float],
+                str,
+                str,
                 str,
             ]
         ],

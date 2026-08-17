@@ -1,4 +1,3 @@
-# pyrefly: ignore-file
 """File manager widget — upload BOM files and assign board names."""
 
 import os

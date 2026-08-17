@@ -8,16 +8,23 @@ version = "1.0.0"
 description = "JLCPCB BOM Enrichment Tool"
 requires-python = ">=3.9"
 dependencies = [
-    "requests",
-    "PyQt6",
-    "openpyxl"
+    "requests>=2.28.0,<3.0.0",
+    "PyQt6>=6.4.0,<7.0.0",
+    "openpyxl>=3.1.0,<4.0.0"
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "pyright"]
+dev = [
+    "pytest>=7.0.0,<10.0.0",
+    "pyright>=1.1.300,<2.0.0",
+    "build>=1.0.0"
+]
 
 [tool.setuptools]
-packages = ["core", "ui", "models", "services", "resources", "saves"]
+packages = ["core", "ui", "models", "services", "resources"]
+
+[tool.setuptools.package-data]
+resources = ["*"]
 
 [tool.pyright]
 venvPath = "."
@@ -27,6 +34,8 @@ include = [
     "core",
     "models",
     "services",
+    "ui",
+    "main.py"
 ]
 reportMissingImports = false
 reportMissingTypeStubs = false

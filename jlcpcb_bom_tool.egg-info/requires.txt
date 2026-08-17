@@ -1,3 +1,8 @@
-requests
-PyQt6
-openpyxl
+requests<3.0.0,>=2.28.0
+PyQt6<7.0.0,>=6.4.0
+openpyxl<4.0.0,>=3.1.0
+
+[dev]
+pytest<10.0.0,>=7.0.0
+pyright<2.0.0,>=1.1.300
+build>=1.0.0

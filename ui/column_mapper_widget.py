@@ -1,4 +1,3 @@
-# pyrefly: ignore-file
 """Column mapper dialog — allows users to verify/override auto-detected column mappings.
 
 Improvements vs. original:

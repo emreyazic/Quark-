@@ -1,4 +1,3 @@
-# pyrefly: ignore-file
 """Progress widget — shows real-time search progress and log."""
 
 from PyQt6.QtCore import Qt, pyqtSignal

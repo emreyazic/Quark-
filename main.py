@@ -1,10 +1,8 @@
-# pyrefly: ignore-file
 """JLCPCB BOM Enrichment Tool — Entry Point."""
 
 import sys
 import os
 
-# pyrefly: ignore [missing-import]
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont, QIcon

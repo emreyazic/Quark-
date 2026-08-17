@@ -1,18 +1,18 @@
 {
-  "python_interpreter": "c:/Users/emrey/Downloads/JLCPCB_BOM_Tool-main/.venv/Scripts/python.exe",
-  "python-interpreter": "c:/Users/emrey/Downloads/JLCPCB_BOM_Tool-main/.venv/Scripts/python.exe",
+  "python_interpreter": ".venv/Scripts/python.exe",
+  "python-interpreter": ".venv/Scripts/python.exe",
   "site_packages": [
-    "c:/Users/emrey/Downloads/JLCPCB_BOM_Tool-main/.venv/Lib/site-packages"
+    ".venv/Lib/site-packages"
   ],
   "site-packages": [
-    "c:/Users/emrey/Downloads/JLCPCB_BOM_Tool-main/.venv/Lib/site-packages"
+    ".venv/Lib/site-packages"
   ],
   "search_path": [
-    "c:/Users/emrey/Downloads/JLCPCB_BOM_Tool-main",
-    "c:/Users/emrey/Downloads/JLCPCB_BOM_Tool-main/.venv/Lib/site-packages"
+    ".",
+    ".venv/Lib/site-packages"
   ],
   "search-path": [
-    "c:/Users/emrey/Downloads/JLCPCB_BOM_Tool-main",
-    "c:/Users/emrey/Downloads/JLCPCB_BOM_Tool-main/.venv/Lib/site-packages"
+    ".",
+    ".venv/Lib/site-packages"
   ]
 }

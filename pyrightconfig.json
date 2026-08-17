@@ -4,7 +4,9 @@
   "include": [
     "core",
     "models",
-    "services"
+    "services",
+    "ui",
+    "main.py"
   ],
   "exclude": ["**/__pycache__"],
   "typeCheckingMode": "basic",

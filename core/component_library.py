@@ -66,6 +66,8 @@ def read_component_library_file(file_path: str) -> Tuple[List[LibraryRow], int]:
             if "Components" in workbook.sheetnames
             else workbook.active
         )
+        if sheet is None:
+            raise ValueError("The selected workbook contains no active sheet.")
         rows = sheet.iter_rows(values_only=True)
         headers = next(rows, None)
         if not headers:
@@ -94,7 +96,7 @@ def read_component_library_file(file_path: str) -> Tuple[List[LibraryRow], int]:
                 continue
 
             raw_code = str(row[internal_index] or "").strip()
-            raw_mpn = clean_mpn_value(row[mpn_index])
+            raw_mpn = clean_mpn_value(str(row[mpn_index] or ""))
             norm_mpn = normalize_mpn(raw_mpn)
 
             if not raw_code or raw_mpn.upper() in INVALID_MPN_VALUES or not norm_mpn:

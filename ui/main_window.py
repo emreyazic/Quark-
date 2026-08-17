@@ -1,11 +1,4 @@
-# pyrefly: ignore-file
-"""Main application window for the JLCPCB BOM Enrichment Tool.
-
-Key additions vs. original:
-- Manual MPN Search tab with JLCPCB + DigiKey search
-- Updated results page with new status categories
-- Background worker for manual search (non-blocking UI)
-"""
+"""Main application window for the JLCPCB BOM Enrichment Tool."""
 
 import os
 import threading
@@ -30,6 +23,8 @@ from PyQt6.QtWidgets import (
     QInputDialog,
     QPushButton,
     QSizePolicy,
+    QPushButton,
+    QSizePolicy,
     QSplitter,
     QStackedWidget,
     QTableWidget,
@@ -49,6 +44,8 @@ from ui.column_mapper_widget import ColumnMapperDialog
 from ui.file_manager_widget import FileManagerWidget
 from ui.progress_widget import ProgressWidget
 from ui.approval_dialog import ApprovalDialog
+from ui.component_library_conflict_dialog import ComponentLibraryConflictDialog
+from core.component_library import read_component_library_file, detect_library_conflicts
 from core.database_manager import DatabaseManager
 
 APP_ID = "610325957269491714"
@@ -342,10 +339,19 @@ class ComponentLibraryImportWorker(QThread):
     LCSC_MAX_WORKERS = 8
     DIGIKEY_MAX_WORKERS = 4
 
-    def __init__(self, file_path: str, db_manager: DatabaseManager, parent=None):
+    def __init__(
+        self,
+        file_path: str,
+        db_manager: DatabaseManager,
+        parent=None,
+        pre_resolved_components: Optional[list[tuple[str, str]]] = None,
+        pre_resolved_skipped: int = 0,
+    ):
         super().__init__(parent)
         self.file_path = file_path
         self.db_manager = db_manager
+        self.pre_resolved_components = pre_resolved_components
+        self.pre_resolved_skipped = pre_resolved_skipped
         self._cancelled = threading.Event()
 
     def cancel(self):
@@ -356,39 +362,15 @@ class ComponentLibraryImportWorker(QThread):
         return " ".join(str(value or "").strip().upper().split())
 
     def _read_components(self) -> tuple[list[tuple[str, str]], int]:
-        workbook = load_workbook(self.file_path, read_only=True, data_only=True)
-        try:
-            sheet = workbook["Components"] if "Components" in workbook.sheetnames else workbook.active
-            rows = sheet.iter_rows(values_only=True)
-            headers = next(rows, None)
-            if not headers:
-                raise ValueError("The selected file is empty.")
-            header_map = {self._normalize_header(value): index for index, value in enumerate(headers)}
-            internal_index = header_map.get("LIBRARYREFERENCE", header_map.get("COMMENT"))
-            mpn_index = header_map.get("MANUFACTURER PART NUMBER")
-            if internal_index is None or mpn_index is None:
-                raise ValueError(
-                    "Required columns were not found. Expected LIBRARYREFERENCE (or COMMENT) and MANUFACTURER PART NUMBER."
-                )
+        if self.pre_resolved_components is not None:
+            return self.pre_resolved_components, self.pre_resolved_skipped
 
-            components = []
-            skipped = 0
-            seen = set()
-            for row in rows:
-                internal_code = str(row[internal_index] or "").strip()
-                mpn = clean_mpn_value(row[mpn_index])
-                if not internal_code or mpn.upper() in self.INVALID_MPN_VALUES:
-                    skipped += 1
-                    continue
-                key = (internal_code, mpn.upper())
-                if key in seen:
-                    skipped += 1
-                    continue
-                seen.add(key)
-                components.append((internal_code, mpn))
-            return components, skipped
-        finally:
-            workbook.close()
+        raw_rows, invalid_skipped = read_component_library_file(self.file_path)
+        clean_components, conflicts, merged_duplicates = detect_library_conflicts(
+            raw_rows, self.db_manager
+        )
+        total_skipped = invalid_skipped + merged_duplicates + len(conflicts)
+        return clean_components, total_skipped
 
     def run(self):
         jlc_searchers = []
@@ -1163,9 +1145,47 @@ class MainWindow(QMainWindow):
     def _import_component_library(self, file_path: str):
         if self._component_library_import_worker is not None:
             return
+
+        try:
+            raw_rows, invalid_skipped = read_component_library_file(file_path)
+            clean_components, conflicts, merged_duplicates = detect_library_conflicts(
+                raw_rows, self._database_manager
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Component Library Read Error", str(exc))
+            return
+
+        total_skipped = invalid_skipped + merged_duplicates
+        resolved_mappings = []
+
+        if conflicts:
+            dlg = ComponentLibraryConflictDialog(conflicts, self)
+            if dlg.exec() != ComponentLibraryConflictDialog.DialogCode.Accepted:
+                return
+            resolved_mappings = dlg.get_resolved_mappings()
+            unresolved_count = len(conflicts) - len(resolved_mappings)
+            total_skipped += unresolved_count
+
+        final_components = clean_components + resolved_mappings
+
+        if not final_components:
+            QMessageBox.information(
+                self,
+                "Component Library Import",
+                f"No valid components to import.\n"
+                f"Skipped {total_skipped} empty, invalid, duplicate, or unselected conflicting row(s).",
+            )
+            return
+
         self._file_manager.set_component_library_import_enabled(False)
         self.statusBar().showMessage(f"Reading component library: {os.path.basename(file_path)}")
-        worker = ComponentLibraryImportWorker(file_path, self._database_manager, self)
+        worker = ComponentLibraryImportWorker(
+            file_path,
+            self._database_manager,
+            self,
+            pre_resolved_components=final_components,
+            pre_resolved_skipped=total_skipped,
+        )
         self._component_library_import_worker = worker
         worker.progress.connect(self._on_component_library_import_progress)
         worker.finished.connect(self._on_component_library_import_finished)
@@ -1345,7 +1365,12 @@ class MainWindow(QMainWindow):
             return build_quantity, "project"
         return None
 
-    def _start_processing(self, force_refresh: bool = False, build_quantity: int = None, pricing_mode: str = None):
+    def _start_processing(
+        self,
+        force_refresh: bool = False,
+        build_quantity: Optional[int] = None,
+        pricing_mode: Optional[str] = None,
+    ):
         """Parse all BOM files, then start JLCPCB search."""
         if build_quantity is None or pricing_mode is None:
             options = self._prompt_processing_options()

@@ -1,4 +1,3 @@
-# pyrefly: ignore-file
 """Sheet selector dialog for multi-sheet BOM workbooks.
 
 Allows users to preview sheet names, row counts, and detected column mappings,
