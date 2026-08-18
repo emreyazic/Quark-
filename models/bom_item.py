@@ -105,12 +105,21 @@ class BomItem:
     digikey_unit_price: Optional[float] = None
     digikey_stock_qty: Optional[int] = None
     digikey_part_number: str = ""
+    production_quantity: Optional[Union[int, float]] = None
+    safety_surplus: int = 0
+    purchase_quantity: Optional[Union[int, float]] = None
     pricing_quantity: Union[int, float] = 1
     jlcpcb_total_price: Optional[float] = None
     digikey_total_price: Optional[float] = None
     
     jlcpcb_price_breaks_raw: str = ""
     digikey_price_breaks: list[tuple[int, float]] = field(default_factory=list)
+    jlcpcb_min_order_quantity: Optional[int] = None
+    jlcpcb_order_multiple: int = 1
+    jlcpcb_currency: str = "USD"
+    digikey_min_order_quantity: Optional[int] = None
+    digikey_order_multiple: int = 1
+    digikey_currency: str = "USD"
     
     is_basic: bool = False
     is_preferred: bool = False
@@ -136,7 +145,7 @@ class BomItem:
         ("Board Name", "board_name"),
         ("Description", "description"),
         ("Designator", "designator"),
-        ("Quantity (Per Board / Total)", "quantity_formatted"), # We can use a property for this if needed, but for raw it's just 'quantity'
+        ("Quantity (Per Board / Total)", "quantity_formatted"),
         ("Value", "value"),
         ("Manufacturer", "manufacturer"),
         ("MPN", "mpn"),
@@ -147,11 +156,37 @@ class BomItem:
         ("DigiKey Stock", "digikey_stock_qty"),
         ("JLCPCB Unit Price", "unit_price"),
         ("DigiKey Unit Price", "digikey_unit_price"),
-        ("Pricing Quantity", "pricing_quantity"),
+        ("Production Required Quantity", "production_quantity_val"),
+        ("Safety Surplus", "safety_surplus"),
+        ("Purchase Quantity", "purchase_quantity_val"),
         ("JLCPCB Total Price", "jlcpcb_total_price"),
         ("DigiKey Total Price", "digikey_total_price"),
         ("Status", "status"),
     ]
+
+    @property
+    def production_quantity_val(self) -> int:
+        if self.production_quantity is not None:
+            try:
+                from core.mpn_utils import parse_positive_integer_quantity
+                return parse_positive_integer_quantity(self.production_quantity)
+            except (ValueError, TypeError):
+                pass
+        try:
+            from core.mpn_utils import parse_positive_integer_quantity
+            return parse_positive_integer_quantity(self.quantity)
+        except (ValueError, TypeError):
+            return 1
+
+    @property
+    def purchase_quantity_val(self) -> int:
+        if self.purchase_quantity is not None:
+            try:
+                from core.mpn_utils import parse_positive_integer_quantity
+                return parse_positive_integer_quantity(self.purchase_quantity)
+            except (ValueError, TypeError):
+                pass
+        return self.production_quantity_val + self.safety_surplus
 
     @property
     def quantity_formatted(self) -> str:
@@ -179,10 +214,10 @@ class BomItem:
 
     @property
     def is_not_found(self) -> bool:
-        """True only when every queried supplier completed without finding an exact result."""
+        """True only when every queried supplier returned not_found."""
         statuses = (self.jlcpcb_status, self.digikey_status)
         queried = [status for status in statuses if status != "not_searched"]
-        return bool(queried) and all(status in ("not_found", "mismatch") for status in queried)
+        return bool(queried) and all(status == "not_found" for status in queried)
 
     def refresh_status(self) -> str:
         """Derive the presentation status from independent supplier states."""
@@ -191,19 +226,40 @@ class BomItem:
                 self.status = f"Warning [{self.jlcpcb_source or 'JLCPCB'}]: {self.notes}"
             else:
                 self.status = ""
-        elif self.jlcpcb_status == "mismatch":
-            self.status = "No exact JLCPCB match"
-        elif self.is_not_found:
-            self.status = "Not Found"
         else:
             errors = [
                 f"JLCPCB API error: {self.jlcpcb_error}" if self.jlcpcb_status == "error" else "",
                 f"DigiKey API error: {self.digikey_error}" if self.digikey_status == "error" else "",
             ]
             errors = [error for error in errors if error]
-            if errors:
+            if self.jlcpcb_status == "mismatch":
+                if errors:
+                    self.status = f"No exact JLCPCB match; {'; '.join(errors)}"
+                else:
+                    self.status = "No exact JLCPCB match"
+            elif errors:
                 self.status = "; ".join(errors)
+            elif self.is_not_found:
+                self.status = "Not Found"
+            elif "Insufficient JLCPCB stock" in (self.status or ""):
+                pass
+            elif not self.status:
+                self.status = "Not Found"
         return self.status
+
+    def get_ui_category(self) -> str:
+        """Return a single mutually exclusive category: 'available', 'not_found', 'mismatch', 'low_stock', 'error', 'manual'."""
+        if self.is_available:
+            return "available"
+        if "Insufficient JLCPCB stock" in (self.status or ""):
+            return "low_stock"
+        if self.jlcpcb_status == "mismatch" or "No exact JLCPCB match" in (self.status or ""):
+            return "mismatch"
+        if self.is_not_found or self.status == "Not Found":
+            return "not_found"
+        if self.jlcpcb_status == "error" or self.digikey_status == "error" or "error" in (self.status or "").lower():
+            return "error"
+        return "manual"
 
     @classmethod
     def get_headers(cls) -> list[str]:

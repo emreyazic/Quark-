@@ -45,8 +45,8 @@ def test_master_summary_totals_and_unpriced(tmp_path):
     
     # Enrich them
     enriched = [
-        BomItem(mpn="R1", jlcpcb_part_number="C123", status="✅ Found", jlcpcb_price_breaks_raw='[{"qFrom": 1, "price": 0.10}]'),
-        BomItem(mpn="R2", status="Not found", digikey_price_breaks=[(1, 0.50)]),
+        BomItem(mpn="R1", jlcpcb_part_number="C123", available_stock_qty=100, status="✅ Found", jlcpcb_price_breaks_raw='[{"qFrom": 1, "price": 0.10}]'),
+        BomItem(mpn="R2", digikey_part_number="DK-R2", digikey_status="found", digikey_stock_qty=100, digikey_price_breaks=[(1, 0.50)]),
         BomItem(mpn="R3", status="Not found") # Unpriced
     ]
     
@@ -103,7 +103,11 @@ def test_master_summary_and_detail_use_same_scalar_price_fallback(tmp_path):
         mpn="R1",
         pricing_quantity=6,
         jlcpcb_part_number="C1",
+        available_stock_qty=100,
         unit_price=1.25,
+        digikey_part_number="DK1",
+        digikey_status="found",
+        digikey_stock_qty=100,
         digikey_unit_price=2.0,
     )
 
@@ -194,8 +198,12 @@ def test_jlcpcb_negative_status_fallback_to_digikey(tmp_path):
         BomItem(
             mpn="R1", 
             jlcpcb_part_number="C123", 
+            available_stock_qty=0,
             status="Insufficient JLCPCB stock", 
             jlcpcb_price_breaks_raw='[{"qFrom": 1, "price": 0.10}]',
+            digikey_part_number="DK-123",
+            digikey_status="found",
+            digikey_stock_qty=50,
             digikey_price_breaks=[(1, 0.50)]
         )
     ]
@@ -221,10 +229,10 @@ def test_jlcpcb_negative_status_fallback_to_digikey(tmp_path):
             comb = row[3]
             dk_only = row[4]
             
-            # Stock is informational; a valid JLCPCB code/price remains costed.
-            assert jlc_cost == 0.10
-            assert dk_cost == 0.0
-            assert comb == 0.10
+            # JLCPCB has insufficient stock (0), so it falls back to DigiKey for sourcing
+            assert jlc_cost == 0.0
+            assert dk_cost == 0.50
+            assert comb == 0.50
             assert dk_only == 0.50
 
 def test_board_quantity_math(tmp_path):
@@ -237,7 +245,7 @@ def test_board_quantity_math(tmp_path):
     agg = aggregate_project(project)
     
     enriched = [
-        BomItem(mpn="R1", digikey_price_breaks=[(1, 0.20)])
+        BomItem(mpn="R1", digikey_part_number="DK-R1", digikey_status="found", digikey_stock_qty=1000, digikey_price_breaks=[(1, 0.20)])
     ]
     
     writer = ProjectExcelWriter(

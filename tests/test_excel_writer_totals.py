@@ -33,14 +33,22 @@ def test_unit_mode_total_cost_sums_extended_price_columns(tmp_path):
     sheet = workbook["Enriched BOM"]
     headers = [cell.value for cell in sheet[1]]
     total_row = len(items) + 2
-    label_col = headers.index("Pricing Quantity") + 1
+    label_col = (
+        headers.index("Purchase Quantity") + 1
+        if "Purchase Quantity" in headers
+        else headers.index("Pricing Quantity") + 1
+    )
     jlc_total_col = headers.index("JLCPCB Total Price") + 1
     dk_total_col = headers.index("DigiKey Total Price") + 1
     jlc_unit_col = headers.index("JLCPCB Unit Price") + 1
 
+    from openpyxl.utils import get_column_letter
+    jlc_letter = get_column_letter(jlc_total_col)
+    dk_letter = get_column_letter(dk_total_col)
+
     assert sheet.cell(total_row, label_col).value == "Total Cost"
-    assert sheet.cell(total_row, jlc_total_col).value == "=SUM(P2:P3)"
-    assert sheet.cell(total_row, dk_total_col).value == "=SUM(Q2:Q3)"
+    assert sheet.cell(total_row, jlc_total_col).value == f"=SUM({jlc_letter}2:{jlc_letter}3)"
+    assert sheet.cell(total_row, dk_total_col).value == f"=SUM({dk_letter}2:{dk_letter}3)"
     assert sheet.cell(total_row, jlc_unit_col).value is None
 
 

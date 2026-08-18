@@ -92,6 +92,67 @@ def test_digikey_credential_rotation_on_429_and_auth_error(monkeypatch):
     assert searcher._active_cred_index == 1  # Successfully rotated to next credential
 
 
+def test_digikey_product_endpoint_retry_on_timeout_and_500(monkeypatch):
+    sleep_calls = []
+    searcher = DigiKeySearcher(
+        _sleep_fn=lambda delay: sleep_calls.append(delay),
+        max_retries=3,
+    )
+    searcher._credentials = [("client-1", "secret-1"), ("client-2", "secret-2")]
+    monkeypatch.setattr(searcher, "_get_access_token", lambda: "valid-token")
+
+    product_attempts = 0
+    def mock_product_post(url, **kwargs):
+        nonlocal product_attempts
+        product_attempts += 1
+        if product_attempts == 1:
+            raise requests.exceptions.Timeout("Product search timeout")
+        if product_attempts == 2:
+            return _MockResponse(500)
+        return _MockResponse(200, {
+            "ExactMatches": [{
+                "ManufacturerProductNumber": "TEST-MPN",
+                "ProductVariations": [{"DigiKeyProductNumber": "DK-123", "QuantityAvailable": 100}]
+            }]
+        })
+
+    monkeypatch.setattr(searcher.session, "post", mock_product_post)
+
+    result = searcher.search_mpn("TEST-MPN", include_live_data=False)
+    assert result.found is True
+    assert product_attempts == 3
+    assert searcher._active_cred_index == 0  # Did not rotate on 500/timeout
+    assert len(sleep_calls) == 2
+
+
+def test_digikey_product_endpoint_credential_rotation_on_401_and_429(monkeypatch):
+    searcher = DigiKeySearcher(_sleep_fn=lambda _: None, max_retries=3)
+    searcher._credentials = [("client-1", "secret-1"), ("client-2", "secret-2")]
+    tokens = {"client-1": "token-1", "client-2": "token-2"}
+    monkeypatch.setattr(searcher, "_get_access_token", lambda: tokens[searcher._credentials[searcher._active_cred_index][0]])
+
+    attempt_clients = []
+    def mock_product_post(url, **kwargs):
+        headers = kwargs.get("headers", {})
+        client_id = headers.get("X-DIGIKEY-Client-Id")
+        attempt_clients.append(client_id)
+        if client_id == "client-1":
+            return _MockResponse(401)
+        return _MockResponse(200, {
+            "ExactMatches": [{
+                "ManufacturerProductNumber": "TEST-MPN",
+                "ProductVariations": [{"DigiKeyProductNumber": "DK-123", "QuantityAvailable": 100}]
+            }]
+        })
+
+    monkeypatch.setattr(searcher.session, "post", mock_product_post)
+
+    result = searcher.search_mpn("TEST-MPN", include_live_data=False)
+    assert result.found is True
+    assert attempt_clients == ["client-1", "client-2"]
+    assert searcher._active_cred_index == 1
+
+
 def test_mask_secret_helper():
     assert mask_secret("") == "(empty)"
     assert mask_secret("short") == "***"

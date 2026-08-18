@@ -179,6 +179,76 @@ def is_res_coded(comment: str) -> bool:
     return bool(re.match(r'^RES\d', comment_stripped, re.IGNORECASE))
 
 
+def is_resistor_or_capacitor(
+    item_or_designator=None,
+    description: str = "",
+    comment: str = "",
+    value: str = "",
+    footprint: str = "",
+) -> bool:
+    """Identify if a component is a resistor or capacitor.
+
+    Priority:
+    1. Designator starting with R/RN (resistor) or C (capacitor).
+    2. Secondary verification via description, comment, footprint, value.
+    """
+    designator = ""
+    if item_or_designator is not None:
+        if hasattr(item_or_designator, "designator"):
+            designator = str(getattr(item_or_designator, "designator", "") or "")
+            description = description or str(getattr(item_or_designator, "description", "") or "")
+            comment = comment or str(getattr(item_or_designator, "comment", "") or "")
+            value = value or str(getattr(item_or_designator, "value", "") or "")
+            footprint = footprint or str(getattr(item_or_designator, "footprint", "") or "")
+        else:
+            designator = str(item_or_designator or "")
+
+    # Primary check: Designator (R, RN for resistors; C for capacitors)
+    if designator:
+        tokens = re.findall(r'[A-Za-z0-9_-]+', designator)
+        for tok in tokens:
+            tok_upper = tok.upper().strip()
+            # Resistor: R or RN followed by digits or exact R/RN (e.g. R1, R12, RN1, RN100)
+            if re.match(r'^(RN|R)(\d+.*|$)', tok_upper):
+                if not re.match(r'^(RF|REG|RELAY|RJ|RTC|RESET)\b', tok_upper):
+                    return True
+            # Capacitor: C followed by digits or exact C (e.g. C1, C12, C100)
+            if re.match(r'^C(\d+.*|$)', tok_upper):
+                if not re.match(r'^(CN|CR|CP|CON|CLK|CPU|CONN)\b', tok_upper):
+                    return True
+
+    # Secondary check: Description, Comment, Value, Footprint
+    text = " ".join([description, comment, value, footprint]).lower()
+    if not text.strip():
+        return False
+
+    # Resistor keywords & patterns
+    if re.search(r'\b(resistor|resistors|res|res_array|res_net|potentiometer)\b', text):
+        return True
+    if re.search(r'\bres\d+\b', text):  # e.g. RES010251
+        return True
+    if re.search(r'\b\d+(\.\d+)?\s*(k|m|g|r)?\s*(ohm|ohms|kohm|mohm|ω|kω|mω)\b', text, re.IGNORECASE):
+        return True
+
+    # Capacitor keywords & patterns
+    if re.search(r'\b(capacitor|capacitors|cap|ceramic_cap|tantalum_cap|elec_cap)\b', text):
+        return True
+    if re.search(r'\bcap\d+\b', text):  # e.g. CAP010251
+        return True
+    if re.search(r'\b\d+(\.\d+)?\s*(p|n|u|µ)\s*f\b', text, re.IGNORECASE):  # e.g. 10uF, 100nF, 22pF
+        return True
+
+    return False
+
+
+def get_safety_surplus(item_or_designator=None, **kwargs) -> int:
+    """Return fixed 10 safety surplus for resistors and capacitors, 0 for other components."""
+    surplus = 10 if is_resistor_or_capacitor(item_or_designator, **kwargs) else 0
+    if item_or_designator is not None and hasattr(item_or_designator, "safety_surplus"):
+        item_or_designator.safety_surplus = surplus
+    return surplus
+
+
 def parse_positive_integer_quantity(quantity) -> int:
     """Validate and return a component quantity as a positive integer.
 

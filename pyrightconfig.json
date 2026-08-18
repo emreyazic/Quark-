@@ -10,7 +10,7 @@
   ],
   "exclude": ["**/__pycache__"],
   "typeCheckingMode": "basic",
-  "reportMissingImports": "none",
+  "reportMissingImports": true,
   "reportMissingTypeStubs": "none",
   "reportOptionalMemberAccess": "warning",
   "reportIncompatibleMethodOverride": "warning"

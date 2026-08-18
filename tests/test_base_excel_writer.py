@@ -93,7 +93,11 @@ def test_project_cost_summary_falls_back_to_scalar_supplier_prices():
     item = BomItem(
         jlcpcb_part_number="C123",
         unit_price=2.0,
+        available_stock_qty=100,
+        digikey_part_number="DK123",
+        digikey_status="found",
         digikey_unit_price=3.0,
+        digikey_stock_qty=100,
         jlcpcb_price_breaks_raw="",
         digikey_price_breaks=[],
     )
@@ -111,6 +115,7 @@ def test_jlcpcb_price_remains_usable_when_digikey_has_api_error():
     writer = BaseExcelWriter(pricing_mode="unit")
     item = BomItem(
         jlcpcb_part_number="C123", unit_price=2.0, pricing_quantity=4,
+        available_stock_qty=100,
         jlcpcb_status="found", digikey_status="error",
         digikey_error="503 Service Unavailable",
     )

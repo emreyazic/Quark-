@@ -92,6 +92,9 @@ class JlcpcbSearchResult:
         self.stock: int = 0
         self.unit_price: Optional[float] = None
         self.price_breaks_raw: str = ""
+        self.minimum_order_quantity: Optional[int] = None
+        self.order_multiple: int = 1
+        self.currency: str = "USD"
         self.package: str = ""
         self.category: str = ""
         self.subcategory: str = ""
@@ -109,9 +112,9 @@ class JlcpcbSearcher:
     """Searches and enriches JLCPCB parts using MPN resolution + Official JOP API."""
     def __init__(
         self,
-        app_id: str,
-        access_key: str,
-        secret_key: str,
+        app_id: str = "",
+        access_key: str = "",
+        secret_key: str = "",
         db_manager: Optional[DatabaseManager] = None,
         _sleep_fn: Callable[[float], None] = time.sleep,
         max_retries: int = 3,
@@ -774,6 +777,28 @@ class JlcpcbSearcher:
             
             price_ranges = exact_comp.get("priceRanges", []) or exact_comp.get("priceList", [])
             result.price_breaks_raw = self._normalize_jop_price_ranges(price_ranges)
+            currency = exact_comp.get("priceCurrency") or exact_comp.get("currency")
+            if isinstance(currency, str) and currency.strip():
+                result.currency = currency.strip().upper()
+            try:
+                moq = int(
+                    exact_comp.get("minimumOrderQuantity")
+                    or exact_comp.get("minOrderQuantity")
+                    or exact_comp.get("moq")
+                    or 0
+                )
+                result.minimum_order_quantity = moq if moq > 0 else None
+            except (TypeError, ValueError):
+                result.minimum_order_quantity = None
+            try:
+                multiple = int(
+                    exact_comp.get("orderMultiple")
+                    or exact_comp.get("orderIncrement")
+                    or 1
+                )
+                result.order_multiple = multiple if multiple > 0 else 1
+            except (TypeError, ValueError):
+                result.order_multiple = 1
 
             needs_page_stock = not official_stock_available
             needs_page_prices = not result.price_breaks_raw
@@ -840,6 +865,9 @@ def clear_jlcpcb_live_data(item: BomItem) -> None:
     item.available_stock_qty = None
     item.unit_price = None
     item.jlcpcb_price_breaks_raw = ""
+    item.jlcpcb_min_order_quantity = None
+    item.jlcpcb_order_multiple = 1
+    item.jlcpcb_currency = "USD"
     item.jlcpcb_total_price = None
     item.jlcpcb_status = "not_searched"
     item.jlcpcb_error = ""
@@ -887,6 +915,9 @@ def enrich_bom_item(item: BomItem, search_result: JlcpcbSearchResult) -> None:
     item.unit_price = search_result.unit_price
     normalized_breaks, price_warnings = normalize_jlcpcb_price_breaks(search_result.price_breaks_raw)
     item.jlcpcb_price_breaks_raw = json.dumps(normalized_breaks) if normalized_breaks else ""
+    item.jlcpcb_min_order_quantity = search_result.minimum_order_quantity
+    item.jlcpcb_order_multiple = search_result.order_multiple
+    item.jlcpcb_currency = search_result.currency
     if price_warnings:
         search_result.warnings.extend(price_warnings)
 
@@ -1264,11 +1295,7 @@ class SearchWorker(QThread):
                 digikey_is_approved = False
                 supplier_errors = []
                 
-                if is_res_coded(item.comment):
-                    item.status = "RES manual"
-                    item.jlcpcb_part_number = ""
-                    item.skip_jlcpcb = True
-                elif internal_code:
+                if internal_code:
                     mapping = self.db_manager.get_internal_mapping(internal_code)
                     if mapping:
                         lcsc_is_approved = bool(

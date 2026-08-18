@@ -102,7 +102,12 @@ class ExcelWriter:
         # "Total Cost" must always sum extended line costs. Unit-price mode
         # controls which unit price is selected; it must not turn the project
         # total into a meaningless sum of per-unit prices.
-        label_col_idx = headers.index("Pricing Quantity") + 1
+        if "Purchase Quantity" in headers:
+            label_col_idx = headers.index("Purchase Quantity") + 1
+        elif "Pricing Quantity" in headers:
+            label_col_idx = headers.index("Pricing Quantity") + 1
+        else:
+            label_col_idx = 1
         total_columns = (jlcpcb_total_col_idx, digikey_total_col_idx)
         self.ws.cell(row=total_row, column=label_col_idx, value="Total Cost")
         self.ws.cell(row=total_row, column=label_col_idx).font = header_font
@@ -156,16 +161,44 @@ class ExcelWriter:
         )
         return not jlc_usable and item.digikey_unit_price is None
 
+    @staticmethod
+    def _selected_supplier_price(
+        item: BomItem,
+        jlcpcb_price: Optional[float],
+        digikey_price: Optional[float],
+        required_quantity: int,
+    ) -> tuple[str, Optional[float]]:
+        """Return a stock-sufficient supplier for legacy Excel callers."""
+        if (
+            item.jlcpcb_part_number
+            and jlcpcb_price is not None
+            and item.available_stock_qty is not None
+            and item.available_stock_qty >= required_quantity
+        ):
+            return "JLCPCB", jlcpcb_price
+        if (
+            item.digikey_part_number
+            and digikey_price is not None
+            and item.digikey_stock_qty is not None
+            and item.digikey_stock_qty >= required_quantity
+        ):
+            return "DigiKey", digikey_price
+        return "None", None
+
     def _add_supplier_stock_sheet(self):
         ws = self.wb.create_sheet("Supplier Stock")
         headers = [
             "MPN", "Design Item ID", "Supplier", "Supplier Part Number",
-            "Stock", "Unit Price", "Pricing Quantity", "Total Price", "Required Stock", "Status",
+            "Stock", "Unit Price", "Production Required Quantity", "Safety Surplus",
+            "Purchase Quantity", "Total Price", "Required Stock", "Status",
         ]
         ws.append(headers)
         for cell in ws[1]:
             cell.font = Font(bold=True)
         for item in self.items:
+            prod_qty = item.production_quantity_val
+            surplus = item.safety_surplus
+            purchase_qty = item.purchase_quantity_val
             rows = [
                 ("JLCPCB", item.jlcpcb_part_number, item.available_stock_qty, item.unit_price, item.jlcpcb_total_price, item.status),
                 ("DigiKey", item.digikey_part_number, item.digikey_stock_qty, item.digikey_unit_price, item.digikey_total_price,
@@ -175,13 +208,13 @@ class ExcelWriter:
                 ws.append([
                     item.mpn, item.comment, supplier, part_number or "-",
                     stock if stock is not None else "-", unit_price,
-                    item.pricing_quantity, total_price,
+                    prod_qty, surplus, purchase_qty, total_price,
                     item.required_stock, status or "",
                 ])
                 if isinstance(unit_price, (int, float)):
                     ws.cell(row=ws.max_row, column=6).number_format = '"$"#,##0.0000'
                 if isinstance(total_price, (int, float)):
-                    ws.cell(row=ws.max_row, column=8).number_format = '"$"#,##0.0000'
+                    ws.cell(row=ws.max_row, column=10).number_format = '"$"#,##0.0000'
         ws.auto_filter.ref = ws.dimensions
         ws.freeze_panes = "A2"
         for column, width in {"A": 24, "B": 20, "C": 12, "D": 26, "E": 14, "F": 16, "G": 16, "H": 28}.items():
@@ -278,34 +311,53 @@ class ExcelWriter:
                     scaled_qty = parse_positive_integer_quantity(item.quantity) * m
                 except ValueError:
                     scaled_qty = 0
+                surplus = item.safety_surplus
+                purchase_qty = scaled_qty + surplus if scaled_qty > 0 else 0
                 
                 # Fetch JLC and DK prices
                 j_price = None
                 if item.jlcpcb_part_number and "error" not in item.status.lower() and "not found" not in item.status.lower() and "mismatch" not in item.status.lower():
-                    j_price = select_unit_price(item.jlcpcb_price_breaks_raw, scaled_qty, use_quantity_breaks=self.pricing_mode == "project")
+                    j_price = select_unit_price(item.jlcpcb_price_breaks_raw, purchase_qty, use_quantity_breaks=self.pricing_mode == "project")
                     if j_price is None:
                         j_price = item.unit_price
                     
-                d_price = select_digikey_price(item.digikey_price_breaks, scaled_qty, use_quantity_breaks=self.pricing_mode == "project")
+                d_price = select_digikey_price(item.digikey_price_breaks, purchase_qty, use_quantity_breaks=self.pricing_mode == "project")
                 if d_price is None:
                     d_price = item.digikey_unit_price
                 
                 used_source = "Missing price"
                 line_total = None
                 
-                if j_price is not None:
+                j_purchasable = (
+                    bool(item.jlcpcb_part_number)
+                    and j_price is not None
+                    and "error" not in item.status.lower()
+                    and "not found" not in item.status.lower()
+                    and "mismatch" not in item.status.lower()
+                    and (item.available_stock_qty is None or item.available_stock_qty >= purchase_qty)
+                    and purchase_qty > 0
+                )
+                d_purchasable = (
+                    bool(item.digikey_part_number)
+                    and d_price is not None
+                    and item.digikey_status != "error"
+                    and (item.digikey_stock_qty is None or item.digikey_stock_qty >= purchase_qty)
+                    and purchase_qty > 0
+                )
+
+                if j_purchasable and j_price is not None:
                     used_source = "JLCPCB"
-                    line_total = scaled_qty * j_price
+                    line_total = purchase_qty * j_price
                     summary_rows[m]["jlc_total"] += line_total
-                elif d_price is not None:
+                elif d_purchasable and d_price is not None:
                     used_source = "DigiKey fallback"
-                    line_total = scaled_qty * d_price
+                    line_total = purchase_qty * d_price
                     summary_rows[m]["rem_dk_total"] += line_total
                 else:
                     summary_rows[m]["missing_count"] += 1
                     
                 if d_price is not None:
-                    summary_rows[m]["all_dk_total"] += scaled_qty * d_price
+                    summary_rows[m]["all_dk_total"] += purchase_qty * d_price
                     
                 row_cache[m] = {
                     "j_price": j_price,

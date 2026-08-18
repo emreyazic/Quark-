@@ -250,7 +250,10 @@ def test_named_board_sheet_contains_its_own_supplier_prices(tmp_path):
     enriched = BomItem(
         mpn="UWB-MPN",
         jlcpcb_part_number="C123",
+        available_stock_qty=100,
         digikey_part_number="DK-123",
+        digikey_status="found",
+        digikey_stock_qty=100,
         jlcpcb_price_breaks_raw='[{"qFrom": 1, "price": 2.0}]',
         digikey_price_breaks=[(1, 2.5)],
     )
@@ -338,8 +341,12 @@ def test_pricing_fallback_and_unpriced(tmp_path):
             enriched.append(BomItem(
                 mpn="FALLBACK", 
                 jlcpcb_part_number="C1",
+                available_stock_qty=0,
                 status="Insufficient JLCPCB stock",
                 jlcpcb_price_breaks_raw='[{"qFrom": 1, "price": 0.10}]',
+                digikey_part_number="DK-1",
+                digikey_status="found",
+                digikey_stock_qty=50,
                 digikey_price_breaks=[(1, 0.50)]
             ))
             

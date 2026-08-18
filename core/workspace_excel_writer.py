@@ -148,7 +148,7 @@ class WorkspaceExcelWriter(BaseExcelWriter):
                 j_total = board_required_quantity * j_price if j_price is not None else None
                 d_total = board_required_quantity * d_price if d_price is not None else None
                 selected_source, selected_price = self._selected_supplier_price(
-                    enriched, j_price, d_price
+                    enriched, j_price, d_price, pricing_pool_quantity
                 )
                 mixed_total = (
                     board_required_quantity * selected_price
@@ -193,6 +193,22 @@ class WorkspaceExcelWriter(BaseExcelWriter):
                         status_cell.fill = fill
 
             data_end_row = ws.max_row
+            missing_price_count = sum(
+                1
+                for comp_key in component_usages
+                if self._selected_supplier_price(
+                    self.enriched_by_key[comp_key],
+                    self._component_price_values(
+                        self.enriched_by_key[comp_key],
+                        sum(u.total_quantity for u in self.component_by_key[comp_key].usages if u.project_name == project_name) * build_quantity
+                    )[1],
+                    self._component_price_values(
+                        self.enriched_by_key[comp_key],
+                        sum(u.total_quantity for u in self.component_by_key[comp_key].usages if u.project_name == project_name) * build_quantity
+                    )[2],
+                    required_quantity=sum(u.total_quantity for u in self.component_by_key[comp_key].usages if u.project_name == project_name) * build_quantity,
+                )[1] is None
+            )
             self._add_price_totals_box(
                 ws,
                 header_row,
@@ -218,7 +234,7 @@ class WorkspaceExcelWriter(BaseExcelWriter):
         headers = [
             "Board Name", "Description", "Designator", "Quantity (Per Board / Total)", 
             "Value", "Manufacturer", "MPN", "Design Item ID", "JLCPCB Part Number", "DigiKey Part Number", "JLCPCB Stock", "DigiKey Stock",
-            "JLCPCB Unit Price", "DigiKey Unit Price", "Pricing Quantity", "JLCPCB Total Price", "DigiKey Total Price", "Status"
+            "JLCPCB Unit Price", "DigiKey Unit Price", "Production Required Quantity", "Safety Surplus", "Purchase Quantity", "JLCPCB Total Price", "DigiKey Total Price", "Status"
         ]
 
         ws.append(headers)
@@ -229,7 +245,9 @@ class WorkspaceExcelWriter(BaseExcelWriter):
             
         for comp_key, comp in self.component_by_key.items():
             enriched = self.enriched_by_key[comp_key]
-            pricing_quantity, j_price, d_price, j_total, d_total = self._component_price_values(enriched)
+            purchase_qty, j_price, d_price, j_total, d_total = self._component_price_values(enriched)
+            prod_qty = enriched.production_quantity_val
+            surplus = enriched.safety_surplus
             
             for usage_index, u in enumerate(comp.usages):
                 board_str = u.board_name
@@ -251,7 +269,9 @@ class WorkspaceExcelWriter(BaseExcelWriter):
                     enriched.digikey_stock_qty if enriched.digikey_stock_qty is not None else "-",
                     j_price,
                     d_price,
-                    pricing_quantity,
+                    prod_qty,
+                    surplus,
+                    purchase_qty,
                     j_total if usage_index == 0 else None,
                     d_total if usage_index == 0 else None,
                     enriched.status
@@ -262,10 +282,10 @@ class WorkspaceExcelWriter(BaseExcelWriter):
                 ws.cell(row=ws.max_row, column=4).alignment = self.wrap_alignment
                 
                 self._format_supplier_price_cells(ws, ws.max_row, 13, 14, enriched)
-                for total_col in (16, 17):
+                for total_col in (18, 19):
                     if isinstance(ws.cell(row=ws.max_row, column=total_col).value, (int, float)):
                         self._format_currency(ws.cell(row=ws.max_row, column=total_col))
-                cell = ws.cell(row=ws.max_row, column=18)
+                cell = ws.cell(row=ws.max_row, column=20)
                 fill = self._get_status_fill(enriched.status, bool(enriched.jlcpcb_part_number))
                 if fill:
                     cell.fill = fill
@@ -278,6 +298,7 @@ class WorkspaceExcelWriter(BaseExcelWriter):
                 enriched,
                 self._component_price_values(enriched)[1],
                 self._component_price_values(enriched)[2],
+                required_quantity=self._component_price_values(enriched)[0],
             )[1] is None
         )
         self._add_price_totals_box(
@@ -297,7 +318,7 @@ class WorkspaceExcelWriter(BaseExcelWriter):
         headers = [
             "Board Names", "Description", "Designator", "Quantity (Per Board / Total)", 
             "Value", "Manufacturer", "MPN", "Design Item ID", "JLCPCB Part Number", "DigiKey Part Number", "JLCPCB Stock", "DigiKey Stock",
-            "JLCPCB Unit Price", "DigiKey Unit Price", "Pricing Quantity", "JLCPCB Total Price", "DigiKey Total Price", "Status"
+            "JLCPCB Unit Price", "DigiKey Unit Price", "Production Required Quantity", "Safety Surplus", "Purchase Quantity", "JLCPCB Total Price", "DigiKey Total Price", "Status"
         ]
 
         ws.append(headers)
@@ -309,7 +330,9 @@ class WorkspaceExcelWriter(BaseExcelWriter):
         for mutual in self.aggregation_result.mutual_components:
             comp_key = mutual.component_key
             enriched = self.enriched_by_key[comp_key]
-            pricing_quantity, j_price, d_price, j_total, d_total = self._component_price_values(enriched)
+            purchase_qty, j_price, d_price, j_total, d_total = self._component_price_values(enriched)
+            prod_qty = enriched.production_quantity_val
+            surplus = enriched.safety_surplus
             
             board_str = "\n".join([u.board_name for u in mutual.usages])
             qty_str = self._format_usage_quantities(mutual.usages)
@@ -329,7 +352,9 @@ class WorkspaceExcelWriter(BaseExcelWriter):
                 enriched.digikey_stock_qty if enriched.digikey_stock_qty is not None else "-",
                 j_price,
                 d_price,
-                pricing_quantity,
+                prod_qty,
+                surplus,
+                purchase_qty,
                 j_total,
                 d_total,
                 enriched.status
@@ -340,10 +365,10 @@ class WorkspaceExcelWriter(BaseExcelWriter):
             ws.cell(row=ws.max_row, column=4).alignment = self.wrap_alignment
             
             self._format_supplier_price_cells(ws, ws.max_row, 13, 14, enriched)
-            for total_col in (16, 17):
+            for total_col in (18, 19):
                 if isinstance(ws.cell(row=ws.max_row, column=total_col).value, (int, float)):
                     self._format_currency(ws.cell(row=ws.max_row, column=total_col))
-            cell = ws.cell(row=ws.max_row, column=18)
+            cell = ws.cell(row=ws.max_row, column=20)
             fill = self._get_status_fill(enriched.status, bool(enriched.jlcpcb_part_number))
             if fill:
                 cell.fill = fill
@@ -360,6 +385,9 @@ class WorkspaceExcelWriter(BaseExcelWriter):
                 self._component_price_values(
                     self.enriched_by_key[mutual.component_key]
                 )[2],
+                required_quantity=self._component_price_values(
+                    self.enriched_by_key[mutual.component_key]
+                )[0],
             )[1] is None
         )
         self._add_price_totals_box(
@@ -450,11 +478,10 @@ class WorkspaceExcelWriter(BaseExcelWriter):
             ws.append([])
             
             # Component Table
-            # Component Table
             headers = [
                 "Board Name", "Description", "Designator", "Quantity (Per Board / Total)", 
                 "Value", "Manufacturer", "MPN", "Design Item ID", "JLCPCB Part Number", "DigiKey Part Number", "JLCPCB Stock", "DigiKey Stock",
-                "JLCPCB Unit Price", "DigiKey Unit Price", "Pricing Quantity", "JLCPCB Total Price", "DigiKey Total Price", "Status"
+                "JLCPCB Unit Price", "DigiKey Unit Price", "Production Required Quantity", "Safety Surplus", "Purchase Quantity", "JLCPCB Total Price", "DigiKey Total Price", "Status"
             ]
                 
             ws.append(headers)
@@ -467,7 +494,9 @@ class WorkspaceExcelWriter(BaseExcelWriter):
                 comp_key = proj_comp.component_key
                 enriched = self.enriched_by_key[comp_key]
                 display_quantity = proj_comp.total_quantity * self.build_multipliers[0]
-                pricing_quantity, j_price, d_price, j_total, d_total = self._component_price_values(enriched, display_quantity)
+                purchase_qty, j_price, d_price, j_total, d_total = self._component_price_values(enriched, display_quantity)
+                prod_qty = int(display_quantity)
+                surplus = enriched.safety_surplus
                 
                 for usage_index, u in enumerate(proj_comp.usages):
                     board_str = u.board_name
@@ -489,7 +518,9 @@ class WorkspaceExcelWriter(BaseExcelWriter):
                         enriched.digikey_stock_qty if enriched.digikey_stock_qty is not None else "-",
                         j_price,
                         d_price,
-                        pricing_quantity,
+                        prod_qty,
+                        surplus,
+                        purchase_qty,
                         j_total if usage_index == 0 else None,
                         d_total if usage_index == 0 else None,
                         enriched.status
@@ -500,10 +531,10 @@ class WorkspaceExcelWriter(BaseExcelWriter):
                     ws.cell(row=ws.max_row, column=4).alignment = self.wrap_alignment
                     
                     self._format_supplier_price_cells(ws, ws.max_row, 13, 14, enriched)
-                    for total_col in (16, 17):
+                    for total_col in (18, 19):
                         if isinstance(ws.cell(row=ws.max_row, column=total_col).value, (int, float)):
                             self._format_currency(ws.cell(row=ws.max_row, column=total_col))
-                    cell = ws.cell(row=ws.max_row, column=18)
+                    cell = ws.cell(row=ws.max_row, column=20)
                     fill = self._get_status_fill(enriched.status, bool(enriched.jlcpcb_part_number))
                     if fill:
                         cell.fill = fill

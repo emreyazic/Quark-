@@ -26,6 +26,21 @@ class AggregatedComponent:
     total_quantity: Union[int, float]
     usages: list[BoardComponentUsage] = field(default_factory=list)
 
+    @property
+    def safety_surplus(self) -> int:
+        from core.mpn_utils import is_resistor_or_capacitor
+        if is_resistor_or_capacitor(self.representative_item):
+            return 10
+        for u in self.usages:
+            item = getattr(u, "bom_item", None) or getattr(u, "item", None)
+            if item and is_resistor_or_capacitor(item):
+                return 10
+        return 0
+
+    @property
+    def purchase_quantity(self) -> Union[int, float]:
+        return self.total_quantity + self.safety_surplus
+
 
 @dataclass
 class ProjectAggregationResult:
@@ -141,6 +156,10 @@ def aggregate_project(project: Project) -> ProjectAggregationResult:
             components_map[key].usages.append(usage)
             
     result.components = sorted(list(components_map.values()), key=lambda c: c.component_key)
+    for comp in result.components:
+        comp.representative_item.safety_surplus = comp.safety_surplus
+        comp.representative_item.production_quantity = comp.total_quantity
+        comp.representative_item.purchase_quantity = comp.purchase_quantity
     return result
 
 
@@ -176,6 +195,21 @@ class WorkspaceAggregatedComponent:
     _temp_locations: set[str] = field(default_factory=set, repr=False)
     _temp_board_names: set[str] = field(default_factory=set, repr=False)
 
+    @property
+    def safety_surplus(self) -> int:
+        from core.mpn_utils import is_resistor_or_capacitor
+        if is_resistor_or_capacitor(self.representative_item):
+            return 10
+        for u in self.usages:
+            item = getattr(u, "item", None) or getattr(u, "bom_item", None)
+            if item and is_resistor_or_capacitor(item):
+                return 10
+        return 0
+
+    @property
+    def purchase_quantity(self) -> Union[int, float]:
+        return self.total_quantity + self.safety_surplus
+
 
 @dataclass
 class WorkspaceMutualComponent:
@@ -186,6 +220,21 @@ class WorkspaceMutualComponent:
     project_count: int = 0
     source_location_count: int = 0
     shared_across_projects: bool = False
+
+    @property
+    def safety_surplus(self) -> int:
+        from core.mpn_utils import is_resistor_or_capacitor
+        if is_resistor_or_capacitor(self.representative_item):
+            return 10
+        for u in self.usages:
+            item = getattr(u, "item", None) or getattr(u, "bom_item", None)
+            if item and is_resistor_or_capacitor(item):
+                return 10
+        return 0
+
+    @property
+    def purchase_quantity(self) -> Union[int, float]:
+        return self.total_quantity + self.safety_surplus
 
 
 @dataclass
@@ -265,19 +314,25 @@ def aggregate_workspace(workspace: Workspace) -> WorkspaceAggregationResult:
         comp.source_projects = sorted(list(comp._temp_projects))
         comp.source_locations = sorted(list(comp._temp_locations))
         comp.source_board_names = sorted(list(comp._temp_board_names))
+        comp.representative_item.safety_surplus = comp.safety_surplus
+        comp.representative_item.production_quantity = comp.total_quantity
+        comp.representative_item.purchase_quantity = comp.purchase_quantity
         
         result.components.append(comp)
         
         if len(comp.source_locations) > 1:
             mutual = WorkspaceMutualComponent(
                 component_key=comp.component_key,
-                representative_item=comp.representative_item,
+                representative_item=copy.deepcopy(comp.representative_item),
                 total_quantity=comp.total_quantity,
                 usages=comp.usages,
                 project_count=len(comp.source_projects),
                 source_location_count=len(comp.source_locations),
                 shared_across_projects=(len(comp.source_projects) > 1)
             )
+            mutual.representative_item.safety_surplus = mutual.safety_surplus
+            mutual.representative_item.production_quantity = mutual.total_quantity
+            mutual.representative_item.purchase_quantity = mutual.purchase_quantity
             result.mutual_components.append(mutual)
             
     result.components.sort(key=lambda c: c.component_key)

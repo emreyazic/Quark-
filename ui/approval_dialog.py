@@ -148,7 +148,7 @@ class ApprovalDialog(QDialog):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(8, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(9, QHeaderView.ResizeMode.Fixed)
-        self.table_pending.setColumnWidth(9, 220)
+        self.table_pending.setColumnWidth(9, 540)
 
     def _load_data(self):
         mappings = self.db_manager.get_all_internal_mappings()
@@ -172,7 +172,35 @@ class ApprovalDialog(QDialog):
             has_lcsc_pending = bool(mapping.get("lcsc_pending_change"))
             has_dk_pending = bool(mapping.get("digikey_pending_change"))
             
-            if has_lcsc_pending and not has_dk_pending:
+            if has_lcsc_pending and has_dk_pending:
+                btn_app_lcsc = QPushButton("Approve LCSC")
+                btn_app_lcsc.setObjectName("actionApproveBtn")
+                btn_app_lcsc.clicked.connect(lambda checked, r=row: self._on_approve_supplier_clicked(r, "JLCPCB"))
+                btn_rej_lcsc = QPushButton("Reject LCSC")
+                btn_rej_lcsc.setObjectName("actionDeleteBtn")
+                btn_rej_lcsc.clicked.connect(lambda checked, r=row: self._on_reject_supplier_clicked(r, "JLCPCB"))
+
+                btn_app_dk = QPushButton("Approve DK")
+                btn_app_dk.setObjectName("actionApproveBtn")
+                btn_app_dk.clicked.connect(lambda checked, r=row: self._on_approve_supplier_clicked(r, "DIGIKEY"))
+                btn_rej_dk = QPushButton("Reject DK")
+                btn_rej_dk.setObjectName("actionDeleteBtn")
+                btn_rej_dk.clicked.connect(lambda checked, r=row: self._on_reject_supplier_clicked(r, "DIGIKEY"))
+
+                btn_app_all = QPushButton("Approve All")
+                btn_app_all.setObjectName("actionUpdateBtn")
+                btn_app_all.clicked.connect(lambda checked, r=row: self._on_approve_clicked(r))
+                btn_rej_all = QPushButton("Reject All")
+                btn_rej_all.setObjectName("actionDeleteBtn")
+                btn_rej_all.clicked.connect(lambda checked, r=row: self._on_reject_clicked(r))
+
+                h_layout.addWidget(btn_app_lcsc)
+                h_layout.addWidget(btn_rej_lcsc)
+                h_layout.addWidget(btn_app_dk)
+                h_layout.addWidget(btn_rej_dk)
+                h_layout.addWidget(btn_app_all)
+                h_layout.addWidget(btn_rej_all)
+            elif has_lcsc_pending:
                 btn_app = QPushButton("Approve LCSC")
                 btn_app.setObjectName("actionApproveBtn")
                 btn_app.clicked.connect(lambda checked, r=row: self._on_approve_supplier_clicked(r, "JLCPCB"))
@@ -181,7 +209,7 @@ class ApprovalDialog(QDialog):
                 btn_rej.clicked.connect(lambda checked, r=row: self._on_reject_supplier_clicked(r, "JLCPCB"))
                 h_layout.addWidget(btn_app)
                 h_layout.addWidget(btn_rej)
-            elif has_dk_pending and not has_lcsc_pending:
+            elif has_dk_pending:
                 btn_app = QPushButton("Approve DK")
                 btn_app.setObjectName("actionApproveBtn")
                 btn_app.clicked.connect(lambda checked, r=row: self._on_approve_supplier_clicked(r, "DIGIKEY"))
@@ -190,15 +218,6 @@ class ApprovalDialog(QDialog):
                 btn_rej.clicked.connect(lambda checked, r=row: self._on_reject_supplier_clicked(r, "DIGIKEY"))
                 h_layout.addWidget(btn_app)
                 h_layout.addWidget(btn_rej)
-            else:
-                btn_app_all = QPushButton("Approve All")
-                btn_app_all.setObjectName("actionApproveBtn")
-                btn_app_all.clicked.connect(lambda checked, r=row: self._on_approve_clicked(r))
-                btn_rej_all = QPushButton("Reject All")
-                btn_rej_all.setObjectName("actionDeleteBtn")
-                btn_rej_all.clicked.connect(lambda checked, r=row: self._on_reject_clicked(r))
-                h_layout.addWidget(btn_app_all)
-                h_layout.addWidget(btn_rej_all)
                 
             self.table_pending.setCellWidget(row, 9, container)
 

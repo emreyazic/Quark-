@@ -924,9 +924,38 @@ class MainWindow(QMainWindow):
         self._manual_search_tab = self._build_manual_search_tab()
         self._result_tabs.addTab(self._manual_search_tab, "🔎 Manual MPN Search")
 
+        # Keep scenario pricing as the final results tab.
+        self._project_pricing_tab = self._build_project_pricing_tab()
+        self._result_tabs.addTab(self._project_pricing_tab, "💰 Project Pricing")
+
         layout.addWidget(self._result_tabs, stretch=1)
 
         return page
+
+    def _build_project_pricing_tab(self) -> QWidget:
+        """Build the Excel-independent project pricing result area."""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        explanation = QLabel(
+            "Independent purchasing scenarios. Supplier, MOQ, order multiple and "
+            "price tier are recalculated for every quantity."
+        )
+        explanation.setWordWrap(True)
+        layout.addWidget(explanation)
+
+        self._pricing_scenario_tabs = QTabWidget()
+        self._pricing_views: dict[int, tuple[QLabel, QTableWidget, object]] = {}
+        self._pricing_empty_label = QLabel(
+            "Process a BOM to calculate the 1, 10, 100 and 1000 project scenarios."
+        )
+        self._pricing_empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self._pricing_empty_label)
+        layout.addWidget(self._pricing_scenario_tabs, stretch=1)
+        self._pricing_scenario_tabs.hide()
+        return tab
 
     def _build_manual_search_tab(self) -> QWidget:
         """Build the manual MPN search panel."""
@@ -1305,7 +1334,8 @@ class MainWindow(QMainWindow):
     def _on_sync_error(self, message: str):
         self._btn_sync_library.setEnabled(True)
         self._btn_sync_library.setText("🗄 Sync JLC Library")
-        QMessageBox.critical(self, "Sync Error", f"JLC Library sync failed:\n{message}")
+        QMessageBox.critical(self, "Sync Error", f"JLC Library sync failed:\n{message}")
+
 
     def _clear_processed_state(self):
         """Clear state from previous processing runs."""
@@ -1474,8 +1504,15 @@ class MainWindow(QMainWindow):
         self._search_item_component_keys = []
         for comp in self._workspace_aggregation_result.components:
             search_item = copy.deepcopy(comp.representative_item)
+            prod_qty = int(comp.total_quantity * build_quantity)
+            surplus = comp.safety_surplus
+            purchase_qty = prod_qty + surplus
             search_item.quantity = int(comp.total_quantity)
-            search_item.pricing_quantity = int(comp.total_quantity * build_quantity)
+            search_item.production_quantity = prod_qty
+            search_item.safety_surplus = surplus
+            search_item.purchase_quantity = purchase_qty
+            search_item.pricing_quantity = purchase_qty
+            search_item.required_stock = purchase_qty
             self._all_items.append(search_item)
             self._search_item_component_keys.append(comp.component_key)
 
@@ -1538,7 +1575,7 @@ class MainWindow(QMainWindow):
             self._validate_ready()
             return
 
-        if self._processed_input_revision != self._input_revision:
+        if getattr(self, "_processed_input_revision", None) != getattr(self, "_input_revision", None):
             self._progress_widget.set_cancelled()
             self._progress_widget._log.appendPlainText(
                 "\n⚠️  BOM files or board quantities changed during processing. "
@@ -1607,7 +1644,7 @@ class MainWindow(QMainWindow):
             else:
                 self._last_unavail_path = None
                 self._progress_widget._log.appendPlainText(
-                    f"\n🎉  No unavailable components found! Skipped separate report."
+                    "\n🎉  No unavailable components found! Skipped separate report."
                 )
 
         except Exception as e:
@@ -1638,11 +1675,12 @@ class MainWindow(QMainWindow):
 
         # Summary cards
         total = len(items)
-        found = sum(1 for i in items if i.is_available)
-        not_found_count = sum(1 for i in items if i.is_not_found)
-        mismatch = sum(1 for i in items if i.status == "No exact JLCPCB match")
-        insuff = sum(1 for i in items if i.status == "Insufficient JLCPCB stock")
-        manual = total - found - not_found_count - mismatch - insuff
+        categories = [item.get_ui_category() for item in items]
+        found = sum(1 for c in categories if c == "available")
+        not_found_count = sum(1 for c in categories if c == "not_found")
+        mismatch = sum(1 for c in categories if c == "mismatch")
+        insuff = sum(1 for c in categories if c == "low_stock")
+        manual = sum(1 for c in categories if c in ("manual", "error"))
 
         self._update_card_value(self._card_total, str(total))
         self._update_card_value(self._card_found, str(found))
@@ -1655,21 +1693,15 @@ class MainWindow(QMainWindow):
         self._fill_result_table(self._tab_all, items, headers)
 
         # Found tab
-        found_items = [i for i in items if i.is_available]
+        found_items = [i for i, c in zip(items, categories) if c == "available"]
         self._fill_result_table(self._tab_found, found_items, headers)
 
         # Not found / mismatch tab
-        nf_items = [
-            i for i in items
-            if i.is_not_found or i.status in ("No exact JLCPCB match", "Insufficient JLCPCB stock")
-        ]
+        nf_items = [i for i, c in zip(items, categories) if c in ("not_found", "mismatch", "low_stock")]
         self._fill_result_table(self._tab_not_found, nf_items, headers)
 
         # Manual review tab
-        manual_items = [
-            i for i in items
-            if not i.is_available and not i.is_not_found and i.status not in ("No exact JLCPCB match", "Insufficient JLCPCB stock")
-        ]
+        manual_items = [i for i, c in zip(items, categories) if c in ("manual", "error", "low_stock")]
         self._fill_result_table(self._tab_manual, manual_items, headers)
 
         # Update tab labels with counts
@@ -1677,6 +1709,98 @@ class MainWindow(QMainWindow):
         self._result_tabs.setTabText(1, f"✅ Available ({found})")
         self._result_tabs.setTabText(2, f"❌ Not Found / Mismatch ({len(nf_items)})")
         self._result_tabs.setTabText(3, f"🔍 Manual Review ({len(manual_items)})")
+        self._populate_project_pricing()
+
+    @staticmethod
+    def _format_currency_totals(values: dict) -> str:
+        if not values:
+            return "—"
+        return " | ".join(
+            f"{currency} {value:.6f}" for currency, value in sorted(values.items())
+        )
+
+    def _populate_project_pricing(self):
+        """Render pricing service results without recalculating table values."""
+        self._pricing_scenario_tabs.clear()
+        self._pricing_views.clear()
+        aggregation = self._workspace_aggregation_result or self._project_aggregation_result
+        if not aggregation or not self._search_item_component_keys:
+            self._pricing_scenario_tabs.hide()
+            self._pricing_empty_label.show()
+            return
+
+        from services.project_pricing import calculate_project_pricing
+
+        scenarios = calculate_project_pricing(
+            aggregation, self._all_items, self._search_item_component_keys
+        )
+        headers = [
+            "Component / MPN", "Description", "Quantity per Project",
+            "Required Quantity", "Safety Surplus", "Target Quantity",
+            "Minimum Order Quantity", "Purchase Quantity",
+            "Excess Stock Quantity", "Supplier", "Supplier Part Number",
+            "Unit Price", "Price for Quantity", "Order Price",
+            "Excess Stock Cost", "Pricing Status / Reason",
+        ]
+        for scenario in scenarios:
+            page = QWidget()
+            page_layout = QVBoxLayout(page)
+            summary = QLabel(
+                f"Production: {scenario.project_quantity}  |  "
+                f"Price for Quantity: {self._format_currency_totals(scenario.price_for_quantity_totals)}  |  "
+                f"Order Price: {self._format_currency_totals(scenario.order_price_totals)}\n"
+                f"Per-project Production: {self._format_currency_totals(scenario.per_project_production_totals)}  |  "
+                f"Per-project Order: {self._format_currency_totals(scenario.per_project_order_totals)}  |  "
+                f"Excess Stock Cost: {self._format_currency_totals(scenario.excess_stock_cost_totals)}  |  "
+                f"Priced: {scenario.priced_count}  |  Unpriced: {scenario.unpriced_count}"
+                + ("  |  COST INCOMPLETE" if scenario.cost_incomplete else "")
+            )
+            summary.setWordWrap(True)
+            summary.setObjectName("pricingSummary")
+            page_layout.addWidget(summary)
+
+            table = QTableWidget()
+            table.setColumnCount(len(headers))
+            table.setHorizontalHeaderLabels(headers)
+            table.setRowCount(len(scenario.components))
+            table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+            table.setAlternatingRowColors(True)
+            table.verticalHeader().setVisible(False)
+            table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+            table.setSortingEnabled(False)
+            for row_index, row in enumerate(scenario.components):
+                quote = row.quote
+                currency = quote.currency if quote else ""
+                values = [
+                    row.mpn or row.component_key, row.description,
+                    row.quantity_per_project, row.required_quantity,
+                    row.safety_surplus, row.target_quantity,
+                    quote.minimum_order_quantity if quote else "",
+                    quote.purchase_quantity if quote else "",
+                    quote.excess_stock_quantity if quote else "",
+                    quote.supplier if quote else "Unpriced",
+                    quote.part_number if quote else "",
+                    f"{currency} {quote.unit_price}" if quote else "",
+                    f"{currency} {quote.price_for_quantity}" if quote else "",
+                    f"{currency} {quote.order_price}" if quote else "",
+                    f"{currency} {quote.excess_stock_cost}" if quote else "",
+                    row.status,
+                ]
+                for column_index, value in enumerate(values):
+                    cell = QTableWidgetItem(str(value))
+                    if isinstance(value, int):
+                        cell.setData(Qt.ItemDataRole.EditRole, value)
+                    if quote is None:
+                        cell.setBackground(QColor("#4a1a1a"))
+                    table.setItem(row_index, column_index, cell)
+            table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+            table.setSortingEnabled(True)
+            page_layout.addWidget(table, stretch=1)
+            self._pricing_views[scenario.project_quantity] = (summary, table, scenario)
+            self._pricing_scenario_tabs.addTab(page, f"{scenario.project_quantity} Projects")
+
+        self._pricing_empty_label.hide()
+        self._pricing_scenario_tabs.show()
 
     def _fill_result_table(
         self, table: QTableWidget, items: list[BomItem], headers: list[str]
