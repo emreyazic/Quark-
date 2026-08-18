@@ -18,6 +18,12 @@ class _Button:
     def setVisible(self, visible):
         self.visible = visible
 
+    def show(self):
+        self.visible = True
+
+    def hide(self):
+        self.visible = False
+
 
 class _Progress:
     def __init__(self):
@@ -83,10 +89,12 @@ def test_cancel_processing_cancels_worker_and_updates_ui():
     worker.cancel = lambda: setattr(worker, "cancelled", True)
     progress = _Progress()
     back_button = _Button()
+    partial_banner = _Button()
     state = SimpleNamespace(
         _search_worker=worker,
         _progress_widget=progress,
         _btn_back_setup=back_button,
+        _partial_banner=partial_banner,
     )
 
     MainWindow._cancel_processing(state)
@@ -94,6 +102,7 @@ def test_cancel_processing_cancels_worker_and_updates_ui():
     assert worker.cancelled is True
     assert progress.cancelled is True
     assert back_button.visible is True
+    assert partial_banner.visible is True
 
 
 def test_stale_worker_result_is_discarded_after_input_change():
@@ -122,10 +131,8 @@ def test_file_input_change_increments_revision_and_clears_processed_state():
     process_button = _Button()
     refresh_button = _Button()
     map_button = _Button()
-    preview = SimpleNamespace(
-        setRowCount=lambda count: None,
-        setColumnCount=lambda count: None,
-    )
+    input_summary = SimpleNamespace(text=None)
+    input_summary.setText = lambda text: setattr(input_summary, "text", text)
     state = _processed_state(input_revision=3, processed_revision=3)
     state._file_manager = SimpleNamespace(
         has_files=lambda: False,
@@ -134,8 +141,7 @@ def test_file_input_change_increments_revision_and_clears_processed_state():
     state._btn_map_columns = map_button
     state._btn_process = process_button
     state._btn_refresh = refresh_button
-    state._preview_table = preview
-    state._preview_info = SimpleNamespace(setText=lambda text: None)
+    state._input_summary = input_summary
     state._clear_processed_state = lambda: MainWindow._clear_processed_state(state)
     state._validate_ready = lambda: None
 
@@ -145,6 +151,7 @@ def test_file_input_change_increments_revision_and_clears_processed_state():
     assert state._all_items == []
     assert state._processed_input_revision is None
     assert refresh_button.enabled is False
+    assert input_summary.text == "Select a BOM file to begin"
 
 
 def test_approved_internal_mpn_mapping_is_applied_before_aggregation():

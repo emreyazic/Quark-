@@ -380,6 +380,8 @@ def test_pending_lcsc_does_not_block_approved_digikey_pricing(monkeypatch):
             result.exact_match = True
             result.matched_mpn = "MPN1"
             result.lcsc_code = "C-NEW"
+            result.stock = 50
+            result.unit_price = 1.0
             return result
 
         def close(self):

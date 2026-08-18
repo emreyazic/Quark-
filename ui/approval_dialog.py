@@ -1,374 +1,509 @@
-import sys
-from datetime import datetime
-from PyQt6.QtCore import Qt
+from __future__ import annotations
+
+from typing import Any, Callable, Optional
+
+from PyQt6.QtCore import QModelIndex, QTimer, Qt
 from PyQt6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QTableWidget, 
-    QTableWidgetItem, QHeaderView, QMessageBox, QLabel, QWidget, QTabWidget,
-    QStyledItemDelegate, QLineEdit
+    QAbstractItemView, QComboBox, QDialog, QHBoxLayout, QHeaderView, QLabel,
+    QLineEdit, QMessageBox, QPushButton, QTabWidget, QTableView, QVBoxLayout, QWidget,
 )
 
-class TableEditorDelegate(QStyledItemDelegate):
-    def createEditor(self, parent, option, index):
-        editor = super().createEditor(parent, option, index)
-        if isinstance(editor, QLineEdit):
-            editor.setObjectName("TableEditor")
-        return editor
-
 from core.database_manager import DatabaseManager
+from ui.approval_models import ActionDelegate, ApprovedModel, HistoryModel, MappingFilterProxy, PendingModel
+
+
+class _CompatItem:
+    def __init__(self, index: QModelIndex):
+        self._index = index
+
+    def text(self) -> str:
+        return str(self._index.data(Qt.ItemDataRole.DisplayRole) or "")
+
+    def data(self, role):
+        return self._index.data(role)
+
+    def toolTip(self) -> str:
+        return str(self._index.data(Qt.ItemDataRole.ToolTipRole) or "")
+
+
+class MappingTableView(QTableView):
+    """Model/view table; compatibility widgets are created only on explicit request."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.compat_widget_factory: Optional[Callable[[int, int], Optional[QWidget]]] = None
+        self.before_visibility_check: Optional[Callable[[], None]] = None
+        self.hidden_predicate: Optional[Callable[[int], bool]] = None
+        self.ensure_loaded: Optional[Callable[[], None]] = None
+        self._compat_widgets: dict[tuple[int, int], QWidget] = {}
+
+    def rowCount(self) -> int:
+        if self.ensure_loaded:
+            self.ensure_loaded()
+        return self.model().rowCount() if self.model() else 0
+
+    def columnCount(self) -> int:
+        return self.model().columnCount() if self.model() else 0
+
+    def item(self, row: int, column: int) -> Optional[_CompatItem]:
+        if self.ensure_loaded:
+            self.ensure_loaded()
+        index = self.model().index(row, column) if self.model() else QModelIndex()
+        return _CompatItem(index) if index.isValid() else None
+
+    def cellWidget(self, row: int, column: int) -> Optional[QWidget]:
+        if self.ensure_loaded:
+            self.ensure_loaded()
+        key = (row, column)
+        if key not in self._compat_widgets and self.compat_widget_factory:
+            widget = self.compat_widget_factory(row, column)
+            if widget is not None:
+                self._compat_widgets[key] = widget
+        return self._compat_widgets.get(key)
+
+    def clear_compat_widgets(self) -> None:
+        for widget in self._compat_widgets.values():
+            widget.deleteLater()
+        self._compat_widgets.clear()
+
+    def isRowHidden(self, row: int) -> bool:
+        if self.hidden_predicate:
+            return self.hidden_predicate(row)
+        if self.before_visibility_check:
+            self.before_visibility_check()
+        current_model = self.model()
+        if isinstance(current_model, MappingFilterProxy):
+            return not current_model.filterAcceptsRow(row, QModelIndex())
+        return super().isRowHidden(row)
 
 
 class ApprovalDialog(QDialog):
+    """Lazy, model/view editor for pending, approved and audit mapping data."""
+
+    SEARCH_DELAY_MS = 250
+    DB_FILTER_THRESHOLD = 2000
+
     def __init__(self, db_manager: DatabaseManager, parent=None):
         super().__init__(parent)
         self.db_manager = db_manager
+        self._closed = False
+        self._loaded = [False, False, False]
+        self._pending_filter_runs = 0
+        self._approved_filter_runs = 0
+        self._history_search_runs = 0
+        self._pending_total_count = 0
+        self._approved_total_count = 0
+        self._pending_db_filter = False
+        self._approved_db_filter = False
+        self._pending_last_filter: Optional[str] = None
+        self._approved_last_filter: Optional[tuple[str, str]] = None
         self.setWindowTitle("Manage Internal Mappings")
-        self.resize(1450, 600)
-        self.setStyleSheet("""
-            #TableEditor {
-                background-color: #2d3436;
-                color: #ffffff;
-                border: 1px solid #0984e3;
-                border-radius: 0px;
-                padding: 2px;
-                margin: 0px;
-            }
-            QPushButton#actionApproveBtn {
-                background: #008f73;
-                color: #ffffff;
-                border: 1px solid #39e6bd;
-                border-radius: 6px;
-                padding: 4px 10px;
-                font-size: 13px;
-                font-weight: 700;
-            }
-            QPushButton#actionApproveBtn:hover { background: #00b894; }
-            QPushButton#actionApproveBtn:pressed { background: #00745e; }
-            QPushButton#actionUpdateBtn {
-                background: #096fb8;
-                color: #ffffff;
-                border: 1px solid #58b8ff;
-                border-radius: 6px;
-                padding: 4px 10px;
-                font-size: 13px;
-                font-weight: 700;
-            }
-            QPushButton#actionUpdateBtn:hover { background: #0984e3; }
-            QPushButton#actionUpdateBtn:pressed { background: #07578f; }
-            QPushButton#actionDeleteBtn {
-                background: #b82425;
-                color: #ffffff;
-                border: 1px solid #ff7675;
-                border-radius: 6px;
-                padding: 4px 10px;
-                font-size: 13px;
-                font-weight: 700;
-            }
-            QPushButton#actionDeleteBtn:hover { background: #d63031; }
-            QPushButton#actionDeleteBtn:pressed { background: #941d1e; }
-        """)
+        self.resize(1180, 640)
+        self.setStyleSheet(self._stylesheet())
         self._setup_ui()
-        self._load_data()
+        self._load_tab(0)
 
-    def _setup_ui(self):
-        main_layout = QVBoxLayout(self)
-        
+    @staticmethod
+    def _stylesheet() -> str:
+        return """
+            QDialog { background-color: #1e272e; color: #f5f6fa; }
+            QTabWidget::pane { border: 1px solid #353b48; background: #1e272e; }
+            QTabBar::tab { background: #2f3640; color: #dcdde1; padding: 8px 22px;
+                           margin-right: 4px; font-size: 13px; font-weight: 600; }
+            QTabBar::tab:selected { background: #008f73; color: white; }
+            QLabel { color: #f5f6fa; font-size: 13px; }
+            QLineEdit, QComboBox { background: #2f3640; color: white; border: 1px solid #718093;
+                                  border-radius: 5px; padding: 5px 10px; font-size: 13px; }
+            QLineEdit:focus { border: 1px solid #00d2d3; }
+            QTableView { background: #2f3640; color: #f5f6fa; gridline-color: #353b48;
+                         border: 1px solid #353b48; selection-background-color: #4b6584; }
+            QHeaderView::section { background: #1e272e; color: #dcdde1; padding: 6px;
+                                   font-weight: 700; border: 1px solid #353b48; }
+            QPushButton { background: #485460; color: white; border: 1px solid #718093;
+                          border-radius: 5px; padding: 6px 14px; }
+        """
+
+    def _setup_ui(self) -> None:
+        layout = QVBoxLayout(self)
         self.tabs = QTabWidget()
-        main_layout.addWidget(self.tabs)
-        
-        # --- TAB 1: Pending Approvals ---
-        self.tab_pending = QWidget()
-        layout_pending = QVBoxLayout(self.tab_pending)
-        
-        info_label_pending = QLabel("Review the approved value against the previous and latest automatic search results. Automatic checks never overwrite approved values.")
-        layout_pending.addWidget(info_label_pending)
-
-        self.table_pending = QTableWidget()
-        self.table_pending.setColumnCount(10)
-        self.table_pending.setHorizontalHeaderLabels([
-            "Internal Code (Comment)", "MPN", "Approved LCSC", "Previous Auto LCSC",
-            "New Auto LCSC", "Approved DigiKey", "Previous Auto DigiKey",
-            "New Auto DigiKey", "Last Updated", "Action"
-        ])
-        self.table_pending.setItemDelegate(TableEditorDelegate(self.table_pending))
-        self.table_pending.verticalHeader().setMinimumSectionSize(44)
-        self.table_pending.verticalHeader().setDefaultSectionSize(44)
-        self._configure_pending_table()
-        layout_pending.addWidget(self.table_pending)
-        
-        self.tabs.addTab(self.tab_pending, "Pending Approvals")
-        
-        # --- TAB 2: Approved Mappings ---
-        self.tab_approved = QWidget()
-        layout_approved = QVBoxLayout(self.tab_approved)
-        
-        info_label_approved = QLabel("Manage your existing approved mappings. Edit cells and click Update to save, or Delete to remove.")
-        layout_approved.addWidget(info_label_approved)
-        
-        self.table_approved = QTableWidget()
-        self.table_approved.setColumnCount(6)
-        self.table_approved.setHorizontalHeaderLabels(["Internal Code (Comment)", "MPN", "LCSC Code", "DigiKey Code", "Last Updated", "Action"])
-        self.table_approved.setItemDelegate(TableEditorDelegate(self.table_approved))
-        self.table_approved.verticalHeader().setMinimumSectionSize(44)
-        self.table_approved.verticalHeader().setDefaultSectionSize(44)
-        self._configure_table(self.table_approved, action_width=240)
-        
-        # Force redraw on edit
-        self.table_pending.itemChanged.connect(lambda item: self.table_pending.viewport().update())
-        self.table_approved.itemChanged.connect(lambda item: self.table_approved.viewport().update())
-        
-        layout_approved.addWidget(self.table_approved)
-        
-        self.tabs.addTab(self.tab_approved, "Approved Mappings")
-
-        # --- Footer ---
-        btn_layout = QHBoxLayout()
-        btn_layout.addStretch()
-        
+        layout.addWidget(self.tabs)
+        self._setup_pending_tab()
+        self._setup_approved_tab()
+        self._setup_history_tab()
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+        footer = QHBoxLayout()
+        footer.addStretch()
         self.btn_close = QPushButton("Close")
         self.btn_close.clicked.connect(self.accept)
-        btn_layout.addWidget(self.btn_close)
-        
-        main_layout.addLayout(btn_layout)
+        footer.addWidget(self.btn_close)
+        layout.addLayout(footer)
 
-    def _configure_table(self, table: QTableWidget, action_width: int = 100):
-        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
-        table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
-        table.horizontalHeader().setMinimumSectionSize(action_width)
-        table.setColumnWidth(5, action_width)
+    def _new_table(self) -> MappingTableView:
+        table = MappingTableView()
+        table.setAlternatingRowColors(True)
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked | QAbstractItemView.EditTrigger.EditKeyPressed | QAbstractItemView.EditTrigger.SelectedClicked)
+        table.verticalHeader().setVisible(False)
+        table.verticalHeader().setDefaultSectionSize(38)
+        return table
 
-    def _configure_pending_table(self):
-        header = self.table_pending.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        for column in range(2, 8):
-            header.setSectionResizeMode(column, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(8, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(9, QHeaderView.ResizeMode.Fixed)
-        self.table_pending.setColumnWidth(9, 540)
+    def _setup_pending_tab(self) -> None:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        bar = QHBoxLayout()
+        self.lbl_pending_count = QLabel("Pending: 0")
+        self.search_pending = QLineEdit()
+        self.search_pending.setPlaceholderText("Search by internal code, MPN, supplier, code...")
+        bar.addWidget(self.lbl_pending_count)
+        bar.addWidget(self.search_pending, 1)
+        layout.addLayout(bar)
+        self.pending_model = PendingModel(self)
+        self.pending_proxy = MappingFilterProxy((0, 1, 2, 3, 4), self)
+        self.pending_proxy.setSourceModel(self.pending_model)
+        self.table_pending = self._new_table()
+        self.table_pending.setModel(self.pending_proxy)
+        self.table_pending.compat_widget_factory = self._pending_compat_widget
+        self.table_pending.before_visibility_check = self._apply_pending_filter
+        delegate = ActionDelegate(lambda row: [("Approve", True), ("Keep", bool(row.get("has_approved")))], self.table_pending)
+        delegate.actionRequested.connect(self._on_pending_action)
+        self.table_pending.setItemDelegateForColumn(5, delegate)
+        self._configure_header(self.table_pending, 5)
+        layout.addWidget(self.table_pending)
+        self.tabs.addTab(tab, "Pending")
+        self._pending_timer = self._debounce(self._apply_pending_filter)
+        self.search_pending.textChanged.connect(lambda _text: self._pending_timer.start())
 
-    def _load_data(self):
-        mappings = self.db_manager.get_all_internal_mappings()
-        
-        pending = [m for m in mappings if m.get("lcsc_pending_change") or m.get("digikey_pending_change")]
-        approved = [m for m in mappings if m.get("lcsc_approved") or m.get("digikey_approved")]
-        
-        self._populate_pending_table(pending)
-        self._populate_approved_table(approved)
-        
-    def _populate_pending_table(self, pending_list):
-        self.table_pending.setRowCount(len(pending_list))
-        for row, mapping in enumerate(pending_list):
-            self._fill_pending_row(row, mapping)
-            
-            container = QWidget()
-            h_layout = QHBoxLayout(container)
-            h_layout.setContentsMargins(2, 2, 2, 2)
-            h_layout.setSpacing(4)
-            
-            has_lcsc_pending = bool(mapping.get("lcsc_pending_change"))
-            has_dk_pending = bool(mapping.get("digikey_pending_change"))
-            
-            if has_lcsc_pending and has_dk_pending:
-                btn_app_lcsc = QPushButton("Approve LCSC")
-                btn_app_lcsc.setObjectName("actionApproveBtn")
-                btn_app_lcsc.clicked.connect(lambda checked, r=row: self._on_approve_supplier_clicked(r, "JLCPCB"))
-                btn_rej_lcsc = QPushButton("Reject LCSC")
-                btn_rej_lcsc.setObjectName("actionDeleteBtn")
-                btn_rej_lcsc.clicked.connect(lambda checked, r=row: self._on_reject_supplier_clicked(r, "JLCPCB"))
+    def _setup_approved_tab(self) -> None:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        bar = QHBoxLayout()
+        self.lbl_approved_count = QLabel("Approved: 0")
+        self.combo_supplier_filter = QComboBox()
+        self.combo_supplier_filter.addItems(["All Suppliers", "JLCPCB", "DigiKey"])
+        self.search_approved = QLineEdit()
+        self.search_approved.setPlaceholderText("Search by internal code, MPN, approved code...")
+        bar.addWidget(self.lbl_approved_count)
+        bar.addWidget(self.combo_supplier_filter)
+        bar.addWidget(self.search_approved, 1)
+        layout.addLayout(bar)
+        self.approved_model = ApprovedModel(self)
+        self.approved_proxy = MappingFilterProxy((0, 1, 3), self)
+        self.approved_proxy.setSourceModel(self.approved_model)
+        self.table_approved = self._new_table()
+        self.table_approved.setModel(self.approved_proxy)
+        self.table_approved.ensure_loaded = lambda: self._load_tab(1)
+        self.table_approved.compat_widget_factory = self._approved_compat_widget
+        self.table_approved.before_visibility_check = self._apply_approved_filter
+        delegate = ActionDelegate(lambda row: [("Save", str(row.get("approved_code", "")).strip() != row.get("_original_code", "")), ("Cancel", row.get("approved_code", "") != row.get("_original_code", ""))], self.table_approved)
+        delegate.actionRequested.connect(self._on_approved_action)
+        self.table_approved.setItemDelegateForColumn(5, delegate)
+        self._configure_header(self.table_approved, 5)
+        layout.addWidget(self.table_approved)
+        self.tabs.addTab(tab, "Approved")
+        self._approved_timer = self._debounce(self._apply_approved_filter)
+        self.search_approved.textChanged.connect(lambda _text: self._approved_timer.start())
+        self.combo_supplier_filter.currentTextChanged.connect(lambda _text: self._approved_timer.start())
 
-                btn_app_dk = QPushButton("Approve DK")
-                btn_app_dk.setObjectName("actionApproveBtn")
-                btn_app_dk.clicked.connect(lambda checked, r=row: self._on_approve_supplier_clicked(r, "DIGIKEY"))
-                btn_rej_dk = QPushButton("Reject DK")
-                btn_rej_dk.setObjectName("actionDeleteBtn")
-                btn_rej_dk.clicked.connect(lambda checked, r=row: self._on_reject_supplier_clicked(r, "DIGIKEY"))
+    def _setup_history_tab(self) -> None:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        bar = QHBoxLayout()
+        self.lbl_history_count = QLabel("Total Records: 0")
+        self.search_history = QLineEdit()
+        self.search_history.setPlaceholderText("Search history by code, MPN, supplier, action...")
+        bar.addWidget(self.lbl_history_count)
+        bar.addWidget(self.search_history, 1)
+        layout.addLayout(bar)
+        self.history_model = HistoryModel(self.db_manager, self)
+        self.table_history = self._new_table()
+        self.table_history.setModel(self.history_model)
+        self.table_history.ensure_loaded = lambda: self._load_tab(2)
+        self.table_history.hidden_predicate = self._history_row_hidden
+        self._configure_header(self.table_history)
+        layout.addWidget(self.table_history)
+        self.tabs.addTab(tab, "History")
+        self._history_timer = self._debounce(self._apply_history_search)
+        self.search_history.textChanged.connect(lambda _text: self._history_timer.start())
 
-                btn_app_all = QPushButton("Approve All")
-                btn_app_all.setObjectName("actionUpdateBtn")
-                btn_app_all.clicked.connect(lambda checked, r=row: self._on_approve_clicked(r))
-                btn_rej_all = QPushButton("Reject All")
-                btn_rej_all.setObjectName("actionDeleteBtn")
-                btn_rej_all.clicked.connect(lambda checked, r=row: self._on_reject_clicked(r))
+    def _debounce(self, callback: Callable[[], None]) -> QTimer:
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.setInterval(self.SEARCH_DELAY_MS)
+        timer.timeout.connect(callback)
+        return timer
 
-                h_layout.addWidget(btn_app_lcsc)
-                h_layout.addWidget(btn_rej_lcsc)
-                h_layout.addWidget(btn_app_dk)
-                h_layout.addWidget(btn_rej_dk)
-                h_layout.addWidget(btn_app_all)
-                h_layout.addWidget(btn_rej_all)
-            elif has_lcsc_pending:
-                btn_app = QPushButton("Approve LCSC")
-                btn_app.setObjectName("actionApproveBtn")
-                btn_app.clicked.connect(lambda checked, r=row: self._on_approve_supplier_clicked(r, "JLCPCB"))
-                btn_rej = QPushButton("Reject LCSC")
-                btn_rej.setObjectName("actionDeleteBtn")
-                btn_rej.clicked.connect(lambda checked, r=row: self._on_reject_supplier_clicked(r, "JLCPCB"))
-                h_layout.addWidget(btn_app)
-                h_layout.addWidget(btn_rej)
-            elif has_dk_pending:
-                btn_app = QPushButton("Approve DK")
-                btn_app.setObjectName("actionApproveBtn")
-                btn_app.clicked.connect(lambda checked, r=row: self._on_approve_supplier_clicked(r, "DIGIKEY"))
-                btn_rej = QPushButton("Reject DK")
-                btn_rej.setObjectName("actionDeleteBtn")
-                btn_rej.clicked.connect(lambda checked, r=row: self._on_reject_supplier_clicked(r, "DIGIKEY"))
-                h_layout.addWidget(btn_app)
-                h_layout.addWidget(btn_rej)
-                
-            self.table_pending.setCellWidget(row, 9, container)
+    @staticmethod
+    def _configure_header(table: QTableView, action_column: Optional[int] = None) -> None:
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        fixed_widths = {0: 145, 2: 95}
+        for column, width in fixed_widths.items():
+            if column < table.model().columnCount():
+                table.setColumnWidth(column, width)
+        for column in range(table.model().columnCount()):
+            if column in (1, 3, 4):
+                header.setSectionResizeMode(column, QHeaderView.ResizeMode.Stretch)
+        if action_column is not None:
+            header.setSectionResizeMode(action_column, QHeaderView.ResizeMode.Fixed)
+            table.setColumnWidth(action_column, 170)
 
-    def _populate_approved_table(self, approved_list):
-        self.table_approved.setRowCount(len(approved_list))
-        for row, mapping in enumerate(approved_list):
-            self._fill_row(self.table_approved, row, mapping)
-            
-            # Action Buttons: Update & Delete
-            btn_update = QPushButton("Update")
-            btn_update.setObjectName("actionUpdateBtn")
-            btn_update.setMinimumWidth(90)
-            btn_update.setFixedHeight(34)
-            btn_update.clicked.connect(lambda checked, r=row: self._on_update_clicked(r))
-            
-            btn_delete = QPushButton("Delete")
-            btn_delete.setObjectName("actionDeleteBtn")
-            btn_delete.setMinimumWidth(90)
-            btn_delete.setFixedHeight(34)
-            btn_delete.clicked.connect(lambda checked, r=row: self._on_delete_clicked(r))
-            
-            container = QWidget()
-            h_layout = QHBoxLayout(container)
-            h_layout.setContentsMargins(4, 2, 4, 2)
-            h_layout.setSpacing(4)
-            h_layout.addWidget(btn_update)
-            h_layout.addWidget(btn_delete)
-            self.table_approved.setCellWidget(row, 5, container)
+    def _on_tab_changed(self, index: int) -> None:
+        self._load_tab(index)
 
-    def _fill_row(self, table: QTableWidget, row: int, mapping: dict):
-        comment = mapping.get("comment_code", "")
-        mpn = mapping.get("mpn", "")
-        lcsc = mapping.get("lcsc_code", "")
-        digikey = mapping.get("digikey_code", "")
-        updated_at = mapping.get("updated_at")
-        updated_text = datetime.fromtimestamp(updated_at).strftime("%Y-%m-%d %H:%M") if updated_at else "—"
-        
-        item_comment = QTableWidgetItem(comment)
-        item_comment.setFlags(item_comment.flags() & ~Qt.ItemFlag.ItemIsEditable)
-        table.setItem(row, 0, item_comment)
-        
-        table.setItem(row, 1, QTableWidgetItem(mpn))
-        table.setItem(row, 2, QTableWidgetItem(lcsc))
-        table.setItem(row, 3, QTableWidgetItem(digikey))
-        item_updated = QTableWidgetItem(updated_text)
-        item_updated.setFlags(item_updated.flags() & ~Qt.ItemFlag.ItemIsEditable)
-        table.setItem(row, 4, item_updated)
-
-    def _fill_pending_row(self, row: int, mapping: dict):
-        values = [
-            mapping.get("comment_code", ""), mapping.get("mpn", ""),
-            mapping.get("lcsc_code", ""), mapping.get("previous_found_lcsc", ""),
-            mapping.get("last_found_lcsc", ""), mapping.get("digikey_code", ""),
-            mapping.get("previous_found_digikey", ""), mapping.get("last_found_digikey", ""),
-        ]
-        for column, value in enumerate(values):
-            item = QTableWidgetItem(value or "")
-            if column in (0, 3, 4, 6, 7):
-                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            self.table_pending.setItem(row, column, item)
-        self.table_pending.item(row, 0).setData(Qt.ItemDataRole.UserRole, mapping)
-        updated_at = mapping.get("updated_at")
-        updated_text = datetime.fromtimestamp(updated_at).strftime("%Y-%m-%d %H:%M") if updated_at else "—"
-        item_updated = QTableWidgetItem(updated_text)
-        item_updated.setFlags(item_updated.flags() & ~Qt.ItemFlag.ItemIsEditable)
-        self.table_pending.setItem(row, 8, item_updated)
-
-    def _on_approve_clicked(self, row: int):
-        self._process_upsert(self.table_pending, row, is_approve_action=True)
-
-    def _on_approve_supplier_clicked(self, row: int, supplier: str):
-        comment = self.table_pending.item(row, 0).text().strip()
-        mpn = self.table_pending.item(row, 1).text().strip()
-        mapping = self.table_pending.item(row, 0).data(Qt.ItemDataRole.UserRole) or {}
-        if supplier.upper() in ("JLCPCB", "LCSC"):
-            code = self.table_pending.item(row, 2).text().strip()
-            if not code or code == (mapping.get("lcsc_code", "") or "").strip():
-                code = self.table_pending.item(row, 4).text().strip()
-        else:
-            code = self.table_pending.item(row, 5).text().strip()
-            if not code or code == (mapping.get("digikey_code", "") or "").strip():
-                code = self.table_pending.item(row, 7).text().strip()
-        try:
-            self.db_manager.approve_supplier_mapping(comment, supplier, code, mpn)
-            QMessageBox.information(self, "Success", f"{supplier} mapping for '{comment}' has been approved.")
-            self._load_data()
-        except Exception as e:
-            QMessageBox.critical(self, "Database Error", str(e))
-
-    def _on_reject_supplier_clicked(self, row: int, supplier: str):
-        comment = self.table_pending.item(row, 0).text().strip()
-        try:
-            self.db_manager.reject_supplier_pending_change(comment, supplier)
-            self._load_data()
-        except Exception as e:
-            QMessageBox.critical(self, "Database Error", str(e))
-
-    def _on_reject_clicked(self, row: int):
-        comment = self.table_pending.item(row, 0).text().strip()
-        try:
-            self.db_manager.reject_pending_changes(comment)
-            self._load_data()
-        except Exception as e:
-            QMessageBox.critical(self, "Database Error", str(e))
-
-    def _on_update_clicked(self, row: int):
-        self._process_upsert(self.table_approved, row, is_approve_action=False)
-        
-    def _process_upsert(self, table: QTableWidget, row: int, is_approve_action: bool):
-        comment = table.item(row, 0).text().strip()
-        mpn = table.item(row, 1).text().strip()
-        lcsc = table.item(row, 2).text().strip()
-        digikey_column = 5 if table is self.table_pending else 3
-        digikey = table.item(row, digikey_column).text().strip()
-        if is_approve_action:
-            mapping = table.item(row, 0).data(Qt.ItemDataRole.UserRole) or {}
-            # Clicking Approve accepts each pending supplier's latest candidate.
-            # A deliberate edit of the approved-value cell remains a manual override.
-            if mapping.get("lcsc_pending_change") and lcsc == (mapping.get("lcsc_code", "") or "").strip():
-                lcsc = table.item(row, 4).text().strip()
-            if mapping.get("digikey_pending_change") and digikey == (mapping.get("digikey_code", "") or "").strip():
-                digikey = table.item(row, 7).text().strip()
-        
-        if not mpn and not lcsc and not digikey:
-            QMessageBox.warning(self, "Validation Error", "Please provide at least one part number (MPN, LCSC, or DigiKey).")
+    def _load_tab(self, index: int) -> None:
+        if self._closed or self._loaded[index]:
             return
-            
-        try:
-            self.db_manager.upsert_internal_mapping(comment, mpn, lcsc, True, digikey)
-            if is_approve_action:
-                QMessageBox.information(self, "Success", f"Mapping for '{comment}' has been approved.")
-            else:
-                QMessageBox.information(self, "Success", f"Mapping for '{comment}' has been updated.")
-            self._load_data()
-        except Exception as e:
-            QMessageBox.critical(self, "Database Error", str(e))
+        (self._load_pending_data, self._load_approved_data, self._load_history_data)[index]()
+        self._loaded[index] = True
 
-    def _on_delete_clicked(self, row: int):
-        comment = self.table_approved.item(row, 0).text().strip()
-        
-        reply = QMessageBox.question(
-            self, "Confirm Delete",
-            f"Are you sure you want to delete the mapping for '{comment}'?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No
+    def _load_data(self) -> None:
+        index = self.tabs.currentIndex()
+        self._loaded[index] = False
+        self._load_tab(index)
+
+    def _load_pending_data(self) -> None:
+        self.table_pending.clear_compat_widgets()
+        rows = self.db_manager.get_pending_supplier_mappings()
+        self.pending_model.replace(rows)
+        self._pending_total_count = len(rows)
+        self._pending_db_filter = len(rows) > self.DB_FILTER_THRESHOLD
+        self._pending_last_filter = ""
+        self._apply_pending_filter()
+
+    def _load_approved_data(self) -> None:
+        self.table_approved.clear_compat_widgets()
+        rows = self.db_manager.get_approved_supplier_mappings()
+        self.approved_model.replace(rows)
+        self._approved_total_count = len(rows)
+        self._approved_db_filter = len(rows) > self.DB_FILTER_THRESHOLD
+        self._approved_last_filter = ("", "All Suppliers")
+        self._apply_approved_filter()
+
+    def _load_history_data(self) -> None:
+        self.history_model.reload(self.search_history.text())
+        self._update_history_count()
+
+    def _apply_pending_filter(self) -> None:
+        self._pending_timer.stop()
+        self._pending_filter_runs += 1
+        query = self.search_pending.text().strip()
+        if self._pending_db_filter:
+            if query != self._pending_last_filter:
+                self.table_pending.clear_compat_widgets()
+                self.pending_model.replace(self.db_manager.get_pending_supplier_mappings(query or None))
+                self._pending_last_filter = query
+            self.pending_proxy.set_query("")
+            shown, total = self.pending_model.rowCount(), self._pending_total_count
+        else:
+            self.pending_proxy.set_query(query)
+            shown, total = self.pending_proxy.rowCount(), self.pending_model.rowCount()
+        self.lbl_pending_count.setText(f"Pending: {shown} of {total}" if shown != total else f"Pending: {total}")
+
+    def _apply_approved_filter(self) -> None:
+        self._approved_timer.stop()
+        self._approved_filter_runs += 1
+        query = self.search_approved.text().strip()
+        supplier = self.combo_supplier_filter.currentText()
+        if self._approved_db_filter:
+            current_filter = (query, supplier)
+            if current_filter != self._approved_last_filter:
+                self.table_approved.clear_compat_widgets()
+                self.approved_model.replace(
+                    self.db_manager.get_approved_supplier_mappings(query or None, supplier)
+                )
+                self._approved_last_filter = current_filter
+            self.approved_proxy.set_query("")
+            self.approved_proxy.set_supplier("All Suppliers")
+            shown, total = self.approved_model.rowCount(), self._approved_total_count
+        else:
+            self.approved_proxy.set_query(query)
+            self.approved_proxy.set_supplier(supplier)
+            shown, total = self.approved_proxy.rowCount(), self.approved_model.rowCount()
+        self.lbl_approved_count.setText(f"Approved: {shown} of {total}" if shown != total else f"Approved: {total}")
+
+    def _apply_history_search(self) -> None:
+        self._history_timer.stop()
+        self._history_search_runs += 1
+        if self._loaded[2] and not self._closed:
+            self.history_model.reload(self.search_history.text())
+            self._update_history_count()
+
+    def _update_history_count(self) -> None:
+        loaded, total = self.history_model.rowCount(), self.history_model.total_count
+        prefix = "Records" if self.history_model.search else "Total Records"
+        self.lbl_history_count.setText(f"{prefix}: {loaded} of {total}" if loaded < total else f"{prefix}: {total}")
+
+    def _history_row_hidden(self, row: int) -> bool:
+        query = self.search_history.text().strip().casefold()
+        if not query or not 0 <= row < self.history_model.rowCount():
+            return False
+        visible = sum(
+            any(
+                query in str(self.history_model.index(candidate, column).data() or "").casefold()
+                for column in range(self.history_model.columnCount())
+            )
+            for candidate in range(self.history_model.rowCount())
         )
-        
-        if reply == QMessageBox.StandardButton.Yes:
-            try:
-                self.db_manager.delete_internal_mapping(comment)
-                QMessageBox.information(self, "Success", f"Mapping for '{comment}' deleted.")
-                self._load_data()
-            except Exception as e:
-                QMessageBox.critical(self, "Database Error", str(e))
+        self.lbl_history_count.setText(f"Records: {visible} of {self.history_model.rowCount()}")
+        return not any(
+            query in str(self.history_model.index(row, column).data() or "").casefold()
+            for column in range(self.history_model.columnCount())
+        )
+
+    @staticmethod
+    def _source_row(index: QModelIndex) -> int:
+        model = index.model()
+        return model.mapToSource(index).row() if isinstance(model, MappingFilterProxy) else index.row()
+
+    def _on_pending_action(self, index: QModelIndex, action: str) -> None:
+        source_row = self._source_row(index)
+        entry = self.pending_model.rows[source_row]
+        try:
+            if action == "approve":
+                code = str(entry.get("candidate_code", "")).strip()
+                if not code:
+                    QMessageBox.warning(self, "Validation Error", "Code cannot be empty.")
+                    return
+                self.db_manager.approve_supplier_mapping(entry["comment_code"], entry["supplier"], code, entry["mpn"], entry.get("_candidate_code", ""))
+            elif action == "keep":
+                self.db_manager.keep_supplier_current_mapping(entry["comment_code"], entry["supplier"])
+            else:
+                return
+        except Exception as exc:
+            QMessageBox.critical(self, "Database Error", str(exc))
+            return
+        self.pending_model.remove_source_row(source_row)
+        self._pending_total_count = max(0, self._pending_total_count - 1)
+        self.table_pending.clear_compat_widgets()
+        self._apply_pending_filter()
+        self._loaded[1] = False
+        self._loaded[2] = False
+
+    def _on_approved_action(self, index: QModelIndex, action: str) -> None:
+        source_row = self._source_row(index)
+        entry = self.approved_model.rows[source_row]
+        if action == "cancel":
+            self.approved_model.cancel_edit(source_row)
+            return
+        if action != "save":
+            return
+        code = str(entry.get("approved_code", "")).strip()
+        if not code:
+            QMessageBox.warning(self, "Validation Error", "Approved code cannot be empty.")
+            return
+        try:
+            self.db_manager.update_approved_supplier_code(entry["comment_code"], entry["supplier"], code, entry["mpn"])
+        except Exception as exc:
+            QMessageBox.critical(self, "Database Error", str(exc))
+            return
+        entry["approved_code"] = code
+        self.approved_model.accept_edit(source_row)
+        self.approved_model.dataChanged.emit(self.approved_model.index(source_row, 3), self.approved_model.index(source_row, 5))
+        self._loaded[2] = False
+
+    def _on_pending_search_changed(self, _text: str) -> None:
+        self._pending_timer.start()
+
+    def _on_approved_filter_changed(self, *_args) -> None:
+        self._approved_timer.start()
+
+    def _on_history_search_changed(self, _text: str) -> None:
+        self._history_timer.start()
+
+    def _on_approve_clicked(self, entry: dict[str, Any], line_edit: QLineEdit) -> None:
+        entry["candidate_code"] = line_edit.text()
+        row = self.pending_model.rows.index(entry)
+        self._on_pending_action(self.pending_proxy.mapFromSource(self.pending_model.index(row, 5)), "approve")
+
+    def _on_keep_clicked(self, entry: dict[str, Any]) -> None:
+        row = self.pending_model.rows.index(entry)
+        self._on_pending_action(self.pending_proxy.mapFromSource(self.pending_model.index(row, 5)), "keep")
+
+    def _pending_compat_widget(self, row: int, column: int) -> Optional[QWidget]:
+        source = self.pending_proxy.mapToSource(self.pending_proxy.index(row, column)).row()
+        entry = self.pending_model.rows[source]
+        if column == 4:
+            editor = QLineEdit(str(entry.get("candidate_code", "")))
+            editor.setObjectName("newCodeInput")
+            editor.setProperty("edited", "false")
+            original = editor.text()
+            def sync_pending(text: str, e=entry) -> None:
+                e["candidate_code"] = text
+                edited = text.strip() != original
+                editor.setProperty("edited", "true" if edited else "false")
+                editor.setToolTip(f"Edited: {text} (Original Candidate: {original})" if edited else text)
+            editor.textChanged.connect(sync_pending)
+            sync_pending(editor.text())
+            return editor
+        if column == 5:
+            widget = QWidget()
+            box = QHBoxLayout(widget)
+            approve = QPushButton("Approve")
+            approve.setObjectName("actionApproveBtn")
+            approve.clicked.connect(lambda _checked=False, e=entry: self._approve_compat_entry(e, row))
+            keep = QPushButton("Keep")
+            keep.setObjectName("actionKeepBtn")
+            keep.setEnabled(bool(entry.get("has_approved")))
+            keep.setToolTip("Keep current code and dismiss candidate" if keep.isEnabled() else "Cannot keep: no previously approved code exists")
+            keep.clicked.connect(lambda _checked=False, e=entry: self._on_keep_clicked(e))
+            box.addWidget(approve)
+            box.addWidget(keep)
+            return widget
+        return None
+
+    def _approve_compat_entry(self, entry: dict[str, Any], proxy_row: int) -> None:
+        editor = self.table_pending.cellWidget(proxy_row, 4)
+        if isinstance(editor, QLineEdit):
+            entry["candidate_code"] = editor.text()
+        self._on_approve_clicked(entry, editor if isinstance(editor, QLineEdit) else QLineEdit(str(entry.get("candidate_code", ""))))
+
+    def _approved_compat_widget(self, row: int, column: int) -> Optional[QWidget]:
+        source = self.approved_proxy.mapToSource(self.approved_proxy.index(row, column)).row()
+        entry = self.approved_model.rows[source]
+        if column == 3:
+            editor = QLineEdit(str(entry.get("approved_code", "")))
+            editor.setObjectName("approvedCodeInput")
+            editor.setToolTip(editor.text())
+            editor.setProperty("edited", "false")
+            def sync_approved(text: str, e=entry) -> None:
+                e["approved_code"] = text
+                edited = text.strip() != str(e.get("_original_code", ""))
+                editor.setProperty("edited", "true" if edited else "false")
+                editor.setToolTip(
+                    f"Edited: {text} (Original Approved: {e.get('_original_code', '')})" if edited else text
+                )
+            editor.textChanged.connect(sync_approved)
+            return editor
+        if column == 5:
+            widget = QWidget()
+            box = QHBoxLayout(widget)
+            save = QPushButton("Save")
+            save.setObjectName("actionSaveBtn")
+            cancel = QPushButton("Cancel")
+            cancel.setObjectName("actionCancelBtn")
+            editor = self.table_approved.cellWidget(row, 3)
+            save.clicked.connect(lambda _checked=False, idx=self.approved_proxy.index(row, 5): self._on_approved_action(idx, "save"))
+            cancel.clicked.connect(lambda _checked=False, idx=self.approved_proxy.index(row, 5): self._cancel_compat(idx, editor))
+            if isinstance(editor, QLineEdit):
+                def sync_buttons(text: str) -> None:
+                    changed = text.strip() != str(entry.get("_original_code", ""))
+                    save.setEnabled(changed)
+                    cancel.setEnabled(changed)
+                editor.textChanged.connect(sync_buttons)
+                sync_buttons(editor.text())
+            box.addWidget(save)
+            box.addWidget(cancel)
+            return widget
+        return None
+
+    def _cancel_compat(self, index: QModelIndex, editor: Optional[QWidget]) -> None:
+        source = self._source_row(index)
+        self.approved_model.cancel_edit(source)
+        if isinstance(editor, QLineEdit):
+            editor.setText(str(self.approved_model.rows[source].get("approved_code", "")))
+
+    def closeEvent(self, event) -> None:
+        self._closed = True
+        for timer in (self._pending_timer, self._approved_timer, self._history_timer):
+            timer.stop()
+        super().closeEvent(event)

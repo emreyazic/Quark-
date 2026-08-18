@@ -30,6 +30,7 @@ from core.mpn_utils import (
 )
 from core.database_manager import DatabaseManager
 from core.logger import get_logger, mask_secret
+from core.supplier_availability import AvailabilityState, normalize_availability
 
 logger = get_logger(__name__)
 
@@ -106,6 +107,18 @@ class JlcpcbSearchResult:
         self.candidates: list[dict] = []
         self.data_source: str = ""
         self.warnings: list[str] = []
+        self.availability: AvailabilityState = AvailabilityState.UNKNOWN
+        self.preorder_only: bool = False
+
+    def is_purchasable(self, required_stock: int) -> bool:
+        return bool(
+            self.found
+            and self.exact_match
+            and self.lcsc_code
+            and self.availability != AvailabilityState.PREORDER
+            and self.unit_price is not None
+            and self.stock >= max(int(required_stock or 0), 1)
+        )
 
 
 class JlcpcbSearcher:
@@ -132,7 +145,21 @@ class JlcpcbSearcher:
         })
         self.last_resolution_failed = False
         self.last_resolution_error: Optional[str] = None
+        self.last_resolution_preorder_only = False
         self._part_page_cache: Dict[str, tuple[Optional[int], str, Optional[str]]] = {}
+        self._part_page_availability: Dict[str, AvailabilityState] = {}
+        self._logged_preorder_candidates: set[tuple[str, str]] = set()
+
+    def _log_preorder_candidate(self, lcsc_code: str, mpn: str) -> None:
+        key = (lcsc_code.upper(), mpn.casefold())
+        if key in self._logged_preorder_candidates:
+            return
+        self._logged_preorder_candidates.add(key)
+        logger.info(
+            "JLCPCB_CANDIDATE_SKIPPED reason=preorder lcsc=%s mpn=%s",
+            lcsc_code,
+            mpn,
+        )
 
     def _request_with_retry(self, method: str, url: str, **kwargs) -> requests.Response:
         """Perform HTTP request with exponential backoff + jitter on timeout, 429, and 5xx."""
@@ -332,6 +359,7 @@ class JlcpcbSearcher:
         cache_key = lcsc_code.upper()
         if cache_key in self._part_page_cache:
             return self._part_page_cache[cache_key]
+        self._part_page_availability[cache_key] = AvailabilityState.UNKNOWN
 
         try:
             response = self._request_with_retry(
@@ -367,7 +395,12 @@ class JlcpcbSearcher:
                 comp = self._find_component_in_json(obj, lcsc_code)
                 if comp:
                     stock, price_breaks = self._extract_stock_and_prices_from_dict(comp)
-                    if stock is not None or price_breaks:
+                    self._part_page_availability[cache_key] = normalize_availability(comp, stock)
+                    if (
+                        self._part_page_availability[cache_key] == AvailabilityState.PREORDER
+                        or stock is not None
+                        or price_breaks
+                    ):
                         break
         except Exception as exc:
             parse_error = f"JSON parse error: {exc}"
@@ -418,7 +451,12 @@ class JlcpcbSearcher:
             f'signature="{signature}"'
         )
 
-    def _resolve_lcsc_from_mpn(self, mpn_clean: str) -> Optional[str]:
+    def _resolve_lcsc_from_mpn(
+        self,
+        mpn_clean: str,
+        excluded_codes: Optional[set[str]] = None,
+        skip_local: bool = False,
+    ) -> Optional[str]:
         """Resolves permanent MPN to LCSC part code (C...) using:
         1. Local JLC library DB (fast, offline)
         2. LCSC global search with exact MPN matching
@@ -427,19 +465,24 @@ class JlcpcbSearcher:
         """
         self.last_resolution_failed = False
         self.last_resolution_error = None
+        self.last_resolution_preorder_only = False
         if not mpn_clean:
             return None
+
+        excluded = {code.upper() for code in (excluded_codes or set())}
+        preorder_matches = 0
 
         completed_remote_lookup = False
         resolution_errors = []
 
         # 1. Önce yerel kütüphane veritabanını sorgula
-        if self.db_manager:
+        if self.db_manager and not skip_local:
             lcsc = self.db_manager.lookup_lcsc_by_mpn(mpn_clean)
             if lcsc:
                 lcsc_code = str(lcsc).strip()
-                logger.debug("Found LCSC: %s for MPN: %s", lcsc_code, mpn_clean)
-                return lcsc_code
+                if lcsc_code.upper() not in excluded:
+                    logger.debug("Found LCSC: %s for MPN: %s", lcsc_code, mpn_clean)
+                    return lcsc_code
 
         # Community fallback helpers
         def get_components(response_data: Any) -> list[dict]:
@@ -451,7 +494,8 @@ class JlcpcbSearcher:
             return components if isinstance(components, list) else []
 
         def find_exact_lcsc(components: list[dict]) -> Optional[str]:
-            exact_codes: set[str] = set()
+            nonlocal preorder_matches
+            eligible: dict[str, tuple[int, int, str]] = {}
             for comp in components:
                 if not isinstance(comp, dict):
                     continue
@@ -477,14 +521,28 @@ class JlcpcbSearcher:
                 if lcsc_val:
                     lcsc_str = str(lcsc_val).strip()
                     lcsc_code = lcsc_str if lcsc_str.startswith("C") else f"C{lcsc_str}"
-                    exact_codes.add(lcsc_code)
+                    if lcsc_code.upper() in excluded:
+                        continue
+                    stock_value = next(
+                        (comp.get(key) for key in ("stockNumber", "stockCount", "stock", "availableStock") if comp.get(key) is not None),
+                        None,
+                    )
+                    availability = normalize_availability(comp, stock_value)
+                    if availability == AvailabilityState.PREORDER:
+                        preorder_matches += 1
+                        self._log_preorder_candidate(lcsc_code, mpn_clean)
+                        continue
+                    try:
+                        stock = int(stock_value or 0)
+                    except (TypeError, ValueError):
+                        stock = 0
+                    priority = 0 if availability == AvailabilityState.IN_STOCK else 1
+                    eligible[lcsc_code.upper()] = (priority, -stock, lcsc_code)
 
-            if len(exact_codes) == 1:
-                lcsc_code = exact_codes.pop()
+            if eligible:
+                lcsc_code = min(eligible.values())[2]
                 logger.debug("Found LCSC: %s for MPN: %s", lcsc_code, mpn_clean)
                 return lcsc_code
-            if len(exact_codes) > 1:
-                logger.debug("Ambiguous exact LCSC matches for MPN: %s: %s", mpn_clean, ', '.join(sorted(exact_codes)))
             return None
 
         try:
@@ -560,12 +618,19 @@ class JlcpcbSearcher:
                 break
 
         self.last_resolution_failed = not completed_remote_lookup
+        self.last_resolution_preorder_only = bool(preorder_matches and completed_remote_lookup)
         if self.last_resolution_failed:
             self.last_resolution_error = "; ".join(resolution_errors) or "MPN lookup services did not respond"
         return None
 
 
-    def search_mpn(self, mpn: str, required_stock: int = 0, refresh: bool = False) -> JlcpcbSearchResult:
+    def search_mpn(
+        self,
+        mpn: str,
+        required_stock: int = 0,
+        refresh: bool = False,
+        excluded_lcsc_codes: Optional[set[str]] = None,
+    ) -> JlcpcbSearchResult:
         """Search component by MPN: resolves LCSC code first, then queries official JOP OpenAPI."""
         result = JlcpcbSearchResult()
         if not mpn or mpn.strip() == "":
@@ -578,7 +643,11 @@ class JlcpcbSearcher:
             return result
 
         # 1. Adım: MPN'i LCSC koduna çözümle (topluluk arama servisi üzerinden)
-        lcsc_code = self._resolve_lcsc_from_mpn(mpn_clean)
+        lcsc_code = self._resolve_lcsc_from_mpn(
+            mpn_clean,
+            excluded_codes=excluded_lcsc_codes,
+            skip_local=bool(excluded_lcsc_codes),
+        )
         if not lcsc_code:
             # Harici servis yanıt vermedi / parçayı bulamadı.
             # Hata verip durmak yerine boş LCSC ile dön;
@@ -587,6 +656,9 @@ class JlcpcbSearcher:
             result.found = False
             result.lcsc_code = ""
             result.matched_mpn = mpn_clean
+            if self.last_resolution_preorder_only:
+                result.availability = AvailabilityState.PREORDER
+                result.preorder_only = True
             if self.last_resolution_failed:
                 result.error = self.last_resolution_error or "MPN lookup failed"
             return result
@@ -594,12 +666,31 @@ class JlcpcbSearcher:
         # Use the same direct-code path for MPN and approved-code searches.
         # It includes the LCSC global-search fallback, which provides live
         # stock/pricing when JOP returns no component detail.
-        return self.search_lcsc(
+        resolved = self.search_lcsc(
             lcsc_code,
             mpn_clean,
             required_stock=required_stock,
             refresh=refresh,
         )
+        if resolved.availability != AvailabilityState.PREORDER:
+            return resolved
+
+        alternative_code = self._resolve_lcsc_from_mpn(
+            mpn_clean,
+            excluded_codes={lcsc_code, *(excluded_lcsc_codes or set())},
+            skip_local=True,
+        )
+        if alternative_code:
+            alternative = self.search_lcsc(
+                alternative_code,
+                mpn_clean,
+                required_stock=required_stock,
+                refresh=refresh,
+            )
+            if alternative.availability != AvailabilityState.PREORDER:
+                return alternative
+        resolved.preorder_only = True
+        return resolved
 
     def search_lcsc(self, lcsc_code: str, mpn: str, required_stock: int = 0, refresh: bool = False) -> JlcpcbSearchResult:
         """Search component directly by LCSC code using API cache or JOP OpenAPI."""
@@ -638,6 +729,17 @@ class JlcpcbSearcher:
                 if not product:
                     return fallback
 
+                fallback.availability = normalize_availability(
+                    product, product.get("stockNumber")
+                )
+                if fallback.availability == AvailabilityState.PREORDER:
+                    fallback.exact_match = True
+                    fallback.matched_mpn = mpn
+                    fallback.lcsc_code = lcsc_code
+                    fallback.preorder_only = True
+                    self._log_preorder_candidate(lcsc_code, mpn)
+                    return fallback
+
                 price_list = product.get("productPriceList") or []
                 price_breaks = []
                 for index, tier in enumerate(price_list):
@@ -659,6 +761,8 @@ class JlcpcbSearcher:
                 fallback.matched_mpn = mpn
                 fallback.lcsc_code = lcsc_code
                 fallback.stock = int(product.get("stockNumber", 0) or 0)
+                if fallback.availability == AvailabilityState.UNKNOWN:
+                    fallback.availability = normalize_availability(None, fallback.stock)
                 fallback.data_source = SOURCE_LCSC_GLOBAL
                 fallback.package = product.get("encapStandard", "") or ""
                 fallback.category = product.get("catalogName", "") or ""
@@ -697,6 +801,15 @@ class JlcpcbSearcher:
                 result.category = cached["category"]
                 result.price_breaks_raw = cached["price_breaks_raw"]
                 result.data_source = SOURCE_CACHE
+                try:
+                    result.availability = AvailabilityState(cached.get("availability") or "UNKNOWN")
+                except ValueError:
+                    result.availability = normalize_availability(None, result.stock)
+                if result.availability == AvailabilityState.PREORDER:
+                    result.found = False
+                    result.preorder_only = True
+                    self._log_preorder_candidate(lcsc_code, mpn)
+                    return result
                 if result.price_breaks_raw:
                     result.unit_price = select_result_unit_price(result.price_breaks_raw, required_stock)
                 return result
@@ -737,7 +850,7 @@ class JlcpcbSearcher:
             result.match_count = len(components)
             if not components:
                 fallback_result = fallback_to_lcsc_global_search()
-                if fallback_result.found:
+                if fallback_result.found or fallback_result.availability == AvailabilityState.PREORDER:
                     if self.db_manager:
                         self.db_manager.upsert_api_cache(
                             lcsc_code=fallback_result.lcsc_code,
@@ -747,13 +860,13 @@ class JlcpcbSearcher:
                             category=fallback_result.category,
                             timestamp=time.time(),
                             source=fallback_result.data_source,
+                            availability=fallback_result.availability.value,
                         )
                     return fallback_result
                 result.found = False
                 return result
 
             exact_comp = components[0]
-            result.found = True
             result.exact_match = True
             result.matched_mpn = mpn
             result.lcsc_code = lcsc_code
@@ -771,9 +884,31 @@ class JlcpcbSearcher:
                 0,
             )
             result.stock = int(official_stock)
+            result.availability = normalize_availability(
+                exact_comp, result.stock if official_stock_available else None
+            )
             result.data_source = SOURCE_JOP
             result.package = exact_comp.get("componentSpecification", "") or exact_comp.get("package", "")
             result.category = exact_comp.get("firstTypeName", "") or exact_comp.get("category", "")
+
+            if result.availability == AvailabilityState.PREORDER:
+                result.found = False
+                result.preorder_only = True
+                self._log_preorder_candidate(lcsc_code, mpn)
+                if self.db_manager:
+                    self.db_manager.upsert_api_cache(
+                        lcsc_code=lcsc_code,
+                        stock=result.stock,
+                        price_breaks_raw="",
+                        package=result.package,
+                        category=result.category,
+                        timestamp=time.time(),
+                        source=result.data_source,
+                        availability=result.availability.value,
+                    )
+                return result
+
+            result.found = True
             
             price_ranges = exact_comp.get("priceRanges", []) or exact_comp.get("priceList", [])
             result.price_breaks_raw = self._normalize_jop_price_ranges(price_ranges)
@@ -807,6 +942,19 @@ class JlcpcbSearcher:
             page_error = None
             if needs_page_stock or needs_page_prices:
                 page_stock, page_price_breaks, page_error = self._fetch_jlcpcb_part_page_data(lcsc_code)
+                page_availability = self._part_page_availability.get(
+                    lcsc_code.upper(), AvailabilityState.UNKNOWN
+                )
+                if page_availability == AvailabilityState.PREORDER:
+                    result.found = False
+                    result.availability = AvailabilityState.PREORDER
+                    result.preorder_only = True
+                    result.price_breaks_raw = ""
+                    result.unit_price = None
+                    self._log_preorder_candidate(lcsc_code, mpn)
+                    return result
+                if result.availability == AvailabilityState.UNKNOWN and page_stock is not None:
+                    result.availability = normalize_availability(None, page_stock)
             used_page_fallback = False
             if not official_stock_available:
                 if page_stock is not None:
@@ -848,6 +996,7 @@ class JlcpcbSearcher:
                     category=result.category,
                     timestamp=time.time(),
                     source=result.data_source,
+                    availability=result.availability.value,
                 )
 
             return result
@@ -870,7 +1019,9 @@ def clear_jlcpcb_live_data(item: BomItem) -> None:
     item.jlcpcb_currency = "USD"
     item.jlcpcb_total_price = None
     item.jlcpcb_status = "not_searched"
+    item.jlcpcb_availability = AvailabilityState.UNKNOWN.value
     item.jlcpcb_error = ""
+
     item.jlcpcb_source = ""
 
 
@@ -880,6 +1031,21 @@ def enrich_bom_item(item: BomItem, search_result: JlcpcbSearchResult) -> None:
     item.source = search_result.data_source or "JLCPCB"
     item.jlcpcb_source = item.source
     item.jlcpcb_error = ""
+
+    if search_result.availability == AvailabilityState.PREORDER:
+        item.jlcpcb_part_number = search_result.lcsc_code
+        item.matched_mpn = search_result.matched_mpn
+        item.exact_match = search_result.exact_match
+        item.available_stock_qty = search_result.stock
+        item.jlcpcb_category = search_result.category
+        item.jlcpcb_package = search_result.package
+        item.jlcpcb_availability = AvailabilityState.PREORDER.value
+        item.jlcpcb_status = "preorder"
+        item.notes = "JLCPCB supplier result is pre-order and is not purchasable."
+        item.refresh_status()
+        if search_result.preorder_only and item.digikey_status != "found":
+            item.status = "Pre-order only"
+        return
 
     if search_result.error:
         item.jlcpcb_part_number = ""
@@ -908,6 +1074,10 @@ def enrich_bom_item(item: BomItem, search_result: JlcpcbSearchResult) -> None:
     item.matched_mpn = search_result.matched_mpn
     item.exact_match = True
     item.available_stock_qty = search_result.stock
+    availability = search_result.availability
+    if availability == AvailabilityState.UNKNOWN:
+        availability = normalize_availability(None, search_result.stock)
+    item.jlcpcb_availability = availability.value
     item.jlcpcb_category = search_result.category
     item.jlcpcb_package = search_result.package
     item.is_basic = search_result.is_basic
@@ -1119,7 +1289,7 @@ class SearchWorker(QThread):
                     continue
             observation_type = {
                 "found": "FOUND", "warning": "FOUND", "not_found": "NOT_FOUND",
-                "error": "API_ERROR",
+                "error": "API_ERROR", "preorder": "PREORDER",
             }.get(status)
             if observation_type:
                 observations.append((supplier, part_number, stock, price, source, observation_type, error))
@@ -1322,6 +1492,22 @@ class SearchWorker(QThread):
                                 )
                                 enrich_bom_item(item, result)
                                 item.jlcpcb_part_number = approved_lcsc_code
+                                if result.availability == AvailabilityState.PREORDER:
+                                    if lcsc_pending:
+                                        self.db_manager.invalidate_lcsc_preorder_candidate(
+                                            internal_code,
+                                            mapping.get("last_found_lcsc", "") or approved_lcsc_code,
+                                        )
+                                        lcsc_pending = False
+                                    alternative = searcher.search_mpn(
+                                        item.mpn,
+                                        item.required_stock,
+                                        refresh=self.force_refresh,
+                                        excluded_lcsc_codes={approved_lcsc_code},
+                                    )
+                                    if alternative.is_purchasable(item.required_stock):
+                                        suggested_lcsc = alternative.lcsc_code
+                                        lcsc_pending = suggested_lcsc != approved_lcsc_code
                         elif not lcsc_pending:
                             lcsc_pending = True
 
@@ -1342,7 +1528,15 @@ class SearchWorker(QThread):
                     result = searcher.search_mpn(item.mpn, item.required_stock, refresh=self.force_refresh)
                     if result:
                         suggested_mpn = result.matched_mpn or item.mpn
-                        suggested_lcsc = result.lcsc_code or ""
+                        if result.is_purchasable(item.required_stock):
+                            suggested_lcsc = result.lcsc_code or ""
+                        elif lcsc_pending and not lcsc_is_approved:
+                            if result.availability == AvailabilityState.PREORDER and internal_code:
+                                self.db_manager.invalidate_lcsc_preorder_candidate(
+                                    internal_code,
+                                    result.lcsc_code or (mapping.get("last_found_lcsc", "") if mapping else ""),
+                                )
+                            lcsc_pending = False
                         if result.error:
                             supplier_errors.append(f"JLCPCB: {result.error}")
                     # A pending supplier collects a suggestion without replacing
@@ -1403,6 +1597,8 @@ class SearchWorker(QThread):
                         mpn=suggested_mpn,
                         lcsc_code=suggested_lcsc,
                         digikey_code=suggested_digikey,
+                        lcsc_pending_enabled=lcsc_pending,
+                        digikey_pending_enabled=digikey_pending,
                     )
                     item.status = "Pending Approval"
                     if supplier_errors:

@@ -8,10 +8,12 @@ from datetime import datetime
 from typing import Optional
 from openpyxl import load_workbook
 
-from PyQt6.QtCore import Qt, QSize, QThread, pyqtSignal, QMutex
+from PyQt6.QtCore import Qt, QSize, QThread, pyqtSignal, QMutex, QTimer
 from PyQt6.QtGui import QColor, QFont, QIcon, QPixmap
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
+    QComboBox,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -29,6 +31,7 @@ from PyQt6.QtWidgets import (
     QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
+    QTableView,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -48,6 +51,7 @@ from ui.component_library_conflict_dialog import ComponentLibraryConflictDialog
 from core.component_library import read_component_library_file, detect_library_conflicts
 from core.database_manager import DatabaseManager
 from core.logger import get_logger
+from ui.results_model import ResultsFilterProxy, ResultsTableModel
 
 logger = get_logger(__name__)
 
@@ -696,7 +700,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
 
-        # Splitter: Left (file manager) | Right (preview)
+        # Splitter: file manager and compact input summary.
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
         # Left panel — file manager
@@ -712,26 +716,22 @@ class MainWindow(QMainWindow):
 
         splitter.addWidget(left_panel)
 
-        # Right panel — preview
+        # Right panel — summary only; raw BOM rows are not rendered.
         right_panel = QWidget()
         right_panel.setObjectName("contentPanel")
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(16, 16, 16, 16)
 
-        preview_title = QLabel("📊  Data Preview")
-        preview_title.setObjectName("sectionTitle")
-        right_layout.addWidget(preview_title)
-
-        self._preview_table = QTableWidget()
-        self._preview_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self._preview_table.setAlternatingRowColors(True)
-        self._preview_table.verticalHeader().setVisible(False)
-        self._preview_table.setMinimumHeight(200)
-        right_layout.addWidget(self._preview_table)
-
-        self._preview_info = QLabel("Load BOM files to see a preview here")
-        self._preview_info.setObjectName("statusLabel")
-        right_layout.addWidget(self._preview_info)
+        summary_title = QLabel("Input Summary")
+        summary_title.setObjectName("sectionTitle")
+        right_layout.addWidget(summary_title)
+        self._input_summary = QLabel("Select a BOM file to begin")
+        self._input_summary.setWordWrap(True)
+        self._input_summary.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self._input_summary.linkActivated.connect(self._show_input_issues)
+        self._input_issues = []
+        right_layout.addWidget(self._input_summary)
+        right_layout.addStretch()
 
         splitter.addWidget(right_panel)
         splitter.setSizes([450, 750])
@@ -863,7 +863,7 @@ class MainWindow(QMainWindow):
         title_row.addWidget(results_title)
         title_row.addStretch()
 
-        self._btn_open_excel = QPushButton("📂  Open Excel File")
+        self._btn_open_excel = QPushButton("Export Excel")
         self._btn_open_excel.clicked.connect(self._open_output_file)
         title_row.addWidget(self._btn_open_excel)
 
@@ -877,6 +877,11 @@ class MainWindow(QMainWindow):
 
         layout.addLayout(title_row)
 
+        self._partial_banner = QLabel("Partial results — processing was cancelled")
+        self._partial_banner.setStyleSheet("background:#4a3a1a; color:#ffd166; padding:8px; font-weight:600")
+        self._partial_banner.hide()
+        layout.addWidget(self._partial_banner)
+
         # Summary cards
         self._summary_frame = QFrame()
         self._summary_frame.setObjectName("summaryFrame")
@@ -884,51 +889,49 @@ class MainWindow(QMainWindow):
         summary_layout.setContentsMargins(16, 16, 16, 16)
         summary_layout.setSpacing(12)
 
-        self._card_total = self._make_stat_card("Total", "0", "#1a6b8a")
-        self._card_found = self._make_stat_card("Found", "0", "#00b894")
-        self._card_not_found = self._make_stat_card("Not Found", "0", "#e74c3c")
-        self._card_mismatch = self._make_stat_card("Mismatch", "0", "#f39c12")
-        self._card_insuff = self._make_stat_card("Low Stock", "0", "#e67e22")
-        self._card_manual = self._make_stat_card("Manual", "0", "#6c5ce7")
+        self._card_total = self._make_stat_card("Components", "0", "#1a6b8a")
+        self._card_found = self._make_stat_card("Available", "0", "#00b894")
+        self._card_manual = self._make_stat_card("Needs Review", "0", "#f39c12")
+        self._card_not_found = self._make_stat_card("Unavailable", "0", "#e74c3c")
 
         summary_layout.addWidget(self._card_total)
         summary_layout.addWidget(self._card_found)
         summary_layout.addWidget(self._card_not_found)
-        summary_layout.addWidget(self._card_mismatch)
-        summary_layout.addWidget(self._card_insuff)
         summary_layout.addWidget(self._card_manual)
+        self._card_best_total = self._make_stat_card("Best Sourcing Total", "—", "#1a6b8a")
+        summary_layout.addWidget(self._card_best_total)
 
         layout.addWidget(self._summary_frame)
 
-        # Tabs with filtered views + manual search
-        self._result_tabs = QTabWidget()
+        filters = QHBoxLayout()
+        self._result_search = QLineEdit(); self._result_search.setPlaceholderText("Search")
+        self._status_filter = QComboBox(); self._status_filter.addItems(["All", "Available", "Needs Review", "Unavailable"])
+        self._supplier_filter = QComboBox(); self._supplier_filter.addItems(["All", "JLCPCB", "DigiKey", "Mixed"])
+        self._only_shortage = QCheckBox("Only Shortage")
+        reset = QPushButton("Reset Filters"); reset.clicked.connect(self._reset_result_filters)
+        for widget in (self._result_search, self._status_filter, self._supplier_filter, self._only_shortage, reset): filters.addWidget(widget)
+        self._showing_label = QLabel("Showing 0 of 0 components"); filters.addWidget(self._showing_label)
+        layout.addLayout(filters)
+        self._filter_timer = QTimer(self); self._filter_timer.setSingleShot(True); self._filter_timer.setInterval(250)
+        self._result_search.textChanged.connect(lambda: self._filter_timer.start())
+        self._filter_timer.timeout.connect(self._apply_result_filters)
+        self._status_filter.currentTextChanged.connect(self._apply_result_filters)
+        self._supplier_filter.currentTextChanged.connect(self._apply_result_filters)
+        self._only_shortage.toggled.connect(self._apply_result_filters)
 
-        self._tab_all = QTableWidget()
-        self._tab_found = QTableWidget()
-        self._tab_not_found = QTableWidget()
-        self._tab_manual = QTableWidget()
-
-        for table in [self._tab_all, self._tab_found, self._tab_not_found, self._tab_manual]:
-            table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-            table.setAlternatingRowColors(True)
-            table.verticalHeader().setVisible(False)
-            table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-            table.setSortingEnabled(True)
-
-        self._result_tabs.addTab(self._tab_all, "All Components")
-        self._result_tabs.addTab(self._tab_found, "✅ Available")
-        self._result_tabs.addTab(self._tab_not_found, "❌ Not Found / Mismatch")
-        self._result_tabs.addTab(self._tab_manual, "🔍 Manual Review")
-
-        # ── Manual MPN Search tab ────────────────────────────────
-        self._manual_search_tab = self._build_manual_search_tab()
-        self._result_tabs.addTab(self._manual_search_tab, "🔎 Manual MPN Search")
-
-        # Keep scenario pricing as the final results tab.
-        self._project_pricing_tab = self._build_project_pricing_tab()
-        self._result_tabs.addTab(self._project_pricing_tab, "💰 Project Pricing")
-
-        layout.addWidget(self._result_tabs, stretch=1)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        self._results_model = ResultsTableModel(self)
+        self._results_proxy = ResultsFilterProxy(self); self._results_proxy.setSourceModel(self._results_model)
+        self._results_table = QTableView(); self._results_table.setModel(self._results_proxy)
+        self._results_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._results_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._results_table.setSortingEnabled(True)
+        self._results_table.doubleClicked.connect(self._show_supplier_details)
+        splitter.addWidget(self._results_table)
+        self._supplier_details = QLabel("Double-click a component to view Supplier Details")
+        self._supplier_details.setWordWrap(True); self._supplier_details.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        splitter.addWidget(self._supplier_details); splitter.setSizes([850, 350])
+        layout.addWidget(splitter, stretch=1)
 
         return page
 
@@ -1059,7 +1062,7 @@ class MainWindow(QMainWindow):
         self._btn_refresh.setEnabled(False)
         bom_files = self._file_manager.get_bom_files()
         if bom_files:
-            self._show_preview(bom_files[0])
+            self._show_input_summary(bom_files)
 
             # Auto-set output path
             if not self._output_path.text():
@@ -1068,42 +1071,29 @@ class MainWindow(QMainWindow):
                 default_name = f"BOM_Enriched_{timestamp}.xlsx"
                 self._output_path.setText(os.path.join(first_dir, default_name))
         else:
-            self._preview_table.setRowCount(0)
-            self._preview_table.setColumnCount(0)
-            self._preview_info.setText("Load BOM files to see a preview here")
+            self._input_summary.setText("Select a BOM file to begin")
 
         self._validate_ready()
 
-    def _show_preview(self, bom_file: BomFile):
-        """Show a preview of the first BOM file."""
-        headers = bom_file.headers
-        rows = bom_file.preview_rows
-
-        self._preview_table.setColumnCount(len(headers))
-        self._preview_table.setHorizontalHeaderLabels(headers)
-        self._preview_table.setRowCount(len(rows))
-
-        for row_idx, row_data in enumerate(rows):
-            for col_idx, val in enumerate(row_data):
-                item = QTableWidgetItem(str(val))
-                self._preview_table.setItem(row_idx, col_idx, item)
-
-                # Highlight MPN column
-                if (bom_file.column_mapping
-                        and bom_file.column_mapping.mpn == col_idx):
-                    item.setBackground(QColor("#1a4a3a"))
-                # Highlight Manufacturer column
-                elif (bom_file.column_mapping
-                        and bom_file.column_mapping.manufacturer == col_idx):
-                    item.setBackground(QColor("#3a1a4a"))
-
-        self._preview_table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.ResizeToContents
+    def _show_input_summary(self, bom_files):
+        self._input_issues = [warning for bom in bom_files for warning in bom.warnings]
+        self._input_issues.extend(b.error_message for b in bom_files if not b.is_valid and b.error_message)
+        issues = len(self._input_issues)
+        workspace = self._file_manager.get_workspace()
+        bom_items = [item for project in workspace.projects for board in project.board_items for item in board.bom_items]
+        components = len({(item.mpn or item.comment or item.description).strip().casefold() for item in bom_items})
+        rows = sum(b.row_count for b in bom_files)
+        files = ", ".join(os.path.basename(b.file_path) for b in bom_files)
+        sheets = ", ".join(b.sheet_name or "Default" for b in bom_files)
+        validation = f'{issues} issues found — <a href="review">Review</a>' if issues else "Valid"
+        self._input_summary.setText(
+            f"File: {files}\nSelected Sheet(s): {sheets}\nComponents: {components}\n"
+            f"Total Line Items: {rows}\nBoard Quantity: Set per board\nValidation Status: {validation}"
         )
-        self._preview_info.setText(
-            f"Showing preview of: {os.path.basename(bom_file.file_path)} "
-            f"({bom_file.row_count} rows)"
-        )
+
+    def _show_input_issues(self, link):
+        if link == "review" and self._input_issues:
+            QMessageBox.warning(self, "Input Issues", "\n".join(self._input_issues))
 
     def _browse_output(self):
         path, _ = QFileDialog.getSaveFileName(
@@ -1149,7 +1139,7 @@ class MainWindow(QMainWindow):
 
         # Refresh preview
         if bom_files:
-            self._show_preview(bom_files[0])
+            self._show_input_summary(bom_files)
 
         QMessageBox.information(
             self, "Column Mapping",
@@ -1545,6 +1535,7 @@ class MainWindow(QMainWindow):
 
     def _start_search_worker(self, force_refresh: bool):
         """Run supplier enrichment for the already prepared component list."""
+        self._partial_banner.hide()
         self._stack.setCurrentIndex(1)
         self._btn_back_setup.setVisible(False)
         self._btn_view_results.setVisible(False)
@@ -1587,6 +1578,7 @@ class MainWindow(QMainWindow):
             return
 
         self._all_items = items
+        self._partial_banner.hide()
         self._btn_refresh.setEnabled(self._has_processed_bom())
         self._progress_widget.set_finished(True)
         self._btn_back_setup.setVisible(True)
@@ -1667,49 +1659,90 @@ class MainWindow(QMainWindow):
             self._search_worker.cancel()
             self._progress_widget.set_cancelled()
             self._btn_back_setup.setVisible(True)
+            self._partial_banner.show()
 
     def _populate_results(self):
-        """Fill the results page with processed data."""
-        items = self._all_items
-        headers = BomItem.get_headers()
+        """Show canonical project-pricing rows without UI-side recalculation."""
+        aggregation = self._workspace_aggregation_result or self._project_aggregation_result
+        if not aggregation or not self._search_item_component_keys:
+            self._results_model.set_rows([])
+            self._showing_label.setText("No components found")
+            return
+        from services.project_pricing import calculate_project_pricing
+        scenario = calculate_project_pricing(
+            aggregation, self._all_items, self._search_item_component_keys,
+            scenarios=(self._build_quantity,),
+        )[0]
+        items = dict(zip(self._search_item_component_keys, self._all_items))
+        rows = []
+        for component in scenario.components:
+            item = items[component.component_key]
+            quote = component.quote
+            category = item.get_ui_category()
+            if quote:
+                status = "Available"
+                supplier = quote.supplier
+                unit = f"{quote.currency} {quote.unit_price:.6f}"
+                total = f"{quote.currency} {quote.order_price:.6f}"
+                stock = item.available_stock_qty if supplier == "JLCPCB" else item.digikey_stock_qty
+            else:
+                status = "Unavailable" if category in ("not_found",) else "Needs Review"
+                supplier, unit, total, stock = "Unavailable" if status == "Unavailable" else "Needs Review", "—", "—", "—"
+            searchable = " ".join((item.comment, item.mpn, item.description, item.jlcpcb_part_number, item.digikey_part_number)).casefold()
+            rows.append({
+                "display": (item.comment, item.mpn, item.description, component.required_quantity,
+                            supplier, unit, total, stock if stock is not None else "—", status),
+                "search": searchable, "status": status, "supplier": supplier,
+                "shortage": any("insufficient stock" in reason for reason in component.supplier_reasons),
+                "item": item, "pricing": component,
+            })
+        self._results_model.set_rows(rows)
+        counts = {name: sum(r["status"] == name for r in rows) for name in ("Available", "Needs Review", "Unavailable")}
+        self._update_card_value(self._card_total, str(len(rows)))
+        self._update_card_value(self._card_found, str(counts["Available"]))
+        self._update_card_value(self._card_manual, str(counts["Needs Review"]))
+        self._update_card_value(self._card_not_found, str(counts["Unavailable"]))
+        jlc = {c: v for c, v in scenario.order_price_totals.items()} if scenario.components else {}
+        self._update_card_value(self._card_best_total, self._format_currency_totals(jlc))
+        self._apply_result_filters()
 
-        # Summary cards
-        total = len(items)
-        categories = [item.get_ui_category() for item in items]
-        found = sum(1 for c in categories if c == "available")
-        not_found_count = sum(1 for c in categories if c == "not_found")
-        mismatch = sum(1 for c in categories if c == "mismatch")
-        insuff = sum(1 for c in categories if c == "low_stock")
-        manual = sum(1 for c in categories if c in ("manual", "error"))
+    def _apply_result_filters(self):
+        self._results_proxy.set_filters(
+            self._result_search.text(), self._status_filter.currentText(),
+            self._supplier_filter.currentText(), self._only_shortage.isChecked(),
+        )
+        self._showing_label.setText(
+            f"Showing {self._results_proxy.rowCount()} of {self._results_model.rowCount()} components"
+        )
 
-        self._update_card_value(self._card_total, str(total))
-        self._update_card_value(self._card_found, str(found))
-        self._update_card_value(self._card_not_found, str(not_found_count))
-        self._update_card_value(self._card_mismatch, str(mismatch))
-        self._update_card_value(self._card_insuff, str(insuff))
-        self._update_card_value(self._card_manual, str(manual))
+    def _reset_result_filters(self):
+        self._result_search.clear(); self._status_filter.setCurrentText("All")
+        self._supplier_filter.setCurrentText("All"); self._only_shortage.setChecked(False)
+        self._apply_result_filters()
 
-        # All items tab
-        self._fill_result_table(self._tab_all, items, headers)
-
-        # Found tab
-        found_items = [i for i, c in zip(items, categories) if c == "available"]
-        self._fill_result_table(self._tab_found, found_items, headers)
-
-        # Not found / mismatch tab
-        nf_items = [i for i, c in zip(items, categories) if c in ("not_found", "mismatch", "low_stock")]
-        self._fill_result_table(self._tab_not_found, nf_items, headers)
-
-        # Manual review tab
-        manual_items = [i for i, c in zip(items, categories) if c in ("manual", "error", "low_stock")]
-        self._fill_result_table(self._tab_manual, manual_items, headers)
-
-        # Update tab labels with counts
-        self._result_tabs.setTabText(0, f"All Components ({total})")
-        self._result_tabs.setTabText(1, f"✅ Available ({found})")
-        self._result_tabs.setTabText(2, f"❌ Not Found / Mismatch ({len(nf_items)})")
-        self._result_tabs.setTabText(3, f"🔍 Manual Review ({len(manual_items)})")
-        self._populate_project_pricing()
+    def _show_supplier_details(self, proxy_index):
+        row = self._results_proxy.mapToSource(proxy_index).row()
+        data = self._results_model.rows[row]
+        item, pricing = data["item"], data["pricing"]
+        quote = pricing.quote
+        def detail(name, part, status, stock, moq, price, source, error):
+            selected = quote if quote and quote.supplier == name else None
+            status_label = "Pre-order" if status == "preorder" else status
+            return (
+                f"{name}\nPart #: {part or '—'}\nMatch Status: {status_label or '—'}\n"
+                f"Stock: {stock if stock is not None else 'Unknown'}\nMOQ: {moq if moq is not None else '—'}\n"
+                f"Unit Price: {selected.currency + ' ' + str(selected.unit_price) if selected else (str(price) if price is not None else '—')}\n"
+                f"Price Break: {selected.purchase_quantity if selected else '—'}\n"
+                f"Extended Cost: {selected.currency + ' ' + str(selected.order_price) if selected else '—'}\n"
+                f"Data Source: {source or '—'}\nUpdated At: —\nError/Warning: {error or '—'}"
+            )
+        self._supplier_details.setText(
+            "Supplier Details\n\n" +
+            detail("JLCPCB", item.jlcpcb_part_number, item.jlcpcb_status, item.available_stock_qty,
+                   item.jlcpcb_min_order_quantity, item.unit_price, item.jlcpcb_source, item.jlcpcb_error) + "\n\n" +
+            detail("DigiKey", item.digikey_part_number, item.digikey_status, item.digikey_stock_qty,
+                   item.digikey_min_order_quantity, item.digikey_unit_price, item.digikey_source, item.digikey_error)
+        )
 
     @staticmethod
     def _format_currency_totals(values: dict) -> str:
@@ -1946,4 +1979,5 @@ class MainWindow(QMainWindow):
         """Reset to start a new processing session."""
         self._clear_processed_state()
         self._all_items.clear()
+        self._partial_banner.hide()
         self._stack.setCurrentIndex(0)

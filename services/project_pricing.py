@@ -141,6 +141,8 @@ def _quote(
 ) -> tuple[Optional[SupplierQuote], str]:
     if supplier_error or supplier_status == "error":
         return None, f"{supplier}: API error ({supplier_error or 'unknown error'})"
+    if supplier_status == "preorder":
+        return None, f"{supplier}: pre-order is not purchasable"
     if supplier_status == "mismatch":
         return None, f"{supplier}: exact MPN mismatch"
     if supplier_status == "not_found":
@@ -190,9 +192,13 @@ def _component_scenario(component: object, item: BomItem, project_quantity: int)
     target = required + surplus
     quotes: list[SupplierQuote] = []
     reasons: list[str] = []
+    jlcpcb_tiers = _jlcpcb_tiers(item.jlcpcb_price_breaks_raw)
+    scalar_jlcpcb_price = _decimal(item.unit_price)
+    if not jlcpcb_tiers and scalar_jlcpcb_price is not None:
+        jlcpcb_tiers = [PriceTier(1, None, scalar_jlcpcb_price)]
     quote, reason = _quote(
         "JLCPCB", item.jlcpcb_part_number, item.available_stock_qty,
-        _jlcpcb_tiers(item.jlcpcb_price_breaks_raw), item.jlcpcb_min_order_quantity,
+        jlcpcb_tiers, item.jlcpcb_min_order_quantity,
         item.jlcpcb_order_multiple, item.jlcpcb_currency, required, target,
         item.jlcpcb_status, item.jlcpcb_error,
     )
@@ -200,9 +206,13 @@ def _component_scenario(component: object, item: BomItem, project_quantity: int)
         quotes.append(quote)
     else:
         reasons.append(reason)
+    digikey_tiers = _digikey_tiers(item.digikey_price_breaks)
+    scalar_digikey_price = _decimal(item.digikey_unit_price)
+    if not digikey_tiers and scalar_digikey_price is not None:
+        digikey_tiers = [PriceTier(1, None, scalar_digikey_price)]
     quote, reason = _quote(
         "DigiKey", item.digikey_part_number, item.digikey_stock_qty,
-        _digikey_tiers(item.digikey_price_breaks), item.digikey_min_order_quantity,
+        digikey_tiers, item.digikey_min_order_quantity,
         item.digikey_order_multiple, item.digikey_currency, required, target,
         item.digikey_status, item.digikey_error,
     )
@@ -231,6 +241,23 @@ def _component_scenario(component: object, item: BomItem, project_quantity: int)
         status="Priced" if selected else "Unpriced: " + "; ".join(reasons),
         supplier_reasons=tuple(reasons),
     )
+
+
+def calculate_item_pricing(
+    item: BomItem,
+    required_quantity: int,
+    safety_surplus: int = 0,
+    component_key: str = "",
+) -> ComponentPricing:
+    """Return the canonical supplier choice for one already-scaled component."""
+    required = parse_positive_integer_quantity(required_quantity)
+    surplus = max(0, int(safety_surplus or 0))
+    component = type("PricingComponent", (), {
+        "total_quantity": required,
+        "safety_surplus": surplus,
+        "component_key": component_key or item.mpn or item.comment,
+    })()
+    return _component_scenario(component, item, 1)
 
 
 def calculate_project_pricing(

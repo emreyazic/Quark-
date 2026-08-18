@@ -154,6 +154,7 @@ class ExcelWriter:
         jlc_usable = (
             bool(item.jlcpcb_part_number)
             and item.unit_price is not None
+            and not item.is_jlcpcb_preorder
             and not any(
                 marker in status_lower
                 for marker in ("not found", "no exact", "error")
@@ -171,6 +172,7 @@ class ExcelWriter:
         """Return a stock-sufficient supplier for legacy Excel callers."""
         if (
             item.jlcpcb_part_number
+            and not item.is_jlcpcb_preorder
             and jlcpcb_price is not None
             and item.available_stock_qty is not None
             and item.available_stock_qty >= required_quantity
@@ -200,7 +202,12 @@ class ExcelWriter:
             surplus = item.safety_surplus
             purchase_qty = item.purchase_quantity_val
             rows = [
-                ("JLCPCB", item.jlcpcb_part_number, item.available_stock_qty, item.unit_price, item.jlcpcb_total_price, item.status),
+                (
+                    "JLCPCB", item.jlcpcb_part_number, item.available_stock_qty,
+                    None if item.is_jlcpcb_preorder else item.unit_price,
+                    None if item.is_jlcpcb_preorder else item.jlcpcb_total_price,
+                    "Pre-order" if item.is_jlcpcb_preorder else item.status,
+                ),
                 ("DigiKey", item.digikey_part_number, item.digikey_stock_qty, item.digikey_unit_price, item.digikey_total_price,
                  "Found" if item.digikey_part_number else "Not Found"),
             ]
@@ -316,7 +323,7 @@ class ExcelWriter:
                 
                 # Fetch JLC and DK prices
                 j_price = None
-                if item.jlcpcb_part_number and "error" not in item.status.lower() and "not found" not in item.status.lower() and "mismatch" not in item.status.lower():
+                if item.jlcpcb_part_number and not item.is_jlcpcb_preorder and "error" not in item.status.lower() and "not found" not in item.status.lower() and "mismatch" not in item.status.lower():
                     j_price = select_unit_price(item.jlcpcb_price_breaks_raw, purchase_qty, use_quantity_breaks=self.pricing_mode == "project")
                     if j_price is None:
                         j_price = item.unit_price
@@ -330,6 +337,7 @@ class ExcelWriter:
                 
                 j_purchasable = (
                     bool(item.jlcpcb_part_number)
+                    and not item.is_jlcpcb_preorder
                     and j_price is not None
                     and "error" not in item.status.lower()
                     and "not found" not in item.status.lower()
@@ -456,7 +464,8 @@ class UnavailableReportWriter:
         self.unavailable_items = [
             item
             for item in items
-            if not item.jlcpcb_part_number and not item.digikey_part_number
+            if (not item.jlcpcb_part_number or item.is_jlcpcb_preorder)
+            and not item.digikey_part_number
         ]
 
     def write(self, output_path: str) -> None:

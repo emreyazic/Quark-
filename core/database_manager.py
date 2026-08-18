@@ -189,6 +189,11 @@ class DatabaseManager:
                            SET lcsc_pending_change = CASE WHEN lcsc_status = 'PENDING_REVIEW' THEN 1 ELSE 0 END,
                                digikey_pending_change = CASE WHEN digikey_status = 'PENDING_REVIEW' THEN 1 ELSE 0 END"""
                     )
+                # Track timestamp of when each supplier mapping was approved.
+                for column in ("lcsc_approved_at", "digikey_approved_at"):
+                    if column not in columns:
+                        cursor.execute(f"ALTER TABLE internal_mappings ADD COLUMN {column} REAL")
+
                 # Versioned data migration: older pending rows stored automatic
                 # suggestions in the approved-value columns. Move those values
                 # to lookup history once, then keep approved values empty until
@@ -255,6 +260,11 @@ class DatabaseManager:
                 api_cache_columns = [info[1] for info in cursor.fetchall()]
                 if 'source' not in api_cache_columns:
                     cursor.execute("ALTER TABLE api_cache ADD COLUMN source TEXT NOT NULL DEFAULT ''")
+                if 'availability' not in api_cache_columns:
+                    cursor.execute(
+                        "ALTER TABLE api_cache ADD COLUMN availability "
+                        "TEXT NOT NULL DEFAULT 'UNKNOWN'"
+                    )
                 
                 # Table 3: local_jlc_library  (MPN -> LCSC kalıcı eşleme, JOP API'den senkronize)
                 cursor.execute('''
@@ -316,6 +326,38 @@ class DatabaseManager:
                     "(mpn COLLATE NOCASE, supplier, observed_at DESC)"
                 )
                 
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS mapping_audit_history (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        comment_code TEXT NOT NULL,
+                        mpn TEXT NOT NULL DEFAULT '',
+                        supplier TEXT NOT NULL,
+                        previous_code TEXT NOT NULL DEFAULT '',
+                        candidate_code TEXT NOT NULL DEFAULT '',
+                        selected_code TEXT NOT NULL DEFAULT '',
+                        action TEXT NOT NULL,
+                        created_at REAL NOT NULL
+                    )
+                ''')
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_audit_comment ON mapping_audit_history (comment_code)')
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_audit_created ON mapping_audit_history (created_at DESC)')
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_mapping_lcsc_pending "
+                    "ON internal_mappings (lcsc_pending_change, comment_code)"
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_mapping_digikey_pending "
+                    "ON internal_mappings (digikey_pending_change, comment_code)"
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_mapping_lcsc_approved "
+                    "ON internal_mappings (lcsc_approved, lcsc_approved_at DESC)"
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_mapping_digikey_approved "
+                    "ON internal_mappings (digikey_approved, digikey_approved_at DESC)"
+                )
+
                 conn.commit()
 
     # =========================================================
@@ -377,7 +419,16 @@ class DatabaseManager:
                       1 if approved else 0, 1 if approved else 0))
                 conn.commit()
 
-    def insert_pending_suggestion(self, comment_code: str, mpn: str = "", lcsc_code: str = "", digikey_code: str = "") -> None:
+    def insert_pending_suggestion(
+        self,
+        comment_code: str,
+        mpn: str = "",
+        lcsc_code: str = "",
+        digikey_code: str = "",
+        *,
+        lcsc_pending_enabled: Optional[bool] = None,
+        digikey_pending_enabled: Optional[bool] = None,
+    ) -> None:
         """Creates a new pending record OR fills in ONLY empty suggestion fields on an existing pending record.
         
         This preserves any manual edits the user has made in ApprovalDialog.
@@ -386,6 +437,8 @@ class DatabaseManager:
         with self._lock:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
+                lcsc_enabled = True if lcsc_pending_enabled is None else bool(lcsc_pending_enabled)
+                digikey_enabled = True if digikey_pending_enabled is None else bool(digikey_pending_enabled)
                 # Önce mevcut kaydı kontrol et
                 cursor.execute("SELECT * FROM internal_mappings WHERE comment_code = ?", (comment_code,))
                 existing = cursor.fetchone()
@@ -398,17 +451,24 @@ class DatabaseManager:
                             last_found_lcsc, last_found_digikey, lcsc_status, digikey_status,
                             lcsc_approved, digikey_approved,
                             lcsc_pending_change, digikey_pending_change)
-                           VALUES (?, ?, ?, ?, 0, ?, ?, ?, 'PENDING_REVIEW', 'PENDING_REVIEW', 0, 0, 1, 1)""",
-                        (comment_code, mpn, "", "", time.time(), lcsc_code, digikey_code)
+                           VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, 0, 0, ?, ?)""",
+                        (
+                            comment_code, mpn, "", "", time.time(),
+                            (lcsc_code or "").strip() if lcsc_enabled else "",
+                            (digikey_code or "").strip() if digikey_enabled else "",
+                            "PENDING_REVIEW" if lcsc_enabled else "NOT_SEARCHED",
+                            "PENDING_REVIEW" if digikey_enabled else "NOT_SEARCHED",
+                            int(lcsc_enabled), int(digikey_enabled),
+                        )
                     )
                 else:
                     # Pending suggestions update automatic history only. The
                     # approved columns remain untouched until Approve is clicked.
                     new_mpn = existing["mpn"] or mpn
-                    new_lcsc = (lcsc_code or "").strip()
-                    new_dk = (digikey_code or "").strip()
-                    changed_lcsc = new_lcsc != existing["last_found_lcsc"]
-                    changed_dk = new_dk != existing["last_found_digikey"]
+                    new_lcsc = (lcsc_code or "").strip() if lcsc_enabled else existing["last_found_lcsc"]
+                    new_dk = (digikey_code or "").strip() if digikey_enabled else existing["last_found_digikey"]
+                    changed_lcsc = lcsc_enabled and new_lcsc != existing["last_found_lcsc"]
+                    changed_dk = digikey_enabled and new_dk != existing["last_found_digikey"]
                     if new_mpn != existing["mpn"] or changed_lcsc or changed_dk:
                         cursor.execute(
                             """UPDATE internal_mappings
@@ -546,22 +606,163 @@ class DatabaseManager:
                 )
                 conn.commit()
 
-    def approve_supplier_mapping(self, comment_code: str, supplier: str, code: str, mpn: Optional[str] = None) -> None:
+    def record_mapping_audit(
+        self,
+        comment_code: str,
+        mpn: str,
+        supplier: str,
+        previous_code: str,
+        candidate_code: str,
+        selected_code: str,
+        action: str,
+        created_at: Optional[float] = None,
+    ) -> None:
+        """Record an audit entry for internal mapping approval/keep/edit."""
+        now = time.time() if created_at is None else created_at
+        with self._lock:
+            with self._get_connection() as conn:
+                conn.execute(
+                    """INSERT INTO mapping_audit_history
+                       (comment_code, mpn, supplier, previous_code, candidate_code, selected_code, action, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        comment_code.strip(),
+                        (mpn or "").strip(),
+                        supplier.strip().upper(),
+                        (previous_code or "").strip(),
+                        (candidate_code or "").strip(),
+                        (selected_code or "").strip(),
+                        action.strip().upper(),
+                        now,
+                    ),
+                )
+                conn.commit()
+
+    def get_mapping_audit_history(
+        self,
+        comment_code: Optional[str] = None,
+        supplier: Optional[str] = None,
+        *,
+        search: Optional[str] = None,
+        limit: Optional[int] = None,
+        offset: int = 0,
+    ) -> list[Dict[str, Any]]:
+        """Retrieve audit history entries ordered newest first."""
+        with self._lock:
+            with self._get_connection() as conn:
+                query = (
+                    "SELECT id, comment_code, mpn, supplier, previous_code, "
+                    "candidate_code, selected_code, action, created_at "
+                    "FROM mapping_audit_history"
+                )
+                conditions = []
+                params = []
+                if comment_code:
+                    conditions.append("comment_code = ?")
+                    params.append(comment_code.strip())
+                if supplier:
+                    conditions.append("supplier = ?")
+                    params.append(supplier.strip().upper())
+                if search:
+                    pattern = f"%{search.strip()}%"
+                    conditions.append(
+                        "(comment_code LIKE ? OR mpn LIKE ? OR supplier LIKE ? OR "
+                        "previous_code LIKE ? OR candidate_code LIKE ? OR "
+                        "selected_code LIKE ? OR action LIKE ?)"
+                    )
+                    params.extend([pattern] * 7)
+                if conditions:
+                    query += " WHERE " + " AND ".join(conditions)
+                query += " ORDER BY created_at DESC, id DESC"
+                if limit is not None:
+                    query += " LIMIT ? OFFSET ?"
+                    params.extend((max(0, int(limit)), max(0, int(offset))))
+                rows = conn.execute(query, params).fetchall()
+                return [dict(row) for row in rows]
+
+    def count_mapping_audit_history(self, search: Optional[str] = None) -> int:
+        """Count audit rows, optionally using the same filter as the history model."""
+        with self._lock:
+            with self._get_connection() as conn:
+                params: list[Any] = []
+                query = "SELECT COUNT(*) FROM mapping_audit_history"
+                if search:
+                    pattern = f"%{search.strip()}%"
+                    query += (
+                        " WHERE comment_code LIKE ? OR mpn LIKE ? OR supplier LIKE ? OR "
+                        "previous_code LIKE ? OR candidate_code LIKE ? OR "
+                        "selected_code LIKE ? OR action LIKE ?"
+                    )
+                    params.extend([pattern] * 7)
+                return int(conn.execute(query, params).fetchone()[0])
+
+    def get_pending_supplier_mappings(self, search: Optional[str] = None) -> list[Dict[str, Any]]:
+        """Return only supplier rows which currently need a decision."""
+        params: list[Any] = []
+        filters = ""
+        if search:
+            pattern = f"%{search.strip()}%"
+            filters = (
+                " AND (comment_code LIKE ? OR mpn LIKE ? OR supplier LIKE ? "
+                "OR current_code LIKE ? OR candidate_code LIKE ?)"
+            )
+            params.extend([pattern] * 5)
+        query = f"""
+            SELECT comment_code, mpn, supplier, current_code, candidate_code,
+                   has_approved
+            FROM (
+                SELECT comment_code, mpn, 'JLCPCB' AS supplier,
+                       lcsc_code AS current_code,
+                       last_found_lcsc AS candidate_code,
+                       CASE WHEN lcsc_approved = 1 AND lcsc_code != '' THEN 1 ELSE 0 END AS has_approved
+                FROM internal_mappings WHERE lcsc_pending_change = 1
+                UNION ALL
+                SELECT comment_code, mpn, 'DigiKey' AS supplier,
+                       digikey_code AS current_code,
+                       last_found_digikey AS candidate_code,
+                       CASE WHEN digikey_approved = 1 AND digikey_code != '' THEN 1 ELSE 0 END AS has_approved
+                FROM internal_mappings WHERE digikey_pending_change = 1
+            ) AS pending
+            WHERE 1 = 1 {filters}
+            ORDER BY comment_code COLLATE NOCASE, supplier
+        """
+        with self._lock:
+            with self._get_connection() as conn:
+                return [dict(row) for row in conn.execute(query, params).fetchall()]
+
+    def approve_supplier_mapping(
+        self,
+        comment_code: str,
+        supplier: str,
+        code: str,
+        mpn: Optional[str] = None,
+        candidate_code: Optional[str] = None,
+    ) -> None:
         """Approve or manually override a mapping for a single specific supplier without affecting the other supplier."""
         supplier_norm = supplier.upper().strip()
+        clean_code = (code or "").strip()
+        if not clean_code:
+            raise ValueError("Approved code cannot be empty.")
+
         with self._lock:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("SELECT * FROM internal_mappings WHERE comment_code = ?", (comment_code,))
                 existing = cursor.fetchone()
                 now = time.time()
-                clean_code = (code or "").strip()
                 new_mpn = mpn.strip() if mpn is not None else (existing["mpn"] if existing else "")
 
                 if supplier_norm in ("JLCPCB", "LCSC"):
-                    last_found = existing["last_found_lcsc"] if existing else ""
-                    source = "MANUAL" if clean_code != last_found else "AUTO"
-                    status = "MANUAL_OVERRIDE" if source == "MANUAL" else "AUTO_APPROVED"
+                    last_found = (
+                        candidate_code.strip()
+                        if candidate_code is not None
+                        else ((existing["last_found_lcsc"] or "").strip() if existing else "")
+                    )
+                    prev_code = (existing["lcsc_code"] or "").strip() if existing else ""
+                    action = "ACCEPT_CANDIDATE" if clean_code == last_found else "MANUAL_EDIT"
+                    source = "AUTO" if action == "ACCEPT_CANDIDATE" else "MANUAL"
+                    status = "AUTO_APPROVED" if source == "AUTO" else "MANUAL_OVERRIDE"
+
                     if existing:
                         cursor.execute(
                             """UPDATE internal_mappings
@@ -570,12 +771,13 @@ class DatabaseManager:
                                    lcsc_source = ?,
                                    lcsc_status = ?,
                                    lcsc_approved = 1,
+                                   lcsc_approved_at = ?,
                                    lcsc_pending_change = 0,
                                    previous_found_lcsc = '',
                                    approved = 1,
                                    updated_at = ?
                                WHERE comment_code = ?""",
-                            (new_mpn, new_mpn, clean_code, source, status, now, comment_code)
+                            (new_mpn, new_mpn, clean_code, source, status, now, now, comment_code)
                         )
                     else:
                         cursor.execute(
@@ -583,14 +785,22 @@ class DatabaseManager:
                                (comment_code, mpn, lcsc_code, digikey_code, approved, updated_at,
                                 last_found_lcsc, last_found_digikey, lcsc_source, digikey_source,
                                 lcsc_status, digikey_status, lcsc_approved, digikey_approved,
+                                lcsc_approved_at, digikey_approved_at,
                                 lcsc_pending_change, digikey_pending_change)
-                               VALUES (?, ?, ?, '', 1, ?, ?, '', ?, 'AUTO', ?, 'PENDING_REVIEW', 1, 0, 0, 1)""",
-                            (comment_code, new_mpn, clean_code, now, clean_code, source, status)
+                               VALUES (?, ?, ?, '', 1, ?, ?, '', ?, 'AUTO', ?, 'PENDING_REVIEW', 1, 0, ?, NULL, 0, 0)""",
+                            (comment_code, new_mpn, clean_code, now, clean_code, source, status, now)
                         )
                 elif supplier_norm == "DIGIKEY":
-                    last_found = existing["last_found_digikey"] if existing else ""
-                    source = "MANUAL" if clean_code != last_found else "AUTO"
-                    status = "MANUAL_OVERRIDE" if source == "MANUAL" else "AUTO_APPROVED"
+                    last_found = (
+                        candidate_code.strip()
+                        if candidate_code is not None
+                        else ((existing["last_found_digikey"] or "").strip() if existing else "")
+                    )
+                    prev_code = (existing["digikey_code"] or "").strip() if existing else ""
+                    action = "ACCEPT_CANDIDATE" if clean_code == last_found else "MANUAL_EDIT"
+                    source = "AUTO" if action == "ACCEPT_CANDIDATE" else "MANUAL"
+                    status = "AUTO_APPROVED" if source == "AUTO" else "MANUAL_OVERRIDE"
+
                     if existing:
                         cursor.execute(
                             """UPDATE internal_mappings
@@ -599,12 +809,13 @@ class DatabaseManager:
                                    digikey_source = ?,
                                    digikey_status = ?,
                                    digikey_approved = 1,
+                                   digikey_approved_at = ?,
                                    digikey_pending_change = 0,
                                    previous_found_digikey = '',
                                    approved = 1,
                                    updated_at = ?
                                WHERE comment_code = ?""",
-                            (new_mpn, new_mpn, clean_code, source, status, now, comment_code)
+                            (new_mpn, new_mpn, clean_code, source, status, now, now, comment_code)
                         )
                     else:
                         cursor.execute(
@@ -612,12 +823,214 @@ class DatabaseManager:
                                (comment_code, mpn, lcsc_code, digikey_code, approved, updated_at,
                                 last_found_lcsc, last_found_digikey, lcsc_source, digikey_source,
                                 lcsc_status, digikey_status, lcsc_approved, digikey_approved,
+                                lcsc_approved_at, digikey_approved_at,
                                 lcsc_pending_change, digikey_pending_change)
-                               VALUES (?, ?, '', ?, 1, ?, '', ?, 'AUTO', ?, 'PENDING_REVIEW', ?, 0, 1, 1, 0)""",
-                            (comment_code, new_mpn, clean_code, now, clean_code, source, status)
+                                VALUES (?, ?, '', ?, 1, ?, '', ?, 'AUTO', ?, 'PENDING_REVIEW', ?, 0, 1, NULL, ?, 0, 0)""",
+                            (comment_code, new_mpn, clean_code, now, clean_code, source, status, now)
                         )
                 else:
                     raise ValueError(f"Unsupported supplier: {supplier}")
+
+                cursor.execute(
+                    """INSERT INTO mapping_audit_history
+                       (comment_code, mpn, supplier, previous_code, candidate_code, selected_code, action, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (comment_code, new_mpn, supplier_norm, prev_code, last_found, clean_code, action, now),
+                )
+                conn.commit()
+
+    def update_approved_supplier_code(
+        self,
+        comment_code: str,
+        supplier: str,
+        new_code: str,
+        mpn: Optional[str] = None,
+    ) -> None:
+        """Manually update an existing approved mapping for a supplier and record MANUAL_EDIT audit history.
+
+        Does not touch pending flags or the other supplier's values.
+        """
+        supplier_norm = supplier.upper().strip()
+        clean_code = (new_code or "").strip()
+        if not clean_code:
+            raise ValueError("Approved code cannot be empty.")
+
+        with self._lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT * FROM internal_mappings WHERE comment_code = ?", (comment_code,))
+                existing = cursor.fetchone()
+                if not existing:
+                    raise ValueError(f"Mapping for '{comment_code}' does not exist.")
+
+                now = time.time()
+                new_mpn = mpn.strip() if mpn is not None else (existing["mpn"] or "")
+
+                if supplier_norm in ("JLCPCB", "LCSC"):
+                    prev_code = (existing["lcsc_code"] or "").strip()
+                    last_found = (existing["last_found_lcsc"] or "").strip()
+                    cursor.execute(
+                        """UPDATE internal_mappings
+                           SET mpn = CASE WHEN ? != '' THEN ? ELSE mpn END,
+                               lcsc_code = ?,
+                               lcsc_source = 'MANUAL',
+                               lcsc_status = 'MANUAL_OVERRIDE',
+                               lcsc_approved = 1,
+                               lcsc_approved_at = ?,
+                               approved = 1,
+                               updated_at = ?
+                           WHERE comment_code = ?""",
+                        (new_mpn, new_mpn, clean_code, now, now, comment_code),
+                    )
+                elif supplier_norm == "DIGIKEY":
+                    prev_code = (existing["digikey_code"] or "").strip()
+                    last_found = (existing["last_found_digikey"] or "").strip()
+                    cursor.execute(
+                        """UPDATE internal_mappings
+                           SET mpn = CASE WHEN ? != '' THEN ? ELSE mpn END,
+                               digikey_code = ?,
+                               digikey_source = 'MANUAL',
+                               digikey_status = 'MANUAL_OVERRIDE',
+                               digikey_approved = 1,
+                               digikey_approved_at = ?,
+                               approved = 1,
+                               updated_at = ?
+                           WHERE comment_code = ?""",
+                        (new_mpn, new_mpn, clean_code, now, now, comment_code),
+                    )
+                else:
+                    raise ValueError(f"Unsupported supplier: {supplier}")
+
+                cursor.execute(
+                    """INSERT INTO mapping_audit_history
+                       (comment_code, mpn, supplier, previous_code, candidate_code, selected_code, action, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, 'MANUAL_EDIT', ?)""",
+                    (comment_code, new_mpn, supplier_norm, prev_code, last_found, clean_code, now),
+                )
+                conn.commit()
+
+    def get_approved_supplier_mappings(
+        self,
+        search: Optional[str] = None,
+        supplier: Optional[str] = None,
+        *,
+        limit: Optional[int] = None,
+        offset: int = 0,
+    ) -> list[Dict[str, Any]]:
+        """Retrieve all approved supplier records as individual supplier entries.
+
+        Each component can yield up to two entries (one for JLCPCB, one for DigiKey).
+        Ordered newest approved first.
+        """
+        params: list[Any] = []
+        conditions = ["approved_code != ''"]
+        if supplier and supplier != "All Suppliers":
+            conditions.append("supplier = ?")
+            params.append(supplier.strip())
+        if search:
+            pattern = f"%{search.strip()}%"
+            conditions.append(
+                "(comment_code LIKE ? OR mpn LIKE ? OR approved_code LIKE ?)"
+            )
+            params.extend([pattern] * 3)
+        query = """
+            SELECT comment_code, mpn, supplier, approved_code, approved_at
+            FROM (
+                SELECT comment_code, mpn, 'JLCPCB' AS supplier,
+                       lcsc_code AS approved_code, lcsc_approved_at AS approved_at
+                FROM internal_mappings WHERE lcsc_approved = 1
+                UNION ALL
+                SELECT comment_code, mpn, 'DigiKey' AS supplier,
+                       digikey_code AS approved_code, digikey_approved_at AS approved_at
+                FROM internal_mappings WHERE digikey_approved = 1
+            ) AS approved_rows
+            WHERE """ + " AND ".join(conditions) + """
+            ORDER BY approved_at IS NOT NULL DESC, approved_at DESC,
+                     comment_code COLLATE NOCASE, supplier
+        """
+        if limit is not None:
+            query += " LIMIT ? OFFSET ?"
+            params.extend((max(0, int(limit)), max(0, int(offset))))
+        with self._lock:
+            with self._get_connection() as conn:
+                return [dict(row) for row in conn.execute(query, params).fetchall()]
+
+    def count_approved_supplier_mappings(
+        self, search: Optional[str] = None, supplier: Optional[str] = None
+    ) -> int:
+        """Count supplier-specific approved rows without loading their payload."""
+        params: list[Any] = []
+        conditions = ["approved_code != ''"]
+        if supplier and supplier != "All Suppliers":
+            conditions.append("supplier = ?")
+            params.append(supplier.strip())
+        if search:
+            pattern = f"%{search.strip()}%"
+            conditions.append("(comment_code LIKE ? OR mpn LIKE ? OR approved_code LIKE ?)")
+            params.extend([pattern] * 3)
+        query = """
+            SELECT COUNT(*) FROM (
+                SELECT comment_code, mpn, 'JLCPCB' AS supplier, lcsc_code AS approved_code
+                FROM internal_mappings WHERE lcsc_approved = 1
+                UNION ALL
+                SELECT comment_code, mpn, 'DigiKey' AS supplier, digikey_code AS approved_code
+                FROM internal_mappings WHERE digikey_approved = 1
+            ) AS approved_rows WHERE """ + " AND ".join(conditions)
+        with self._lock:
+            with self._get_connection() as conn:
+                return int(conn.execute(query, params).fetchone()[0])
+
+    def keep_supplier_current_mapping(self, comment_code: str, supplier: str) -> None:
+        """Keep current approved code, dismiss candidate, and record KEEP_CURRENT audit entry.
+
+        If no current approved code exists, raises ValueError to avoid silently losing the candidate without an approved value.
+        """
+        supplier_norm = supplier.upper().strip()
+        with self._lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT * FROM internal_mappings WHERE comment_code = ?", (comment_code,))
+                existing = cursor.fetchone()
+                if not existing:
+                    raise ValueError(f"Mapping '{comment_code}' does not exist.")
+
+                now = time.time()
+                mpn = existing["mpn"] or ""
+                if supplier_norm in ("JLCPCB", "LCSC"):
+                    current_code = (existing["lcsc_code"] or "").strip()
+                    if not current_code or not existing["lcsc_approved"]:
+                        raise ValueError("Cannot keep current mapping: no approved JLCPCB code exists.")
+                    candidate = (existing["last_found_lcsc"] or "").strip()
+                    cursor.execute(
+                        """UPDATE internal_mappings
+                           SET lcsc_pending_change = 0,
+                               lcsc_status = CASE WHEN lcsc_source = 'MANUAL' THEN 'MANUAL_OVERRIDE' ELSE 'AUTO_APPROVED' END,
+                               updated_at = ?
+                           WHERE comment_code = ?""",
+                        (now, comment_code),
+                    )
+                elif supplier_norm == "DIGIKEY":
+                    current_code = (existing["digikey_code"] or "").strip()
+                    if not current_code or not existing["digikey_approved"]:
+                        raise ValueError("Cannot keep current mapping: no approved DigiKey code exists.")
+                    candidate = (existing["last_found_digikey"] or "").strip()
+                    cursor.execute(
+                        """UPDATE internal_mappings
+                           SET digikey_pending_change = 0,
+                               digikey_status = CASE WHEN digikey_source = 'MANUAL' THEN 'MANUAL_OVERRIDE' ELSE 'AUTO_APPROVED' END,
+                               updated_at = ?
+                           WHERE comment_code = ?""",
+                        (now, comment_code),
+                    )
+                else:
+                    raise ValueError(f"Unsupported supplier: {supplier}")
+
+                cursor.execute(
+                    """INSERT INTO mapping_audit_history
+                       (comment_code, mpn, supplier, previous_code, candidate_code, selected_code, action, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (comment_code, mpn, supplier_norm, current_code, candidate, current_code, "KEEP_CURRENT", now),
+                )
                 conn.commit()
 
     def reject_supplier_pending_change(self, comment_code: str, supplier: str) -> None:
@@ -625,28 +1038,92 @@ class DatabaseManager:
         supplier_norm = supplier.upper().strip()
         with self._lock:
             with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT * FROM internal_mappings WHERE comment_code = ?", (comment_code,))
+                existing = cursor.fetchone()
+                now = time.time()
                 if supplier_norm in ("JLCPCB", "LCSC"):
-                    conn.execute(
+                    cursor.execute(
                         """UPDATE internal_mappings
                            SET lcsc_pending_change = 0,
                                lcsc_status = CASE WHEN lcsc_approved = 1 THEN 'AUTO_APPROVED' ELSE lcsc_status END,
                                updated_at = ?
                            WHERE comment_code = ?""",
-                        (time.time(), comment_code),
+                        (now, comment_code),
                     )
+                    if existing and (existing["lcsc_code"] or "").strip() and existing["lcsc_approved"]:
+                        cursor.execute(
+                            """INSERT INTO mapping_audit_history
+                               (comment_code, mpn, supplier, previous_code, candidate_code, selected_code, action, created_at)
+                               VALUES (?, ?, ?, ?, ?, ?, 'KEEP_CURRENT', ?)""",
+                            (comment_code, existing["mpn"] or "", supplier_norm, existing["lcsc_code"], existing["last_found_lcsc"] or "", existing["lcsc_code"], now),
+                        )
                 elif supplier_norm == "DIGIKEY":
-                    conn.execute(
+                    cursor.execute(
                         """UPDATE internal_mappings
                            SET digikey_pending_change = 0,
                                digikey_status = CASE WHEN digikey_approved = 1 THEN 'AUTO_APPROVED' ELSE digikey_status END,
                                updated_at = ?
                            WHERE comment_code = ?""",
-                        (time.time(), comment_code),
+                        (now, comment_code),
                     )
+                    if existing and (existing["digikey_code"] or "").strip() and existing["digikey_approved"]:
+                        cursor.execute(
+                            """INSERT INTO mapping_audit_history
+                               (comment_code, mpn, supplier, previous_code, candidate_code, selected_code, action, created_at)
+                               VALUES (?, ?, ?, ?, ?, ?, 'KEEP_CURRENT', ?)""",
+                            (comment_code, existing["mpn"] or "", supplier_norm, existing["digikey_code"], existing["last_found_digikey"] or "", existing["digikey_code"], now),
+                        )
                 else:
                     raise ValueError(f"Unsupported supplier: {supplier}")
                 conn.commit()
-                
+
+    def invalidate_lcsc_preorder_candidate(
+        self, comment_code: str, candidate_code: str = ""
+    ) -> bool:
+        """Remove a live pre-order candidate without changing an approved mapping."""
+        with self._lock:
+            with self._get_connection() as conn:
+                existing = conn.execute(
+                    "SELECT comment_code, mpn, lcsc_code, lcsc_approved, "
+                    "last_found_lcsc, lcsc_pending_change FROM internal_mappings "
+                    "WHERE comment_code = ?",
+                    (comment_code,),
+                ).fetchone()
+                if existing is None:
+                    return False
+                current_candidate = (existing["last_found_lcsc"] or "").strip()
+                target = (candidate_code or current_candidate).strip()
+                if not existing["lcsc_pending_change"] and not current_candidate:
+                    return False
+                now = time.time()
+                conn.execute(
+                    """UPDATE internal_mappings
+                       SET last_found_lcsc = '', lcsc_pending_change = 0,
+                           lcsc_status = CASE WHEN lcsc_approved = 1
+                               THEN 'NEEDS_REVIEW_PREORDER'
+                               ELSE 'AUTO_INVALIDATED_PREORDER' END,
+                           updated_at = ?
+                       WHERE comment_code = ?""",
+                    (now, comment_code),
+                )
+                conn.execute(
+                    """INSERT INTO mapping_audit_history
+                       (comment_code, mpn, supplier, previous_code, candidate_code,
+                        selected_code, action, created_at)
+                       VALUES (?, ?, 'JLCPCB', ?, ?, ?, 'AUTO_INVALIDATED_PREORDER', ?)""",
+                    (
+                        comment_code,
+                        existing["mpn"] or "",
+                        existing["lcsc_code"] or "",
+                        target,
+                        existing["lcsc_code"] if existing["lcsc_approved"] else "",
+                        now,
+                    ),
+                )
+                conn.commit()
+                return True
+
     def get_all_internal_mappings(self) -> list[Dict[str, Any]]:
         """Retrieves all internal mappings."""
         with self._lock:
@@ -665,7 +1142,8 @@ class DatabaseManager:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    "SELECT lcsc_code, stock, price_breaks_raw, package, category, source, timestamp FROM api_cache WHERE lcsc_code = ?",
+                    "SELECT lcsc_code, stock, price_breaks_raw, package, category, source, "
+                    "availability, timestamp FROM api_cache WHERE lcsc_code = ?",
                     (lcsc_code,)
                 )
                 row = cursor.fetchone()
@@ -682,22 +1160,24 @@ class DatabaseManager:
         category: str,
         timestamp: float,
         source: str = "",
+        availability: str = "UNKNOWN",
     ) -> None:
         """Inserts or updates cached API data for an LCSC code."""
         with self._lock:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
-                    INSERT INTO api_cache (lcsc_code, stock, price_breaks_raw, package, category, source, timestamp)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO api_cache (lcsc_code, stock, price_breaks_raw, package, category, source, availability, timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(lcsc_code) DO UPDATE SET
                         stock = excluded.stock,
                         price_breaks_raw = excluded.price_breaks_raw,
                         package = excluded.package,
                         category = excluded.category,
                         source = excluded.source,
+                        availability = excluded.availability,
                         timestamp = excluded.timestamp
-                ''', (lcsc_code, stock, price_breaks_raw, package, category, source, timestamp))
+                ''', (lcsc_code, stock, price_breaks_raw, package, category, source, availability, timestamp))
                 conn.commit()
 
     def clear_old_cache(self, max_age_seconds: float) -> None:

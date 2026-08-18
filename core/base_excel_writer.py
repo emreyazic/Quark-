@@ -1,3 +1,4 @@
+import copy
 import re
 import openpyxl
 from datetime import datetime
@@ -197,6 +198,8 @@ class BaseExcelWriter:
             pricing_quantity,
             use_quantity_breaks=use_breaks,
         ) if item.digikey_price_breaks else item.digikey_unit_price
+        if item.is_jlcpcb_preorder:
+            j_price = None
         return (
             pricing_quantity,
             j_price,
@@ -221,39 +224,22 @@ class BaseExcelWriter:
         try:
             qty_int = parse_positive_integer_quantity(qty)
         except (ValueError, TypeError):
-            qty_int = 1
-
-        j_purchasable = (
-            self._is_jlcpcb_usable(item)
-            and bool(item.jlcpcb_part_number)
-            and j_price is not None
-            and item.available_stock_qty is not None
-            and item.available_stock_qty >= qty_int
-            and qty_int > 0
+            return "Unpriced", None
+        from services.project_pricing import calculate_item_pricing
+        pricing_item = copy.copy(item)
+        if not pricing_item.jlcpcb_price_breaks_raw and pricing_item.unit_price is None:
+            pricing_item.unit_price = j_price
+        if not pricing_item.digikey_price_breaks and pricing_item.digikey_unit_price is None:
+            pricing_item.digikey_unit_price = d_price
+        result = calculate_item_pricing(pricing_item, qty_int)
+        if result.quote:
+            return result.quote.supplier, float(result.quote.unit_price)
+        return (
+            "Shortage / Unavailable"
+            if item.jlcpcb_part_number or item.digikey_part_number or j_price is not None or d_price is not None
+            else "Unpriced",
+            None,
         )
-        if j_purchasable:
-            return "JLCPCB", j_price
-
-        d_purchasable = (
-            bool(item.digikey_part_number)
-            and item.digikey_status == "found"
-            and d_price is not None
-            and item.digikey_stock_qty is not None
-            and item.digikey_stock_qty >= qty_int
-            and qty_int > 0
-        )
-        if d_purchasable:
-            return "DigiKey fallback", d_price
-
-        if (
-            j_price is not None
-            or d_price is not None
-            or bool(item.jlcpcb_part_number)
-            or bool(item.digikey_part_number)
-        ):
-            return "Shortage / Unavailable", None
-
-        return "Unpriced", None
 
     def _add_price_totals_box(
         self,
@@ -467,7 +453,7 @@ class BaseExcelWriter:
     def _is_jlcpcb_usable(self, item: BomItem) -> bool:
         """Determines whether JLCPCB pricing is usable for this component."""
         status_lower = str(item.status or "").lower()
-        if item.jlcpcb_status in ("not_found", "error", "mismatch"):
+        if item.jlcpcb_status in ("not_found", "error", "mismatch", "preorder"):
             return False
         if not item.jlcpcb_part_number:
             return False
@@ -488,6 +474,12 @@ class BaseExcelWriter:
             prod_qty = 0
         surplus = getattr(item, "safety_surplus", 0) or get_safety_surplus(item)
         purchase_quantity = prod_qty + surplus if prod_qty > 0 else 0
+
+        from services.project_pricing import calculate_item_pricing
+        canonical = (
+            calculate_item_pricing(item, prod_qty, surplus)
+            if prod_qty > 0 else None
+        )
 
         use_breaks = self.pricing_mode == "project"
         j_price = select_unit_price(
@@ -510,9 +502,12 @@ class BaseExcelWriter:
         j_cost = None
         rem_dk_cost = None
         all_dk_cost = None
-        selected_price = None
-        selected_source = "Unpriced"
-        combined_cost = None
+        quote = canonical.quote if canonical else None
+        selected_price = float(quote.unit_price) if quote else None
+        selected_source = quote.supplier if quote else (
+            "Shortage / Unavailable" if canonical else "Unpriced"
+        )
+        combined_cost = float(quote.order_price) if quote else None
 
         # Sourcing purchasability criteria: checks stock >= purchase_quantity
         j_purchasable = (
@@ -535,25 +530,10 @@ class BaseExcelWriter:
         if d_purchasable and d_price is not None:
             all_dk_cost = purchase_quantity * d_price
 
-        if j_purchasable and j_price is not None:
-            selected_source = "JLCPCB"
-            selected_price = j_price
-            j_cost = purchase_quantity * j_price
-            combined_cost = j_cost
-        elif d_purchasable and d_price is not None:
-            selected_source = "DigiKey fallback"
-            selected_price = d_price
-            rem_dk_cost = purchase_quantity * d_price
-            combined_cost = rem_dk_cost
-        elif (
-            j_price is not None
-            or d_price is not None
-            or bool(item.jlcpcb_part_number)
-            or bool(item.digikey_part_number)
-        ):
-            selected_source = "Shortage / Unavailable"
-            selected_price = None
-            combined_cost = None
+        if quote and quote.supplier == "JLCPCB":
+            j_cost = float(quote.order_price)
+        elif quote and quote.supplier == "DigiKey":
+            rem_dk_cost = float(quote.order_price)
 
         return {
             "selected_source": selected_source,

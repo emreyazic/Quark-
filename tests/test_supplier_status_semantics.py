@@ -119,7 +119,7 @@ def test_mixed_sourcing_stock_semantics():
     from core.base_excel_writer import BaseExcelWriter
     writer = BaseExcelWriter()
 
-    # 1. JLCPCB stock=0, DigiKey sufficient -> DigiKey fallback selected
+    # 1. JLCPCB stock=0, DigiKey sufficient -> canonical DigiKey source selected
     item_dk_fallback = BomItem(
         jlcpcb_part_number="C1",
         available_stock_qty=0,
@@ -129,7 +129,7 @@ def test_mixed_sourcing_stock_semantics():
         digikey_stock_qty=50,
     )
     source, price = writer._selected_supplier_price(item_dk_fallback, j_price=0.10, d_price=0.50, required_quantity=10)
-    assert source == "DigiKey fallback"
+    assert source == "DigiKey"
     assert price == 0.50
 
     # 2. Both suppliers insufficient -> Shortage / Unavailable, purchasable total None

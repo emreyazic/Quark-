@@ -128,6 +128,7 @@ class BomItem:
     status: str = ""  # "Found", "Not Found", "Exact MPN Mismatch", "Insufficient Stock", etc.
     notes: str = ""  # Detailed notes/error messages
     jlcpcb_status: str = "not_searched"  # found, not_found, error, warning, not_searched
+    jlcpcb_availability: str = "UNKNOWN"  # IN_STOCK, OUT_OF_STOCK, PREORDER, UNKNOWN
     jlcpcb_error: str = ""
     jlcpcb_source: str = ""
     digikey_status: str = "not_searched"
@@ -210,7 +211,15 @@ class BomItem:
     @property
     def is_available(self) -> bool:
         """True when at least one supplier returned a usable result."""
-        return self.jlcpcb_status in ("found", "warning") or self.digikey_status == "found"
+        return self.is_jlcpcb_usable or self.digikey_status == "found"
+
+    @property
+    def is_jlcpcb_preorder(self) -> bool:
+        return self.jlcpcb_availability == "PREORDER" or self.jlcpcb_status == "preorder"
+
+    @property
+    def is_jlcpcb_usable(self) -> bool:
+        return not self.is_jlcpcb_preorder and self.jlcpcb_status in ("found", "warning")
 
     @property
     def is_not_found(self) -> bool:
@@ -239,6 +248,8 @@ class BomItem:
                     self.status = "No exact JLCPCB match"
             elif errors:
                 self.status = "; ".join(errors)
+            elif self.is_jlcpcb_preorder:
+                self.status = "Pre-order — Needs Review"
             elif self.is_not_found:
                 self.status = "Not Found"
             elif "Insufficient JLCPCB stock" in (self.status or ""):
